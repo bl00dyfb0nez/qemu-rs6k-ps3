@@ -10,11 +10,9 @@ Nothing here is needed to build or use the rest of QEMU.
 
 # Credits
 
-None of the boot-chain research this model rests on is mine.  zecoxao,
-who compiled the list, does not claim credit for it either - in his
-words:
-
 > I do not take any credit it will be stated in the PS3_MODEL.md.
+>
+> - bl00dyb0nes
 
 - zecoxao
 - wildcard
