@@ -19654,7 +19654,7 @@
     "extra_files": [],
     "subproject": null,
     "dependencies": [
-      "dep90789115848482156932179477129972165101"
+      "dep25682891807870264919064872054596336061"
     ],
     "depends": [],
     "installed": false
@@ -21007,7 +21007,7 @@
       "libpmem",
       "libdaxctl",
       "libzstd",
-      "dep90789115848482156932179477129972165101"
+      "dep25682891807870264919064872054596336061"
     ],
     "depends": [],
     "installed": false
@@ -21300,6 +21300,7 @@
           "C:/Users/Thewoodsman/qemu/hw/ppc/rs6000_mc.c",
           "C:/Users/Thewoodsman/qemu/hw/ppc/rs6000_ps3.c",
           "C:/Users/Thewoodsman/qemu/hw/ppc/ps3_spu.c",
+          "C:/Users/Thewoodsman/qemu/hw/ppc/ps3_self.c",
           "C:/Users/Thewoodsman/qemu/hw/ppc/mac_oldworld.c",
           "C:/Users/Thewoodsman/qemu/hw/ppc/mac_newworld.c",
           "C:/Users/Thewoodsman/qemu/hw/ppc/e500plat.c",
@@ -21537,7 +21538,7 @@
       "libpmem",
       "libdaxctl",
       "libzstd",
-      "dep90789115848482156932179477129972165101",
+      "dep25682891807870264919064872054596336061",
       "capstone"
     ],
     "depends": [],

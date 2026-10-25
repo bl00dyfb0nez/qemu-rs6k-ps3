@@ -1,4 +1,4 @@
-Build started at 2026-10-24T19:18:33.200397
+Build started at 2026-10-24T20:27:26.592068
 Main binary: C:/Users/Thewoodsman/qemu/build-ps3/pyvenv/bin/python.exe
 Build Options: -Dwerror=false -Dauto_features=disabled -Db_pie=false -Ddocs=disabled --native-file=C:/Users/Thewoodsman/qemu/build-ps3/config-meson.cross --native-file=C:/Users/Thewoodsman/qemu/configs/meson/windows.txt
 Python system: Windows
@@ -1301,21 +1301,21 @@ Cached compiler stderr:
 Compiler for C++ supports arguments -Wno-typedef-redefinition: NO (cached)
 Program cgcc skipped: feature sparse disabled
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpymwdflj6
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmputpzuyat
 Code:
 int main(void) { return 0; }
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpymwdflj6/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpymwdflj6/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lm -Wl,--allow-shlib-undefined` -> 0
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmputpzuyat/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmputpzuyat/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lm -Wl,--allow-shlib-undefined` -> 0
 Library m found: YES
 Dependency threads for host machine found: YES unknown (cached)
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp3uftl45z
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpz9mx8xm4
 Code:
 int main(void) { return 0; }
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp3uftl45z/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp3uftl45z/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lutil -Wl,--allow-shlib-undefined` -> 1
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpz9mx8xm4/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpz9mx8xm4/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lutil -Wl,--allow-shlib-undefined` -> 1
 stderr:
 C:/msys64/ucrt64/bin/../lib/gcc/x86_64-w64-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find -lutil: No such file or directory
 collect2.exe: error: ld returned 1 exit status
@@ -1339,11 +1339,11 @@ Cached run stdout:
 Cached run stderr:
  
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp5hh1mhjq
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpwfq7rtjp
 Code:
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp5hh1mhjq/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp5hh1mhjq/output.obj -c -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE --print-search-dirs` -> 0
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpwfq7rtjp/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpwfq7rtjp/output.obj -c -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE --print-search-dirs` -> 0
 stdout:
 install: C:/msys64/ucrt64/bin/../lib/gcc/x86_64-w64-mingw32/16.2.0/
 programs: =C:/msys64/ucrt64/bin/../lib/gcc/x86_64-w64-mingw32/16.2.0/;C:/msys64/ucrt64/bin/../lib/gcc/;C:/msys64/ucrt64/bin/../lib/gcc/x86_64-w64-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/x86_64-w64-mingw32/16.2.0/;C:/msys64/ucrt64/bin/../lib/gcc/x86_64-w64-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/
@@ -1353,36 +1353,36 @@ Library util found: NO
 Program midl found: NO
 Program widl found: NO
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpaw6ai60g
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp7qc4fqha
 Code:
 int main(void) { return 0; }
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpaw6ai60g/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpaw6ai60g/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lpathcch -Wl,--allow-shlib-undefined` -> 0
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp7qc4fqha/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp7qc4fqha/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lpathcch -Wl,--allow-shlib-undefined` -> 0
 Library pathcch found: YES
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmppuawuodl
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp1ndw2_df
 Code:
 int main(void) { return 0; }
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmppuawuodl/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmppuawuodl/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lsynchronization -Wl,--allow-shlib-undefined` -> 0
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp1ndw2_df/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp1ndw2_df/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lsynchronization -Wl,--allow-shlib-undefined` -> 0
 Library synchronization found: YES
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpcridlj3i
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp_yb547vf
 Code:
 int main(void) { return 0; }
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpcridlj3i/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpcridlj3i/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lws2_32 -Wl,--allow-shlib-undefined` -> 0
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp_yb547vf/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp_yb547vf/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lws2_32 -Wl,--allow-shlib-undefined` -> 0
 Library ws2_32 found: YES
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpdhm6fzm6
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpaygrauii
 Code:
 int main(void) { return 0; }
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpdhm6fzm6/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpdhm6fzm6/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lwinmm -Wl,--allow-shlib-undefined` -> 0
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpaygrauii/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpaygrauii/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lwinmm -Wl,--allow-shlib-undefined` -> 0
 Library winmm found: YES
 Windows resource compiler: GNU windres (GNU Binutils) 2.47.20260726
 Dependency glib-2.0 for host machine found: YES 2.90.1 (cached)
@@ -1525,12 +1525,12 @@ Library snappy skipped: feature snappy disabled
 Library lzo2 skipped: feature lzo disabled
 Library numa skipped: feature numa disabled
 Running compile:
-Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpie0wnvoi
+Working directory:  C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp7ycvhm6a
 Code:
 int main(void) { return 0; }
 
 -----------
-Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpie0wnvoi/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpie0wnvoi/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lfdt -Wl,--allow-shlib-undefined` -> 1
+Command line: `cc -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp7ycvhm6a/testfile.c -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmp7ycvhm6a/output.exe -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -lfdt -Wl,--allow-shlib-undefined` -> 1
 stderr:
 C:/msys64/ucrt64/bin/../lib/gcc/x86_64-w64-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find -lfdt: No such file or directory
 collect2.exe: error: ld returned 1 exit status
@@ -5002,11 +5002,11 @@ compilation terminated.
 
 Header "linux/vm_sockets.h" has symbol "AF_VSOCK" : NO (cached)
 Running compile:
-Working directory:  C:/msys64/tmp/tmp4bkwe7cr
+Working directory:  C:/msys64/tmp/tmp67gpntz2
 Code:
 int i = static_cast<int>(0);
 -----------
-Command line: `c++ -m64 C:/msys64/tmp/tmp4bkwe7cr/testfile.cpp -o C:/msys64/tmp/tmp4bkwe7cr/output.obj -D_FILE_OFFSET_BITS=64 -c -std=gnu++23` -> 0
+Command line: `c++ -m64 C:/msys64/tmp/tmp67gpntz2/testfile.cpp -o C:/msys64/tmp/tmp67gpntz2/output.obj -D_FILE_OFFSET_BITS=64 -c -std=gnu++23` -> 0
 Compiler accepts -std=gnu++23: YES
 Using cached compile:
 Cached command line:  c++ -m64 C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpt71z0t2g/testfile.cpp -o C:/Users/Thewoodsman/qemu/build-ps3/meson-private/tmpt71z0t2g/output.obj -c -D_FILE_OFFSET_BITS=64 -O0 -U_FORTIFY_SOURCE -fpermissive -std=gnu++23 

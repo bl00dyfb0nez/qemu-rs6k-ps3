@@ -81,6 +81,7 @@
 #include "system/system.h"
 
 #include "ps3_spu.h"
+#include "ps3_self.h"
 
 #define TYPE_PS3_MIC "ps3-mic"
 OBJECT_DECLARE_SIMPLE_TYPE(PS3MICState, PS3_MIC)
@@ -496,6 +497,11 @@ struct PS3BootROMState {
     char spu_why[160];
     uint64_t spu_insns;
     int spu_status;
+
+    /* One SPU stage image run on its own, for the boot-chain tests. */
+    char *stage_elf;
+    uint32_t stage_entry;
+    uint64_t stage_limit;
 
     uint8_t rom[PS3_ROM_SIZE];
     size_t rom_len;
@@ -1148,6 +1154,8 @@ static void ps3_rom_reset(DeviceState *dev)
     }
 }
 
+static int ps3_spu_stage(PS3BootROMState *s);
+
 static bool ps3_readout_from_hex(const char *text, uint8_t out[32])
 {
     size_t len = strlen(text);
@@ -1269,10 +1277,151 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
 
     s->spu = ps3_spu_new(memory_region_get_ram_ptr(&s->ls_mr), PS3_LS_SIZE,
                          s->flash, s->flash_len);
+
+    /*
+     * A stage image is a whole run: load it, execute it, report, exit.  It is
+     * the command-line form of the boot-chain tests, so the exit status is the
+     * verdict and nothing after it needs the machine.
+     */
+    if (s->stage_elf) {
+        exit(ps3_spu_stage(s));
+    }
+}
+
+/*
+ * Load an SPU ELF (a decrypted boot-chain stage such as lv1ldr/appldr) into
+ * local storage and run it from its entry point.  This is what lets the stage
+ * tests execute the rest of the chain on the same interpreter the mask ROM and
+ * lv0ldr.2 already run on, instead of checking the images structurally only.
+ *
+ * Returns 0 when the stage ran without faulting, 1 when it hit an opcode or an
+ * address the model does not implement, 2 when the image could not be loaded.
+ */
+static int ps3_spu_stage(PS3BootROMState *s)
+{
+    g_autoptr(GError) err = NULL;
+    g_autofree uint8_t *img = NULL;
+    gsize len = 0;
+    uint8_t *ls = memory_region_get_ram_ptr(&s->ls_mr);
+    uint32_t phoff, phentsize, phnum, entry;
+    unsigned loaded = 0;
+    uint64_t bytes = 0;
+    char why[160];
+    int rc;
+
+    if (!g_file_get_contents(s->stage_elf, (gchar **)&img, &len, &err)) {
+        info_report("ps3-spu-stage: cannot read %s: %s", s->stage_elf,
+                    err->message);
+        return 2;
+    }
+
+    /*
+     * A stage is either a decrypted SPU ELF or the SELF it is delivered in.
+     * The SELF is opened here with the loader keysets the chain itself uses,
+     * so a stage test needs nothing on the PC side but the firmware file.
+     */
+    if (len >= 0x200 && !memcmp(img, "SCE\0", 4)) {
+        uint32_t stage_entry = 0;
+        unsigned segments = 0;
+        int rc = ps3_self_load_ls(img, len, ls, PS3_LS_SIZE, &stage_entry,
+                                  &segments, why, sizeof(why));
+
+        if (rc) {
+            info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
+            return rc == 1 ? 1 : 2;
+        }
+
+        if (s->stage_entry) {
+            stage_entry = s->stage_entry;
+        }
+
+        ps3_spu_set_trace(s->spu, s->spu_trace);
+        rc = ps3_spu_run(s->spu, stage_entry, s->stage_limit ?: (1 << 22),
+                         why, sizeof(why));
+        info_report("ps3-spu-stage: %s entry=0x%X segments=%u steps=%" PRIu64
+                    " result=%s stop=%u :: %s",
+                    s->stage_elf, stage_entry, segments,
+                    ps3_spu_insns(s->spu),
+                    rc == 0 ? "stop" : rc == 1 ? "limit" : "fault",
+                    ps3_spu_stop_code(s->spu), why);
+        return rc == 2 ? 1 : 0;
+    }
+
+    if (len < 52 || memcmp(img, "\177ELF", 4) || img[4] != 1 || img[5] != 2) {
+        info_report("ps3-spu-stage: %s is not a 32-bit big-endian ELF",
+                    s->stage_elf);
+        return 2;
+    }
+
+    entry    = ps3_be32(img + 24);
+    phoff    = ps3_be32(img + 28);
+    phentsize = (img[42] << 8) | img[43];
+    phnum    = (img[44] << 8) | img[45];
+
+    memory_region_set_readonly(&s->ls_mr, false);
+    memset(ls, 0, PS3_LS_SIZE);
+
+    for (unsigned i = 0; i < phnum; i++) {
+        size_t o = (size_t)phoff + (size_t)i * phentsize;
+        uint32_t type, off, vaddr, filesz, memsz;
+
+        if (o + 32 > len) {
+            info_report("ps3-spu-stage: program header %u is outside %s",
+                        i, s->stage_elf);
+            return 2;
+        }
+
+        type   = ps3_be32(img + o + 0);
+        off    = ps3_be32(img + o + 4);
+        vaddr  = ps3_be32(img + o + 8);
+        filesz = ps3_be32(img + o + 16);
+        memsz  = ps3_be32(img + o + 20);
+
+        if (type != 1) {
+            continue;
+        }
+
+        if (vaddr >= PS3_LS_SIZE || memsz > PS3_LS_SIZE - vaddr ||
+            filesz > memsz || off > len || filesz > len - off) {
+            info_report("ps3-spu-stage: segment %u (0x%X/0x%X) does not fit "
+                        "local storage", i, vaddr, memsz);
+            return 2;
+        }
+
+        memcpy(ls + vaddr, img + off, filesz);
+        loaded++;
+        bytes += filesz;
+    }
+
+    if (!loaded) {
+        info_report("ps3-spu-stage: %s carries no loadable segment",
+                    s->stage_elf);
+        return 2;
+    }
+
+    if (s->stage_entry != 0) {
+        entry = s->stage_entry;
+    }
+
+    ps3_spu_set_trace(s->spu, s->spu_trace);
+
+    rc = ps3_spu_run(s->spu, entry, s->stage_limit ?: (1 << 22),
+                     why, sizeof(why));
+
+    info_report("ps3-spu-stage: %s entry=0x%X segments=%u bytes=%" PRIu64
+                " steps=%" PRIu64 " result=%s stop=%u :: %s",
+                s->stage_elf, entry, loaded, bytes, ps3_spu_insns(s->spu),
+                rc == 0 ? "stop" : rc == 1 ? "limit" : "fault",
+                ps3_spu_stop_code(s->spu), why);
+
+    return rc == 2 ? 1 : 0;
 }
 
 static const Property ps3_rom_properties[] = {
     DEFINE_PROP_DRIVE("drive", PS3BootROMState, blk),
+    DEFINE_PROP_STRING("stage-elf", PS3BootROMState, stage_elf),
+    DEFINE_PROP_UINT32("stage-entry", PS3BootROMState, stage_entry, 0),
+    DEFINE_PROP_UINT64("stage-limit", PS3BootROMState, stage_limit, 0),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
     DEFINE_PROP_STRING("readout", PS3BootROMState, readout),

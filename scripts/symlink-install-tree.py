@@ -16,6 +16,10 @@ def destdir_join(d1: str, d2: str) -> str:
     return str(PurePath(d1, *PurePath(d2).parts[1:]))
 
 introspect = os.environ.get('MESONINTROSPECT')
+if not introspect:
+    # Nothing to install into: meson did not hand us its introspect command
+    # (Windows reconfigure), and the bundle is only used by `make install`.
+    sys.exit(0)
 out = subprocess.run([*shlex.split(introspect), '--installed'],
                      stdout=subprocess.PIPE, check=True).stdout
 for source, dest in json.loads(out).items():
