@@ -26,6 +26,14 @@ void ps3_spu_set_ch66(PS3SPU *spu, const uint8_t key[32]);
 /* SPU_RdSigNotify1/2, the image effective address the ROM fetches. */
 void ps3_spu_set_sig(PS3SPU *spu, uint32_t hi, uint32_t lo);
 
+/*
+ * Set one register in every slot before starting.  The mask ROM is entered
+ * with $90 preset (the isolation loader leaves the local-store hand-off
+ * address there): it DMA-prefetches its header to LS 0x410 and reads it back
+ * through $90 - 0x40 .. $90 - 0x10.
+ */
+void ps3_spu_set_reg(PS3SPU *spu, unsigned reg, uint32_t value);
+
 /* One line per instruction on stderr. */
 void ps3_spu_set_trace(PS3SPU *spu, bool on);
 
@@ -38,6 +46,14 @@ void ps3_spu_set_trace(PS3SPU *spu, bool on);
  */
 int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
                 char *why, size_t why_len);
+
+/*
+ * Run until the program reaches `stop_pc' (the ROM's hand-off at 0x400), or
+ * stops on its own.  Returns 0 when the PC reached `stop_pc', 1 on the
+ * instruction limit, 2 on a fault.
+ */
+int ps3_spu_run_to(PS3SPU *spu, uint32_t entry, uint32_t stop_pc,
+                   uint64_t limit, char *why, size_t why_len);
 
 uint64_t ps3_spu_insns(const PS3SPU *spu);
 uint32_t ps3_spu_pc(const PS3SPU *spu);

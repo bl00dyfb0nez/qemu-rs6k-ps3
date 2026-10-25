@@ -28,6 +28,15 @@
 
 #define SPU_LS_MASK 0x3FFFFu
 #define SPU_MAX_GPR 128
+
+/*
+ * Slots are numbered in memory order: gpr[reg][0] holds the four bytes at the
+ * load address, gpr[reg][3] the last four.  That is the ISA's slot 3 first -
+ * the preferred slot is the one at the lowest address - and it is what makes
+ * `lqa $12,0x420` then `brz $12` test the length word rather than the nonce.
+ * Byte 0 of a quadword is likewise the first byte in memory.
+ */
+#define SPU_PREFERRED 0
 #define SPU_TAG_FIFO 64
 
 struct PS3SPU {
@@ -136,11 +145,11 @@ static void gpr_fill(PS3SPU *spu, unsigned reg, uint32_t v)
     }
 }
 
-/* The preferred slot, which is where word-wise operations keep the value and
- * where branches, shifts and channel addresses read it. */
+/* The preferred slot: where branches, shifts and channel addresses read the
+ * value (see SPU_PREFERRED). */
 static uint32_t scw(const PS3SPU *spu, unsigned reg)
 {
-    return gpr_w(spu, reg, 3);
+    return gpr_w(spu, reg, SPU_PREFERRED);
 }
 
 static uint8_t qbyte(const PS3SPU *spu, unsigned reg, unsigned i)
@@ -350,7 +359,8 @@ static void mfc_start(PS3SPU *spu)
 {
     const uint32_t size = (spu->mfc_size & 0xFFFF) ? (spu->mfc_size & 0xFFFF)
                                                    : 0x4000;
-    const uint32_t lsa = spu->mfc_lsa & SPU_LS_MASK;
+    /* LSA bits 3:17: the low four bits are not part of the address. */
+    const uint32_t lsa = spu->mfc_lsa & SPU_LS_MASK & ~0xFu;
     const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
 
     if (spu->mfc_cmd & 0x40) {              /* MFC_GET */
@@ -366,6 +376,15 @@ static void mfc_start(PS3SPU *spu)
         spu->mfc_gets++;
         spu->last_get_ea = (uint32_t)ea;
         spu->last_get_size = size;
+
+        /* The first transfers say whether the loader is walking its input as
+         * intended (a size of 0 is the 16 KiB maximum, not an empty one). */
+        if (spu->log_events && spu->mfc_gets <= 8) {
+            fprintf(stderr,
+                    "[spu] get %u bytes ea=0x%" PRIX64 " -> lsa=0x%X at 0x%X"
+                    " (cmd=0x%X)\n",
+                    size, ea, lsa, spu->last_pc, spu->mfc_cmd);
+        }
     } else if (spu->mfc_cmd & 0x20) {       /* MFC_PUT */
         for (uint32_t i = 0; i < size; i++) {
             const uint32_t src = (lsa + i) & SPU_LS_MASK;
@@ -382,13 +401,19 @@ static void mfc_start(PS3SPU *spu)
         spu->last_put_lsa = lsa;
 
         /* Few enough to be worth a line each, and the only trace of where the
-         * loader sent its output. */
+         * loader sent its output.  Small transfers carry the word itself. */
         if (spu->log_events) {
-            fprintf(stderr,
-                    "[spu] put %u bytes lsa=0x%X -> ea=0x%" PRIX64
-                    " at 0x%X ($1=0x%X $3=0x%X $4=0x%X $5=0x%X $6=0x%X)\n",
-                    size, lsa, ea, spu->last_pc, scw(spu, 1), scw(spu, 3),
-                    scw(spu, 4), scw(spu, 5), scw(spu, 6));
+            if (size == 4) {
+                fprintf(stderr,
+                        "[spu] put %u bytes lsa=0x%X -> ea=0x%" PRIX64
+                        " at 0x%X: 0x%08X\n",
+                        size, lsa, ea, spu->last_pc,
+                        be32(spu->ls + lsa));
+            } else {
+                fprintf(stderr,
+                        "[spu] put %u bytes lsa=0x%X -> ea=0x%" PRIX64
+                        " at 0x%X\n", size, lsa, ea, spu->last_pc);
+            }
         }
     }
 
@@ -553,6 +578,11 @@ void ps3_spu_set_sig(PS3SPU *spu, uint32_t hi, uint32_t lo)
     spu->sig_lo = lo;
 }
 
+void ps3_spu_set_reg(PS3SPU *spu, unsigned reg, uint32_t value)
+{
+    gpr_fill(spu, reg, value);
+}
+
 void ps3_spu_set_trace(PS3SPU *spu, bool on)
 {
     spu->trace = on;
@@ -676,6 +706,7 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
         fprintf(stderr, "[spu] %05X  %08X  %-8s rt=%u ra=%u rb=%u\n",
                 pc, word, in.op->name, in.rt, in.ra, in.rb);
     }
+
 
     switch (in.op->kind) {
     /* ---- control ---------------------------------------------------- */
@@ -1024,10 +1055,6 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
         break;
 
     /* ---- three-register word ops ------------------------------------ */
-    case K_A:
-    case K_AH:
-    case K_SF:
-    case K_SFH:
     case K_ADDX:
     case K_SFX:
         for (unsigned i = 0; i < 4; i++) {
@@ -1053,6 +1080,10 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
         }
         break;
 
+    case K_A:
+    case K_AH:
+    case K_SF:
+    case K_SFH:
     case K_AND:
     case K_ANDC:
     case K_OR:
@@ -1594,8 +1625,8 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
     case K_HEQI:
     case K_HEQ: {
         const bool eq = (in.op->kind == K_HEQI)
-            ? gpr_w(spu, in.ra, 3) == in.i10
-            : gpr_w(spu, in.ra, 3) == gpr_w(spu, in.rb, 3);
+            ? scw(spu, in.ra) == in.i10
+            : scw(spu, in.ra) == scw(spu, in.rb);
 
         if (eq) {
             spu->stop_code = 0x3FFF;
@@ -1613,11 +1644,32 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
     return true;
 }
 
-int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
-                char *why, size_t why_len)
+static void report_hot(PS3SPU *spu, const char *what, char *why, size_t why_len)
 {
-    spu->pc = entry;
-    spu->insns = 0;
+    uint32_t best = 0, second = 0;
+    uint32_t best_pc = 0, second_pc = 0;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(spu->hot); i++) {
+        if (spu->hot[i].count > best) {
+            second = best;
+            second_pc = best_pc;
+            best = spu->hot[i].count;
+            best_pc = spu->hot[i].pc;
+        } else if (spu->hot[i].count > second) {
+            second = spu->hot[i].count;
+            second_pc = spu->hot[i].pc;
+        }
+    }
+
+    snprintf(why, why_len,
+             "%s at 0x%X; hottest 0x%X (%u hits), next 0x%X (%u), "
+             "%" PRIu64 " MFC gets/%" PRIu64 " puts",
+             what, spu->pc, best_pc, best, second_pc, second,
+             spu->mfc_gets, spu->mfc_puts);
+}
+
+static void run_reset(PS3SPU *spu)
+{
     spu->tag_head = 0;
     spu->tag_count = 0;
     spu->stop_code = 0;
@@ -1626,6 +1678,48 @@ int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
     for (unsigned i = 0; i < ARRAY_SIZE(spu->hist); i++) {
         spu->hist[i].pc = UINT32_MAX;
     }
+}
+
+int ps3_spu_run_to(PS3SPU *spu, uint32_t entry, uint32_t stop_pc,
+                   uint64_t limit, char *why, size_t why_len)
+{
+    spu->pc = entry;
+    spu->insns = 0;
+    run_reset(spu);
+
+    for (uint64_t i = 0; i < limit; i++) {
+        const uint32_t pc = spu->pc;
+
+        if (pc == stop_pc) {
+            snprintf(why, why_len, "reached 0x%X after %" PRIu64
+                     " instructions", stop_pc, spu->insns);
+            return 0;
+        }
+
+        spu->insns++;
+
+        if (!execute(spu, pc, why, why_len)) {
+            return 2;
+        }
+    }
+
+    {
+        char what[64];
+
+        snprintf(what, sizeof(what),
+                 "instruction limit (%" PRIu64 ") before 0x%X", limit,
+                 stop_pc);
+        report_hot(spu, what, why, why_len);
+    }
+    return 1;
+}
+
+int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
+                char *why, size_t why_len)
+{
+    spu->pc = entry;
+    spu->insns = 0;
+    run_reset(spu);
 
     for (uint64_t i = 0; i < limit; i++) {
         const uint32_t pc = spu->pc;
@@ -1644,26 +1738,11 @@ int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
     }
 
     {
-        uint32_t best = 0, second = 0;
-        uint32_t best_pc = 0, second_pc = 0;
+        char what[64];
 
-        for (unsigned i = 0; i < ARRAY_SIZE(spu->hot); i++) {
-            if (spu->hot[i].count > best) {
-                second = best;
-                second_pc = best_pc;
-                best = spu->hot[i].count;
-                best_pc = spu->hot[i].pc;
-            } else if (spu->hot[i].count > second) {
-                second = spu->hot[i].count;
-                second_pc = spu->hot[i].pc;
-            }
-        }
-
-        snprintf(why, why_len,
-                 "instruction limit (%" PRIu64 ") at 0x%X; hottest 0x%X "
-                 "(%u hits), next 0x%X (%u), %" PRIu64 " MFC gets/%" PRIu64
-                 " puts", limit, spu->pc, best_pc, best, second_pc, second,
-                 spu->mfc_gets, spu->mfc_puts);
+        snprintf(what, sizeof(what),
+                 "instruction limit (%" PRIu64 ")", limit);
+        report_hot(spu, what, why, why_len);
     }
     return 1;
 }

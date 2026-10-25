@@ -20,7 +20,8 @@
  *
  *   - ps3-mic        the MIC's 64-bit MMIO registers, mmio_base 0xF050A000
  *   - ps3-boot-rom   the 0x400-byte SPU boot ROM and the 256 KiB local store
- *                    it wipes, plus the container opener the ROM carries
+ *                    it wipes, plus the container opener the ROM carries and
+ *                    the SPU interpreter the decrypted payload runs on
  *   - rs6000-ps3     a Cell PPU (970FX, the closest QEMU core), 256 MiB of
  *                    XDR, the flash window and the two devices above
  *
@@ -43,6 +44,20 @@
  * real hardware, and the tag check fails exactly as the ROM's "stop 2" path
  * does.  The container name defaults to lv0ldr.2 and falls back to the NOR
  * slots at 0xFC0000 and 0x840 when a dump carries no name.
+ *
+ * Once the container opens, its plaintext is placed at LS 0x400 - where the
+ * mask ROM falls through to it - and executed by the SPU interpreter
+ * (ps3_spu.c) rather than modelled in C.  Two things make the run visible:
+ *
+ *   -global ps3-boot-rom.ls-dump=ls.bin     the local store after the run,
+ *                                           in the layout ls_sift.py reads
+ *   -global ps3-boot-rom.spu-trace=on       one line per instruction
+ *
+ * `ps3-boot-rom.spu=off' keeps the container path and skips the payload run.
+ * The device's own selftest replays the real 1 KiB mask ROM through the same
+ * interpreter and checks that it produces the C opener's plaintext, so a
+ * broken instruction semantic shows up as a failed selftest rather than as a
+ * plausible-looking boot.
  */
 
 #include "qemu/osdep.h"
@@ -819,7 +834,7 @@ static void ps3_rom_boot(PS3BootROMState *s)
             ps3_spu_set_ch66(s->spu, ch66);
             ps3_spu_set_sig(s->spu, 0, s->container_offset);
             ps3_spu_set_trace(s->spu, s->spu_trace);
-            s->spu_status = ps3_spu_run(s->spu, 0x400, 1 << 28,
+            s->spu_status = ps3_spu_run(s->spu, 0x400, 1 << 26,
                                         s->spu_why, sizeof(s->spu_why));
             s->spu_insns = ps3_spu_insns(s->spu);
 
@@ -986,8 +1001,75 @@ static void ps3_rom_selftest(PS3BootROMState *s)
         }
     }
 
+    /*
+     * Now the same container through the SPU interpreter: the real 1 KiB mask
+     * ROM executed from LS 0, with the readout on channel 66 and the
+     * container's effective address on the signal channels.  The ROM has to
+     * reach 0x400 with the same plaintext the C opener produced.  This is the
+     * model's acceptance test: it is the ROM's own AES, table build, key
+     * ladder and tag check running as instructions rather than as C.
+     */
+    if (s->rom_len == PS3_ROM_SIZE) {
+        const uint32_t ea = 0x100000;
+        uint8_t *flash = g_malloc0(ea + sizeof(hdr) + sizeof(body));
+        uint8_t *ls = g_malloc0(PS3_LS_SIZE);
+        PS3SPU *spu;
+        char why[192];
+        int status;
+
+        /* The ROM arrives byte-swapped as often as not; the SPU fetches the
+         * native form, which is what the device left in its own region. */
+        const uint8_t *rom = memory_region_get_ram_ptr(&s->rom_mr);
+
+        memcpy(flash + ea, hdr, sizeof(hdr));
+        memcpy(flash + ea + sizeof(hdr), body, sizeof(body));
+        memcpy(ls, rom, PS3_ROM_SIZE);
+
+        spu = ps3_spu_new(ls, PS3_LS_SIZE, flash, ea + sizeof(hdr) + sizeof(body));
+        ps3_spu_set_ch66(spu, ch66);
+        ps3_spu_set_sig(spu, 0, ea);
+        ps3_spu_set_reg(spu, 90, 0x450);   /* header hand-off, LS 0x410 */
+
+        status = ps3_spu_run_to(spu, 0, 0x400, 4000000, why, sizeof(why));
+
+        if (status != 0) {
+            s->selftest_result = 2;
+            info_report("ps3-boot-rom: selftest FAILED (mask ROM in the "
+                        "interpreter: %s after %" PRIu64 " instructions)",
+                        why, ps3_spu_insns(spu));
+        } else if (memcmp(ls + 0x400, plain, sizeof(body))) {
+            unsigned at = 0;
+
+            for (i = 0; i + (int)sizeof(body) <= PS3_LS_SIZE; i += 16) {
+                if (!memcmp(ls + i, plain, sizeof(body))) {
+                    at = i;
+                    break;
+                }
+            }
+
+            s->selftest_result = 2;
+            info_report("ps3-boot-rom: selftest FAILED (the interpreter's mask "
+                        "ROM reached 0x400 but the plaintext does not match; "
+                        "found at LS 0x%X, expected 0x400)", at);
+        } else {
+            info_report("ps3-boot-rom: the mask ROM in the SPU interpreter "
+                        "opened the same container (%" PRIu64
+                        " instructions, plaintext at LS 0x400)",
+                        ps3_spu_insns(spu));
+        }
+
+        ps3_spu_free(spu);
+        g_free(ls);
+        g_free(flash);
+
+        if (s->selftest_result == 2) {
+            return;
+        }
+    }
+
     s->selftest_result = 1;
-    info_report("ps3-boot-rom: selftest passed (AES-128 KAT and sealed container round trip)");
+    info_report("ps3-boot-rom: selftest passed (AES-128 KAT, sealed container "
+                "round trip, mask ROM replayed by the SPU interpreter)");
 }
 
 static uint64_t ps3_rom_regs_read(void *opaque, hwaddr offset, unsigned size)
