@@ -120,6 +120,11 @@ config PREP
 config RS6000_MC
     bool
 
+config RS6000_PS3
+    bool
+    default y
+    depends on PPC64
+
 config MAC_OLDWORLD
     bool
     default y

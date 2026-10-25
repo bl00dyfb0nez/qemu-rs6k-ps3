@@ -1,0 +1,37 @@
+# QEMU configure log Sat, Oct 24, 2026  6:47:17 PM
+# Configured with: '../configure' '--target-list=ppc64-softmmu' '--without-default-features' '--enable-tcg' '--disable-werror' '--disable-docs'
+
+#
+
+funcs: do_compiler do_cc compile_object check_define main
+lines: 119 124 327 336 0
+cc -c -o config-temp/qemu-conf.o config-temp/qemu-conf.c
+config-temp/qemu-conf.c:2:2: error: #error __linux__ not defined
+    2 | #error __linux__ not defined
+      |  ^~~~~
+
+funcs: do_compiler do_cc compile_object check_define main
+lines: 119 124 327 338 0
+cc -c -o config-temp/qemu-conf.o config-temp/qemu-conf.c
+
+funcs: do_compiler do_cc compile_object check_define main
+lines: 119 124 327 371 0
+cc -c -o config-temp/qemu-conf.o config-temp/qemu-conf.c
+
+funcs: do_compiler do_cc compile_object check_define main
+lines: 119 124 327 372 0
+cc -c -o config-temp/qemu-conf.o config-temp/qemu-conf.c
+config-temp/qemu-conf.c:2:2: error: #error __ILP32__ not defined
+    2 | #error __ILP32__ not defined
+      |  ^~~~~
+
+funcs: do_compiler do_cc compile_object main
+lines: 119 124 893 0
+cc -m64 -c -o config-temp/qemu-conf.o config-temp/qemu-conf.c
+
+funcs: do_compiler do_cc compile_prog main
+lines: 119 130 1133 0
+cc -m64 -o config-temp/qemu-conf.exe config-temp/qemu-conf.c
+config-temp/qemu-conf.c:2:3: error: #error LITTLE
+    2 | # error LITTLE
+      |   ^~~~~

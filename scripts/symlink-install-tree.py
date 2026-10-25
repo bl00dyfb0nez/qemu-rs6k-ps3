@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -27,6 +28,17 @@ for source, dest in json.loads(out).items():
         raise e
     try:
         os.symlink(source, bundle_dest)
+    except OSError as e:
+        # Windows refuses symlinks without Developer Mode; a copy is
+        # equivalent for a local build tree.
+        if getattr(e, 'winerror', 0) == 1314 or e.errno in (errno.EPERM, errno.EACCES):
+            # A local build tree does not need the install bundle; skip
+            # entries whose target has not been built yet.
+            if not os.path.exists(source):
+                continue
+            shutil.copy2(source, bundle_dest)
+            continue
+        raise
     except BaseException as e:
         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
             if os.name == 'nt':

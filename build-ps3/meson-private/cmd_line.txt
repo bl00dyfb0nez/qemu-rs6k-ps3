@@ -1,0 +1,9 @@
+[options]
+werror = false
+auto_features = disabled
+b_pie = false
+docs = disabled
+
+[properties]
+native_file = ['C:/Users/Thewoodsman/qemu/build-ps3/config-meson.cross', 'C:/Users/Thewoodsman/qemu/configs/meson/windows.txt']
+

@@ -1,0 +1,76 @@
+[
+  {
+    "name": "threads",
+    "type": "system",
+    "version": "unknown",
+    "compile_args": [
+      "-pthread"
+    ],
+    "link_args": [
+      "-pthread"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "threads"
+    ]
+  },
+  {
+    "name": "glib-2.0",
+    "type": "pkgconfig",
+    "version": "2.90.1",
+    "compile_args": [
+      "-IC:/msys64/ucrt64/include/glib-2.0",
+      "-IC:/msys64/ucrt64/lib/glib-2.0/include"
+    ],
+    "link_args": [
+      "C:/msys64/ucrt64/lib/libglib-2.0.dll.a",
+      "C:/msys64/ucrt64/lib/libintl.dll.a"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "glib_pc"
+    ]
+  },
+  {
+    "name": "zlib",
+    "type": "pkgconfig",
+    "version": "1.3.2",
+    "compile_args": [],
+    "link_args": [
+      "C:/msys64/ucrt64/lib/libz.dll.a"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "zlib"
+    ]
+  },
+  {
+    "name": "gmp",
+    "type": "pkgconfig",
+    "version": "6.3.0",
+    "compile_args": [],
+    "link_args": [
+      "C:/msys64/ucrt64/lib/libgmp.dll.a"
+    ],
+    "include_directories": [],
+    "sources": [],
+    "extra_files": [],
+    "dependencies": [],
+    "depends": [],
+    "meson_variables": [
+      "gmp"
+    ]
+  }
+]
