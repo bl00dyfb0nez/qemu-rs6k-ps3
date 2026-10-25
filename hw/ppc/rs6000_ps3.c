@@ -1189,6 +1189,20 @@ static void ps3_rom_regs_write(void *opaque, hwaddr offset, uint64_t value,
             ps3_rom_selftest(s);
         }
         break;
+    case 0x14: {
+        /* The vsh-run syscall trampoline reports r11 here. */
+        CPUState *cs = qemu_get_cpu(0);
+
+        s->vsh_last_sc = (uint32_t)value;
+        if (s->ppu_trace && cs) {
+            PowerPCCPU *cpu = POWERPC_CPU(cs);
+
+            info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64
+                        ", pc=0x%" PRIX64 ")", s->vsh_last_sc,
+                        (uint64_t)cpu->env.lr, (uint64_t)cpu->env.nip);
+        }
+        break;
+    }
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ps3-boot-rom: write to 0x%" HWADDR_PRIx "\n", offset);
@@ -2399,26 +2413,49 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
          * services it needs.  It is a bring-up probe, not an lv2 model.
          */
         ps3_put_be32(ram + 0xC00, 0x3D800000); /* lis   r12, 0          */
-        ps3_put_be32(ram + 0xC04, 0x618C0800); /* ori   r12, r12, 0x800 */
-        ps3_put_be32(ram + 0xC08, 0x916C0000); /* stw   r11, 0(r12)     */
-        ps3_put_be32(ram + 0xC0C, 0x2C0B015C); /* cmpwi r11, 0x15C      */
-        ps3_put_be32(ram + 0xC10, 0x41820020); /* beq   0xC30           */
-        ps3_put_be32(ram + 0xC14, 0x3860FFDA); /* li    r3, -ENOSYS     */
-        ps3_put_be32(ram + 0xC18, 0x7D80D2A6); /* mfspr r12, SRR0       */
-        ps3_put_be32(ram + 0xC1C, 0x7D80D3A6); /* mtspr SRR0, r12       */
-        ps3_put_be32(ram + 0xC20, 0x4C000024); /* rfid                  */
+        ps3_put_be32(ram + 0xC04, 0x618CF104); /* ori   r12, r12, 0xF104 */
+        ps3_put_be32(ram + 0xC08, 0x558C801E); /* slwi  r12, r12, 16    */
+        ps3_put_be32(ram + 0xC0C, 0x618C0014); /* ori   r12, r12, 0x14  */
+        ps3_put_be32(ram + 0xC10, 0x916C0000); /* stw   r11, 0(r12)     */
+        ps3_put_be32(ram + 0xC14, 0x2C0B015C); /* cmpwi r11, 0x15C      */
+        ps3_put_be32(ram + 0xC18, 0x4182002C); /* beq   0xC44           */
+        ps3_put_be32(ram + 0xC1C, 0x2C0B0193); /* cmpwi r11, 0x193      */
+        ps3_put_be32(ram + 0xC20, 0x4182004C); /* beq   0xC6C           */
+        ps3_put_be32(ram + 0xC24, 0x3860FFDA); /* li    r3, -ENOSYS     */
+        ps3_put_be32(ram + 0xC28, 0x4800000C); /* b     0xC34           */
+        ps3_put_be32(ram + 0xC2C, 0x38600000); /* li    r3, 0           */
+        ps3_put_be32(ram + 0xC30, 0x48000004); /* b     0xC34           */
+        ps3_put_be32(ram + 0xC34, 0x7D80D2A6); /* mfspr r12, SRR0       */
+        ps3_put_be32(ram + 0xC38, 0x7D80D3A6); /* mtspr SRR0, r12       */
+        ps3_put_be32(ram + 0xC3C, 0x4C000024); /* rfid                  */
 
         /* sys_memory_allocate(size, flags, u32 *addr) */
-        ps3_put_be32(ram + 0xC30, 0x800C0008); /* lwz   r0, 8(r12)      */
-        ps3_put_be32(ram + 0xC34, 0x90050000); /* stw   r0, 0(r5)       */
-        ps3_put_be32(ram + 0xC38, 0x7C001A14); /* add   r0, r0, r3      */
-        ps3_put_be32(ram + 0xC3C, 0x380000FF); /* addi  r0, r0, 0xFF    */
-        ps3_put_be32(ram + 0xC40, 0x5400063E); /* clrrwi r0, r0, 8      */
-        ps3_put_be32(ram + 0xC44, 0x900C0008); /* stw   r0, 8(r12)      */
-        ps3_put_be32(ram + 0xC48, 0x38600000); /* li    r3, 0           */
-        ps3_put_be32(ram + 0xC4C, 0x7D80D2A6); /* mfspr r12, SRR0       */
-        ps3_put_be32(ram + 0xC50, 0x7D80D3A6); /* mtspr SRR0, r12       */
-        ps3_put_be32(ram + 0xC54, 0x4C000024); /* rfid                  */
+        ps3_put_be32(ram + 0xC44, 0x3D800000); /* lis   r12, 0          */
+        ps3_put_be32(ram + 0xC48, 0x618C0800); /* ori   r12, r12, 0x800 */
+        ps3_put_be32(ram + 0xC4C, 0x800C0008); /* lwz   r0, 8(r12)      */
+        ps3_put_be32(ram + 0xC50, 0x90050000); /* stw   r0, 0(r5)       */
+        ps3_put_be32(ram + 0xC54, 0x7C001A14); /* add   r0, r0, r3      */
+        ps3_put_be32(ram + 0xC58, 0x380000FF); /* addi  r0, r0, 0xFF    */
+        ps3_put_be32(ram + 0xC5C, 0x5400063E); /* clrrwi r0, r0, 8      */
+        ps3_put_be32(ram + 0xC60, 0x900C0008); /* stw   r0, 8(r12)      */
+        ps3_put_be32(ram + 0xC64, 0x38600000); /* li    r3, 0           */
+        ps3_put_be32(ram + 0xC68, 0x4BFFFFCC); /* b     0xC34           */
+
+        /* sys_tty_write(channel, buf, len, u32 *written) */
+        ps3_put_be32(ram + 0xC6C, 0x3D8000FF); /* lis   r12, 0x00FF     */
+        ps3_put_be32(ram + 0xC70, 0x618CF31C); /* ori   r12, r12, 0xF31C */
+        ps3_put_be32(ram + 0xC74, 0x38E00000); /* li    r7, 0           */
+        ps3_put_be32(ram + 0xC78, 0x7C072800); /* cmpw  r7, r5          */
+        ps3_put_be32(ram + 0xC7C, 0x4080001C); /* bge   0xC98           */
+        ps3_put_be32(ram + 0xC80, 0x7D0438AE); /* lbzx  r8, r4, r7      */
+        ps3_put_be32(ram + 0xC84, 0x990C0000); /* stb   r8, 0(r12)      */
+        ps3_put_be32(ram + 0xC88, 0x38E70001); /* addi  r7, r7, 1       */
+        ps3_put_be32(ram + 0xC8C, 0x4BFFFFEC); /* b     0xC78           */
+        ps3_put_be32(ram + 0xC90, 0x60000000); /* nop                   */
+        ps3_put_be32(ram + 0xC94, 0x60000000); /* nop                   */
+        ps3_put_be32(ram + 0xC98, 0x90E60000); /* stw   r7, 0(r6)       */
+        ps3_put_be32(ram + 0xC9C, 0x38600000); /* li    r3, 0           */
+        ps3_put_be32(ram + 0xCA0, 0x4BFFFF94); /* b     0xC34           */
 
         /* lv2 heap: above the VSH image and below the initial stack. */
         ps3_put_be32(ram + 0x808, 0x01000000);
