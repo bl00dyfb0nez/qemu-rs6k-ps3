@@ -590,6 +590,35 @@ static uint32_t ps3_be32(const uint8_t *p)
            ((uint32_t)p[2] << 8) | p[3];
 }
 
+/*
+ * The lv2 syscall trampoline used by vsh-run, assembled from the shim below
+ * with the Cell PPU binutils:
+ *
+ *   lis/ori/slwi  load 0xF1040014, the board's syscall trace register
+ *   stw r11       report the number, then dispatch on it
+ *   0x15C         sys_memory_allocate: bump a heap at RAM+0x808, align to 0x100
+ *   0x193         sys_tty_write: copy the guest buffer to the PPE UART
+ *   0x5F/0x64/0x69  lwmutex/mutex/cond create: store id 1 at *r3
+ *   0x61/0x62/0x66/0x68  lock/unlock: succeed
+ *   0x93          sys_time_get_timebase_frequency: 79,800,000
+ *   default       return -ENOSYS, restore SRR0 and rfid
+ *
+ * The .S file is kept beside this comment in the development tree; these are
+ * the linked instruction words, so the runtime does not need an assembler.
+ */
+static const uint32_t ps3_lv2_shim[] = {
+    0x3D800000, 0x618CF104, 0x558C801E, 0x618C0014, 0x916C0000, 0x2C0B015C,
+    0x41820074, 0x2C0B0193, 0x41820094, 0x2C0B005F, 0x41820040, 0x2C0B0064,
+    0x41820038, 0x2C0B0069, 0x41820030, 0x2C0B0093, 0x41820038, 0x2C0B0061,
+    0x41820028, 0x2C0B0062, 0x41820020, 0x2C0B0066, 0x41820018, 0x2C0B0068,
+    0x41820010, 0x48000020, 0x38000001, 0x90030000, 0x38600000, 0x48000070,
+    0x3C6004C1, 0x60639A40, 0x48000064, 0x3860FFDA, 0x4800005C, 0x3D800000,
+    0x618C0800, 0x800C0008, 0x90050000, 0x7C001A14, 0x380000FF, 0x5400002E,
+    0x900C0008, 0x38600000, 0x48000034, 0x3D8000FF, 0x618CF31C, 0x38E00000,
+    0x7C072800, 0x40800014, 0x7D0438AE, 0x990C0000, 0x38E70001, 0x4BFFFFEC,
+    0x90E60000, 0x38600000, 0x48000004, 0x7D9A02A6, 0x7D9A03A6, 0x4C000024,
+};
+
 static void ps3_put_be32(uint8_t *p, uint32_t v)
 {
     p[0] = v >> 24;
@@ -2407,55 +2436,14 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         /*
          * The lv2 syscall boundary.  A bare PPU has no handler at the 0xC00
          * vector, so the first sc would run zeros and take a program
-         * exception.  This trampoline records the syscall number in low RAM,
-         * returns -ENOSYS in r3 and rfid's back to the caller, which lets the
-         * guest's own startup path continue far enough to show which lv2
-         * services it needs.  It is a bring-up probe, not an lv2 model.
+         * exception.  The shim is a bring-up lv2, not a full kernel: it
+         * handles the calls the VSH's C runtime makes while it initializes
+         * (memory, locks, timebase, tty), reports each number at 0xF1040014,
+         * and returns -ENOSYS for anything else.
          */
-        ps3_put_be32(ram + 0xC00, 0x3D800000); /* lis   r12, 0          */
-        ps3_put_be32(ram + 0xC04, 0x618CF104); /* ori   r12, r12, 0xF104 */
-        ps3_put_be32(ram + 0xC08, 0x558C801E); /* slwi  r12, r12, 16    */
-        ps3_put_be32(ram + 0xC0C, 0x618C0014); /* ori   r12, r12, 0x14  */
-        ps3_put_be32(ram + 0xC10, 0x916C0000); /* stw   r11, 0(r12)     */
-        ps3_put_be32(ram + 0xC14, 0x2C0B015C); /* cmpwi r11, 0x15C      */
-        ps3_put_be32(ram + 0xC18, 0x4182002C); /* beq   0xC44           */
-        ps3_put_be32(ram + 0xC1C, 0x2C0B0193); /* cmpwi r11, 0x193      */
-        ps3_put_be32(ram + 0xC20, 0x4182004C); /* beq   0xC6C           */
-        ps3_put_be32(ram + 0xC24, 0x3860FFDA); /* li    r3, -ENOSYS     */
-        ps3_put_be32(ram + 0xC28, 0x4800000C); /* b     0xC34           */
-        ps3_put_be32(ram + 0xC2C, 0x38600000); /* li    r3, 0           */
-        ps3_put_be32(ram + 0xC30, 0x48000004); /* b     0xC34           */
-        ps3_put_be32(ram + 0xC34, 0x7D80D2A6); /* mfspr r12, SRR0       */
-        ps3_put_be32(ram + 0xC38, 0x7D80D3A6); /* mtspr SRR0, r12       */
-        ps3_put_be32(ram + 0xC3C, 0x4C000024); /* rfid                  */
-
-        /* sys_memory_allocate(size, flags, u32 *addr) */
-        ps3_put_be32(ram + 0xC44, 0x3D800000); /* lis   r12, 0          */
-        ps3_put_be32(ram + 0xC48, 0x618C0800); /* ori   r12, r12, 0x800 */
-        ps3_put_be32(ram + 0xC4C, 0x800C0008); /* lwz   r0, 8(r12)      */
-        ps3_put_be32(ram + 0xC50, 0x90050000); /* stw   r0, 0(r5)       */
-        ps3_put_be32(ram + 0xC54, 0x7C001A14); /* add   r0, r0, r3      */
-        ps3_put_be32(ram + 0xC58, 0x380000FF); /* addi  r0, r0, 0xFF    */
-        ps3_put_be32(ram + 0xC5C, 0x5400063E); /* clrrwi r0, r0, 8      */
-        ps3_put_be32(ram + 0xC60, 0x900C0008); /* stw   r0, 8(r12)      */
-        ps3_put_be32(ram + 0xC64, 0x38600000); /* li    r3, 0           */
-        ps3_put_be32(ram + 0xC68, 0x4BFFFFCC); /* b     0xC34           */
-
-        /* sys_tty_write(channel, buf, len, u32 *written) */
-        ps3_put_be32(ram + 0xC6C, 0x3D8000FF); /* lis   r12, 0x00FF     */
-        ps3_put_be32(ram + 0xC70, 0x618CF31C); /* ori   r12, r12, 0xF31C */
-        ps3_put_be32(ram + 0xC74, 0x38E00000); /* li    r7, 0           */
-        ps3_put_be32(ram + 0xC78, 0x7C072800); /* cmpw  r7, r5          */
-        ps3_put_be32(ram + 0xC7C, 0x4080001C); /* bge   0xC98           */
-        ps3_put_be32(ram + 0xC80, 0x7D0438AE); /* lbzx  r8, r4, r7      */
-        ps3_put_be32(ram + 0xC84, 0x990C0000); /* stb   r8, 0(r12)      */
-        ps3_put_be32(ram + 0xC88, 0x38E70001); /* addi  r7, r7, 1       */
-        ps3_put_be32(ram + 0xC8C, 0x4BFFFFEC); /* b     0xC78           */
-        ps3_put_be32(ram + 0xC90, 0x60000000); /* nop                   */
-        ps3_put_be32(ram + 0xC94, 0x60000000); /* nop                   */
-        ps3_put_be32(ram + 0xC98, 0x90E60000); /* stw   r7, 0(r6)       */
-        ps3_put_be32(ram + 0xC9C, 0x38600000); /* li    r3, 0           */
-        ps3_put_be32(ram + 0xCA0, 0x4BFFFF94); /* b     0xC34           */
+        for (size_t i = 0; i < ARRAY_SIZE(ps3_lv2_shim); i++) {
+            ps3_put_be32(ram + 0xC00 + i * 4, ps3_lv2_shim[i]);
+        }
 
         /* lv2 heap: above the VSH image and below the initial stack. */
         ps3_put_be32(ram + 0x808, 0x01000000);
