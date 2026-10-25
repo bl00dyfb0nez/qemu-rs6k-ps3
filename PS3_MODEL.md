@@ -12,7 +12,7 @@ Nothing here is needed to build or use the rest of QEMU.
 
 > I do not take any credit it will be stated in the PS3_MODEL.md.
 >
-> - zecoxao
+> - bl00dyb0nes
 
 The boot-chain research this model rests on is theirs, not mine:
 
