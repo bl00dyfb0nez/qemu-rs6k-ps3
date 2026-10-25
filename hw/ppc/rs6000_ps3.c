@@ -2017,6 +2017,72 @@ static void ps3_lv2_relink_all(PS3BootROMState *s, uint8_t *ram,
  * exports are patched, so a stray match elsewhere in the image cannot do any
  * damage.
  */
+/* Does `opd' look like a function descriptor inside [lo, hi)? */
+static bool ps3_lv2_opd_ok(const uint8_t *ram, uint64_t ram_size, uint32_t opd,
+                           uint32_t lo, uint32_t hi)
+{
+    uint32_t code;
+
+    if ((uint64_t)opd + 8 > ram_size) {
+        return false;
+    }
+
+    code = ps3_be32(ram + opd);
+    return code >= lo && code < hi;
+}
+
+/*
+ * The process's own exports: what the executable publishes for the modules it
+ * loads (the VSH exports `sysPrxForUser`, `vsh`, `stdc` and so on).  appldr
+ * registers these for lv2; this model recovers them from the image, and the
+ * OPD check keeps the scan honest - an export entry lists function
+ * descriptors, an import entry lists pointers to stubs.
+ */
+static unsigned ps3_lv2_register_process_exports(PS3BootROMState *s,
+                                                 uint8_t *ram,
+                                                 uint64_t ram_size)
+{
+    uint32_t addr;
+    unsigned added = 0;
+
+    if (!s->vsh_lo || s->vsh_hi <= s->vsh_lo) {
+        return 0;
+    }
+
+    for (addr = s->vsh_lo; addr + PS3_PRX_ENTRY_MIN <= s->vsh_hi; addr += 4) {
+        PS3PrxEntry e;
+        char lib[28];
+
+        if (!ps3_prx_entry(ram, ram_size, addr, s->vsh_hi, &e) ||
+            !(e.attributes & PS3_PRX_LIB_ATTRIBUTE) ||
+            (e.attributes & PS3_PRX_LIB_STUB) ||
+            !e.num_func ||
+            !ps3_lv2_guest_string(ram, ram_size, e.name, lib, sizeof(lib)) ||
+            !ps3_prx_array(ram_size, e.nids, e.num_func) ||
+            !ps3_prx_array(ram_size, e.addrs, e.num_func) ||
+            !ps3_lv2_opd_ok(ram, ram_size, ps3_be32(ram + e.addrs),
+                            s->vsh_lo, s->vsh_hi)) {
+            continue;
+        }
+
+        for (unsigned i = 0; i < e.num_func; i++) {
+            uint32_t opd = ps3_be32(ram + e.addrs + 4 * i);
+
+            if (!ps3_lv2_opd_ok(ram, ram_size, opd, s->vsh_lo, s->vsh_hi)) {
+                continue;
+            }
+            ps3_lv2_add_export(s, lib, ps3_be32(ram + e.nids + 4 * i), opd,
+                               0);
+            added++;
+        }
+
+        info_report("ps3-ppu: lv2: process exports %s (%u function(s))",
+                    lib, e.num_func);
+    }
+
+    return added;
+}
+
 static unsigned ps3_lv2_link_process(PS3BootROMState *s, uint8_t *ram,
                                      uint64_t ram_size)
 {
@@ -3754,6 +3820,8 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         s->lv2_container_size = 0;
         s->lv2_mod_count = 0;
         s->lv2_export_count = 0;
+        ps3_lv2_register_process_exports(s, ram, ram_size);
+        ps3_lv2_link_process(s, ram, ram_size);
         s->lv2_exited = false;
         s->lv2_exit_status = 0;
         ps3_put_be32(ram + PS3_LV2_HEAP, 0x01000000);
