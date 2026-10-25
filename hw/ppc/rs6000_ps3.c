@@ -570,6 +570,11 @@ struct PS3BootROMState {
     uint64_t vsh_bytes;
     char vsh_why[160];
 
+    /* The lv2 layer vsh-run answers the guest's syscalls with. */
+    uint32_t lv2_next_id;
+    bool lv2_exited;
+    int32_t lv2_exit_status;
+
     uint8_t rom[PS3_ROM_SIZE];
     size_t rom_len;
     uint8_t *flash;
@@ -590,32 +595,26 @@ static uint32_t ps3_be32(const uint8_t *p)
 }
 
 /*
- * The lv2 syscall trampoline used by vsh-run, assembled from the shim below
- * with the Cell PPU binutils:
+ * The lv2 syscall trampoline used by vsh-run.
  *
- *   lis/ori/slwi  load 0xF1040014, the board's syscall trace register
- *   stw r11       report the number, then dispatch on it
- *   0x15C         sys_memory_allocate: bump a heap at RAM+0x808, align to 0x100
- *   0x193         sys_tty_write: copy the guest buffer to the PPE UART
- *   0x5F/0x64/0x69  lwmutex/mutex/cond create: store id 1 at *r3
- *   0x61/0x62/0x66/0x68  lock/unlock: succeed
- *   0x93          sys_time_get_timebase_frequency: 79,800,000
- *   default       return -ENOSYS, restore SRR0 and rfid
+ * lv2 is the Cell's operating system layer: a guest `sc` enters at 0xC00 with
+ * the call number in r11 and the arguments in r3..r10.  A bare 970FX has no
+ * handler there, so the trampoline does the one thing the guest cannot do for
+ * itself - it publishes the call to the board by storing r11 in the register
+ * window at 0xF1040014.  ps3_lv2_service() runs the call from there, reads the
+ * arguments out of the live GPRs and leaves r3 plus an exit flag in the
+ * scratch block at RAM 0x880; the trampoline returns them with the rfid lv2
+ * itself would use.
  *
- * The .S file is kept beside this comment in the development tree; these are
- * the linked instruction words, so the runtime does not need an assembler.
+ * The .S source and the encoder that produces these words live beside each
+ * other in the development tree (.tmp/ps3_lv2_shim.S, .tmp/shimasm.py); the
+ * encoder is checked against the previous trampoline image, so the words
+ * below need no assembler at runtime.
  */
 static const uint32_t ps3_lv2_shim[] = {
-    0x3D800000, 0x618CF104, 0x558C801E, 0x618C0014, 0x916C0000, 0x2C0B015C,
-    0x41820074, 0x2C0B0193, 0x41820094, 0x2C0B005F, 0x41820040, 0x2C0B0064,
-    0x41820038, 0x2C0B0069, 0x41820030, 0x2C0B0093, 0x41820038, 0x2C0B0061,
-    0x41820028, 0x2C0B0062, 0x41820020, 0x2C0B0066, 0x41820018, 0x2C0B0068,
-    0x41820010, 0x48000020, 0x38000001, 0x90030000, 0x38600000, 0x48000070,
-    0x3C6004C1, 0x60639A40, 0x48000064, 0x3860FFDA, 0x4800005C, 0x3D800000,
-    0x618C0800, 0x800C0008, 0x90050000, 0x7C001A14, 0x380000FF, 0x5400002E,
-    0x900C0008, 0x38600000, 0x48000034, 0x3D8000FF, 0x618CF31C, 0x38E00000,
-    0x7C072800, 0x40800014, 0x7D0438AE, 0x990C0000, 0x38E70001, 0x4BFFFFEC,
-    0x90E60000, 0x38600000, 0x48000004, 0x7D9A02A6, 0x7D9A03A6, 0x4C000024,
+    0x3D800000, 0x618CF104, 0x558C801E, 0x618C0014, 0x916C0000,
+    0x3D800000, 0x618C0880, 0x806C0000, 0x800C0004, 0x2C000000,
+    0x40820010, 0x7D9A02A6, 0x7D9A03A6, 0x4C000024, 0x48000000,
 };
 
 static void ps3_put_be32(uint8_t *p, uint32_t v)
@@ -625,6 +624,20 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
     p[2] = v >> 8;
     p[3] = v;
 }
+
+/*
+ * The lv2 scratch area: the 0xC00 trampoline collects the return value from
+ * 0x880 and reads 0x884 to learn that the process has ended.  0x808 holds the
+ * bump pointer sys_memory_allocate hands out blocks from.
+ */
+#define PS3_LV2_SCRATCH 0x880
+#define PS3_LV2_HEAP    0x808
+
+/* lv2 reports its errors as negative Cell error codes. */
+#define PS3_LV2_EINVAL  ((int32_t)0x80010002)
+#define PS3_LV2_ENOSYS  ((int32_t)0x80010003)
+#define PS3_LV2_ENOMEM  ((int32_t)0x80010004)
+#define PS3_LV2_EFAULT  ((int32_t)0x8001000D)
 
 /*
  * The mask ROM is stored with each 32-bit word byte reversed (the dump's
@@ -1204,6 +1217,8 @@ static uint64_t ps3_rom_regs_read(void *opaque, hwaddr offset, unsigned size)
     }
 }
 
+static void ps3_lv2_service(PS3BootROMState *s);
+
 static void ps3_rom_regs_write(void *opaque, hwaddr offset, uint64_t value,
                                unsigned size)
 {
@@ -1217,19 +1232,10 @@ static void ps3_rom_regs_write(void *opaque, hwaddr offset, uint64_t value,
             ps3_rom_selftest(s);
         }
         break;
-    case 0x14: {
-        /* The vsh-run syscall shim reports r11 here. */
-        CPUState *cs = qemu_get_cpu(0);
-
-        if (s->ppu_trace && cs) {
-            PowerPCCPU *cpu = POWERPC_CPU(cs);
-
-            info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64
-                        ", pc=0x%" PRIX64 ")", (uint32_t)value,
-                        (uint64_t)cpu->env.lr, (uint64_t)cpu->env.nip);
-        }
+    case 0x14:
+        /* vsh-run's 0xC00 trampoline publishes each lv2 call here. */
+        ps3_lv2_service(s);
         break;
-    }
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ps3-boot-rom: write to 0x%" HWADDR_PRIx "\n", offset);
@@ -1426,27 +1432,42 @@ static uint64_t ps3_ppe_uart_read(void *opaque, hwaddr addr, unsigned size)
     return 0;
 }
 
-static void ps3_ppe_uart_write(void *opaque, hwaddr addr, uint64_t value,
-                               unsigned size)
+static void ps3_uart_flush(PS3BootROMState *s)
 {
-    PS3BootROMState *s = opaque;
-    uint8_t ch = value & 0xFF;
-
-    if (addr != PS3_PPE_UART_DATA) {
-        return;
+    if (s->uart_len) {
+        s->uart_line[s->uart_len] = 0;
+        info_report("ps3-ppu console: %s", s->uart_line);
+        s->uart_len = 0;
     }
+}
 
+/*
+ * One console character.  lv0 polls the same port, and sys_tty_write feeds it
+ * from the lv2 side, so both paths share this.
+ */
+static void ps3_uart_putc(PS3BootROMState *s, uint8_t ch)
+{
     if (ch == '\r') {
         return;
     }
 
     if (ch == '\n' || s->uart_len + 1 >= sizeof(s->uart_line)) {
-        s->uart_line[s->uart_len] = 0;
-        info_report("ps3-ppu console: %s", s->uart_line);
-        s->uart_len = 0;
+        ps3_uart_flush(s);
     } else {
         s->uart_line[s->uart_len++] = ch;
     }
+}
+
+static void ps3_ppe_uart_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size)
+{
+    PS3BootROMState *s = opaque;
+
+    if (addr != PS3_PPE_UART_DATA) {
+        return;
+    }
+
+    ps3_uart_putc(s, value & 0xFF);
 }
 
 static const MemoryRegionOps ps3_ppe_uart_ops = {
@@ -1458,6 +1479,141 @@ static const MemoryRegionOps ps3_ppe_uart_ops = {
         .max_access_size = 4,
     },
 };
+
+/*
+ * The lv2 services vsh-run answers, in the order the VSH asks for them.
+ *
+ * This is not a kernel: there is no scheduler, and a call runs to completion
+ * on the calling thread.  What it does have is the semantics liblv2 and the
+ * VSH's C runtime depend on - process identity, the PARAM.SFO they check, the
+ * memory they allocate, the sync objects they create and the console they
+ * write to - so the guest runs its own startup code instead of stopping at
+ * the first handshake.
+ *
+ * The trampoline published the call number but kept the registers, so the
+ * arguments are read from the CPU here and the result is left in the scratch
+ * block at RAM 0x880 for the trampoline to collect.
+ */
+static void ps3_lv2_service(PS3BootROMState *s)
+{
+    CPUState *cs = qemu_get_cpu(0);
+    PowerPCCPU *cpu;
+    uint8_t *ram;
+    uint64_t ram_size;
+    uint32_t nr, a0, a1, a2, a3;
+    int32_t ret = PS3_LV2_ENOSYS;
+
+    if (!cs) {
+        return;
+    }
+
+    cpu = POWERPC_CPU(cs);
+    ram = memory_region_get_ram_ptr(s->ram);
+    ram_size = memory_region_size(s->ram);
+    nr = cpu->env.gpr[11];
+    a0 = cpu->env.gpr[3];
+    a1 = cpu->env.gpr[4];
+    a2 = cpu->env.gpr[5];
+    a3 = cpu->env.gpr[6];
+
+    if (s->ppu_trace) {
+        info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64
+                    ", pc=0x%" PRIX64 ")", nr, (uint64_t)cpu->env.lr,
+                    (uint64_t)cpu->env.nip);
+    }
+
+    switch (nr) {
+    case 0x001:                 /* sys_process_getpid */
+        ret = 1;
+        break;
+    case 0x012:                 /* sys_process_getppid */
+        ret = 0;
+        break;
+    case 0x016:                 /* _sys_process_exit(status) */
+        s->lv2_exit_status = (int32_t)a0;
+        s->lv2_exited = true;
+        ps3_uart_flush(s);
+        info_report("ps3-ppu: process exited with status %d",
+                    s->lv2_exit_status);
+        ps3_put_be32(ram + PS3_LV2_SCRATCH, 0);
+        ps3_put_be32(ram + PS3_LV2_SCRATCH + 4, 1);
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        return;
+    case 0x01E:                 /* _sys_process_get_paramsfo(buf) */
+        if ((uint64_t)a0 + 0x40 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        /* A valid, empty SFO header: magic, version, two tables, no entries. */
+        memset(ram + a0, 0, 0x40);
+        ps3_put_be32(ram + a0, 0x00505346);
+        ps3_put_be32(ram + a0 + 0x04, 0x00000101);
+        ps3_put_be32(ram + a0 + 0x08, 0x00000014);
+        ps3_put_be32(ram + a0 + 0x0C, 0x00000014);
+        ret = 0;
+        break;
+    case 0x05F:                 /* _sys_lwmutex_create(id*, ...) */
+    case 0x064:                 /* sys_mutex_create(id*, attr*) */
+    case 0x069:                 /* sys_cond_create(id*, mutex_id, attr*) */
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a0, ++s->lv2_next_id);
+        ret = 0;
+        break;
+    case 0x060: case 0x061: case 0x062: case 0x063:     /* lwmutex */
+    case 0x065: case 0x066: case 0x067: case 0x068:     /* mutex */
+    case 0x06A: case 0x06B: case 0x06C: case 0x06D: case 0x06E: /* cond */
+        ret = 0;
+        break;
+    case 0x093:                 /* sys_time_get_timebase_frequency */
+        ret = 79800000;
+        break;
+    case 0x15C: {               /* sys_memory_allocate(size, flags, addr*) */
+        uint32_t heap = ps3_be32(ram + PS3_LV2_HEAP);
+        uint32_t end = (heap + a0 + 0xFF) & ~0xFFu;
+
+        if (!a0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if ((uint64_t)a2 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (end < heap || (uint64_t)end + 0x100 > ram_size) {
+            ret = PS3_LV2_ENOMEM;
+            break;
+        }
+        ps3_put_be32(ram + a2, heap);
+        ps3_put_be32(ram + PS3_LV2_HEAP, end);
+        ret = 0;
+        break;
+    }
+    case 0x193: {               /* sys_tty_write(channel, buf, len, written) */
+        uint32_t i;
+
+        if ((uint64_t)a1 + a2 > ram_size || (uint64_t)a3 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (i = 0; i < a2; i++) {
+            ps3_uart_putc(s, ram[a1 + i]);
+        }
+        ps3_put_be32(ram + a3, a2);
+        ret = 0;
+        break;
+    }
+    default:
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2 syscall 0x%X is not modelled", nr);
+        }
+        break;
+    }
+
+    ps3_put_be32(ram + PS3_LV2_SCRATCH, (uint32_t)ret);
+}
 
 static void ps3_rom_realize(DeviceState *dev, Error **errp)
 {
@@ -1931,6 +2087,12 @@ static void ps3_ppu_reset_entry(void *opaque)
     cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
 
     if (s->vsh_run && s->vsh_toc) {
+        /*
+         * lv2 enables floating point and Altivec for a user process before it
+         * enters it; the VSH uses both, and without MSR[FP] its first float
+         * operation would take the 0x800 vector instead of running.
+         */
+        cpu->env.msr |= (1ULL << MSR_FP) | (1ULL << MSR_VR);
         cpu->env.gpr[2] = s->vsh_toc;
         cpu->env.gpr[1] = memory_region_size(s->ram) - 0x100;
         cpu->env.gpr[3] = 0;
@@ -2418,7 +2580,8 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         cpu->env.gpr[1] = ram_size - 0x100;
         cpu->env.gpr[3] = 0;
         cpu->env.gpr[4] = 0;
-        cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME);
+        cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME) |
+                        (1ULL << MSR_FP) | (1ULL << MSR_VR);
         cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
         /*
          * The lv2 syscall boundary.  A bare PPU has no handler at the 0xC00
@@ -2432,8 +2595,12 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
             ps3_put_be32(ram + 0xC00 + i * 4, ps3_lv2_shim[i]);
         }
 
-        /* lv2 heap: above the VSH image and below the initial stack. */
-        ps3_put_be32(ram + 0x808, 0x01000000);
+        /* lv2 scratch, then the heap above the VSH image and below the stack. */
+        memset(ram + PS3_LV2_SCRATCH, 0, 8);
+        s->lv2_next_id = 0;
+        s->lv2_exited = false;
+        s->lv2_exit_status = 0;
+        ps3_put_be32(ram + PS3_LV2_HEAP, 0x01000000);
 
         s->ppu_entry = code;
         s->ppu_last_pc = code;

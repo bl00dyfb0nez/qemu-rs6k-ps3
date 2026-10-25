@@ -14,6 +14,7 @@ Nothing here is needed to build or use the rest of QEMU.
 >
 > - bl00dyb0nes
 
+- RPCS3 Team
 - zecoxao
 - wildcard
 - ZeroTolerance
