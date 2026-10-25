@@ -572,6 +572,7 @@ struct PS3BootROMState {
 
     /* The lv2 layer vsh-run answers the guest's syscalls with. */
     uint32_t lv2_next_id;
+    uint32_t lv2_container_size;
     bool lv2_exited;
     int32_t lv2_exit_status;
 
@@ -606,10 +607,25 @@ static uint32_t ps3_be32(const uint8_t *p)
  * scratch block at RAM 0x880; the trampoline returns them with the rfid lv2
  * itself would use.
  *
- * The .S source and the encoder that produces these words live beside each
- * other in the development tree (.tmp/ps3_lv2_shim.S, .tmp/shimasm.py); the
- * encoder is checked against the previous trampoline image, so the words
- * below need no assembler at runtime.
+ * The words are this program, already linked, so the runtime needs no
+ * assembler:
+ *
+ *     lis   r12, 0
+ *     ori   r12, r12, 0xF104
+ *     slwi  r12, r12, 16
+ *     ori   r12, r12, 0x14
+ *     stw   r11, 0(r12)      publish the call to the board
+ *     lis   r12, 0
+ *     ori   r12, r12, 0x880
+ *     lwz   r3, 0(r12)       return value
+ *     lwz   r0, 4(r12)       exit flag
+ *     cmpwi r0, 0
+ *     bne   halt
+ *     mfspr r12, 26
+ *     mtspr 26, r12
+ *     rfid
+ * halt:
+ *     b     halt
  */
 static const uint32_t ps3_lv2_shim[] = {
     0x3D800000, 0x618CF104, 0x558C801E, 0x618C0014, 0x916C0000,
@@ -1481,6 +1497,32 @@ static const MemoryRegionOps ps3_ppe_uart_ops = {
 };
 
 /*
+ * The memory container: a bump heap above the loaded image.  Both allocate
+ * calls hand out 256-byte aligned blocks from it, and free is a no-op, which
+ * is all the guest's allocator needs from a container this simple.
+ */
+static int32_t ps3_lv2_alloc(uint8_t *ram, uint64_t ram_size, uint32_t size,
+                             uint32_t out)
+{
+    uint32_t heap = ps3_be32(ram + PS3_LV2_HEAP);
+    uint32_t end = (heap + size + 0xFF) & ~0xFFu;
+
+    if (!size) {
+        return PS3_LV2_EINVAL;
+    }
+    if ((uint64_t)out + 4 > ram_size) {
+        return PS3_LV2_EFAULT;
+    }
+    if (end < heap || (uint64_t)end + 0x100 > ram_size) {
+        return PS3_LV2_ENOMEM;
+    }
+
+    ps3_put_be32(ram + out, heap);
+    ps3_put_be32(ram + PS3_LV2_HEAP, end);
+    return 0;
+}
+
+/*
  * The lv2 services vsh-run answers, in the order the VSH asks for them.
  *
  * This is not a kernel: there is no scheduler, and a call runs to completion
@@ -1552,9 +1594,13 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ps3_put_be32(ram + a0 + 0x0C, 0x00000014);
         ret = 0;
         break;
+    case 0x078:                 /* sys_rwlock_create(id*, attr*) */
+    case 0x080:                 /* sys_event_queue_create(id*, attr*, key, size) */
+    case 0x05A:                 /* sys_semaphore_create(id*, attr*, ...) */
     case 0x05F:                 /* _sys_lwmutex_create(id*, ...) */
     case 0x064:                 /* sys_mutex_create(id*, attr*) */
     case 0x069:                 /* sys_cond_create(id*, mutex_id, attr*) */
+    case 0x086:                 /* sys_event_port_create(id*, type, name) */
         if ((uint64_t)a0 + 4 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
@@ -1565,32 +1611,91 @@ static void ps3_lv2_service(PS3BootROMState *s)
     case 0x060: case 0x061: case 0x062: case 0x063:     /* lwmutex */
     case 0x065: case 0x066: case 0x067: case 0x068:     /* mutex */
     case 0x06A: case 0x06B: case 0x06C: case 0x06D: case 0x06E: /* cond */
+    case 0x05B: case 0x05C: case 0x05D: case 0x05E:     /* semaphore */
+    case 0x079:                 /* sys_rwlock_destroy */
+    case 0x081:                 /* sys_event_queue_destroy */
+    case 0x085:                 /* sys_event_queue_drain */
+    case 0x087:                 /* sys_event_port_destroy */
+    case 0x088:                 /* sys_event_port_connect_local */
+    case 0x089:                 /* sys_event_port_disconnect */
+    case 0x08A:                 /* sys_event_port_send */
+    case 0x08C:                 /* sys_event_port_connect_ipc */
+        ret = 0;
+        break;
+    case 0x144:                 /* sys_memory_container_create(id*, size) */
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        s->lv2_container_size = a1 & ~0xFFFFFu;
+        if (!s->lv2_container_size) {
+            ret = PS3_LV2_ENOMEM;
+            break;
+        }
+        ps3_put_be32(ram + a0, ++s->lv2_next_id);
+        ret = 0;
+        break;
+    case 0x145:                 /* sys_memory_container_destroy(id) */
+        ret = 0;
+        break;
+    case 0x157:                 /* sys_memory_container_get_size(size*, id) */
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a0, s->lv2_container_size);
+        ret = 0;
+        break;
+    case 0x160: {               /* sys_memory_get_user_memory_size(info*) */
+        uint32_t used = ps3_be32(ram + PS3_LV2_HEAP) - 0x01000000;
+
+        if ((uint64_t)a0 + 8 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a0, (uint32_t)ram_size);
+        ps3_put_be32(ram + a0 + 4, (uint32_t)ram_size - used);
+        ret = 0;
+        break;
+    }
+    case 0x072:                 /* sys_semaphore_get_value(id, val*) */
+        if ((uint64_t)a1 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a1, 1);
+        ret = 0;
+        break;
+    case 0x17C:                 /* sys_sm_get_params(a, b, c, d) */
+        if (!a0 || !a1 || (uint64_t)a2 + 4 > ram_size ||
+            (uint64_t)a3 + 8 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ram[a0] = 0;
+        ram[a1] = 0;
+        ps3_put_be32(ram + a2, 0x200);
+        ps3_put_be32(ram + a3, 0);
+        ps3_put_be32(ram + a3 + 4, 7);
+        ret = 0;
+        break;
+    case 0x15D:                 /* sys_memory_free(addr) */
+        ret = 0;
+        break;
+    case 0x1E4:                 /* _sys_prx_register_module(param*) */
+    case 0x1E6:                 /* _sys_prx_register_library(param*) */
         ret = 0;
         break;
     case 0x093:                 /* sys_time_get_timebase_frequency */
         ret = 79800000;
         break;
-    case 0x15C: {               /* sys_memory_allocate(size, flags, addr*) */
-        uint32_t heap = ps3_be32(ram + PS3_LV2_HEAP);
-        uint32_t end = (heap + a0 + 0xFF) & ~0xFFu;
-
-        if (!a0) {
-            ret = PS3_LV2_EINVAL;
-            break;
-        }
-        if ((uint64_t)a2 + 4 > ram_size) {
-            ret = PS3_LV2_EFAULT;
-            break;
-        }
-        if (end < heap || (uint64_t)end + 0x100 > ram_size) {
-            ret = PS3_LV2_ENOMEM;
-            break;
-        }
-        ps3_put_be32(ram + a2, heap);
-        ps3_put_be32(ram + PS3_LV2_HEAP, end);
-        ret = 0;
+    case 0x15C:                 /* sys_memory_allocate(size, flags, addr*) */
+        ret = ps3_lv2_alloc(ram, ram_size, a0, a2);
         break;
-    }
+    case 0x15E:                 /* sys_memory_allocate_from_container(id,
+                                 * size, flags, addr*) */
+        ret = ps3_lv2_alloc(ram, ram_size, a1, a3);
+        break;
     case 0x193: {               /* sys_tty_write(channel, buf, len, written) */
         uint32_t i;
 
@@ -2598,6 +2703,7 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         /* lv2 scratch, then the heap above the VSH image and below the stack. */
         memset(ram + PS3_LV2_SCRATCH, 0, 8);
         s->lv2_next_id = 0;
+        s->lv2_container_size = 0;
         s->lv2_exited = false;
         s->lv2_exit_status = 0;
         ps3_put_be32(ram + PS3_LV2_HEAP, 0x01000000);

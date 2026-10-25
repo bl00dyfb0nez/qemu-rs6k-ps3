@@ -318,17 +318,60 @@ $Q -M rs6000-ps3 -display none \
 Observed with the 4.93 `vsh.self` (3,154,016 bytes): two segments,
 `0x10000+0x6ABEA8` and `0x6C0000+0x91548`, both zlib.  The ELF entry is
 `0x6D5AC8`; its OPD gives code `0x10230` and TOC `0x6F5558`.  The guest runs
-from `_start` through its C runtime setup and reaches the lv2 boundary at
-`0x60C5C0` (first syscall `0x16`, `_sys_process_exit`), then `0x3DC`.
+from `_start` through its C runtime setup; the first lv2 call is
+`sys_mutex_create` at `0x10390`.  The core is entered with MSR[FP] and
+MSR[VR] set, because lv2 enables both for a user process - without them the
+VSH's first float operation takes the `0x800` vector instead of running.
 
-A bare PPU has no handler at the `0xC00` vector, so `vsh-run` installs a small
-trampoline there.  It records the syscall number at RAM `0x800`, returns
-`-ENOSYS` in `r3`, restores `SRR0` and `rfid`s back to the caller.  That is a
-bring-up probe, not an lv2 implementation: it lets the guest's own startup
-path run far enough to identify the services it needs.  The next real step is
-the lv2 syscall layer (process/thread creation, memory containers and the
-module loader); until that exists, VSH can be mapped and entered, but not
-completed.
+### The lv2 layer `vsh-run` answers
+
+A bare 970FX has no handler at the `0xC00` vector and cannot trap `sc` itself,
+so `vsh-run` installs a trampoline there.  It does not try to be a kernel in
+guest code: it publishes the call number (r11) to the board's register window
+at `0xF1040014` and waits for a result block at RAM `0x880`.  The C side
+(`ps3_lv2_service`) reads the arguments straight out of the live GPRs, runs the
+call, and leaves `r3` plus an exit flag; the trampoline returns with the same
+`rfid` lv2 uses, or spins when the process asked to end.  `ppu-trace` logs each
+call with the caller's `lr`.
+
+The calls the VSH asks for, in the order it first asks for them:
+
+| # | Key | Service | Model |
+| --- | --- | --- | --- |
+| 100 | `0x64` | `sys_mutex_create` | id from a counter |
+| 348 | `0x15C` | `sys_memory_allocate` | 256-byte blocks from a bump heap at RAM `0x808`, starting at `0x1000000` |
+| 105 | `0x69` | `sys_cond_create` | id |
+| 95 | `0x5F` | `_sys_lwmutex_create` | id |
+| 102/104 | `0x66`/`0x68` | `sys_mutex_lock`/`unlock` | succeed (a single thread) |
+| 147 | `0x93` | `sys_time_get_timebase_frequency` | 79,800,000 |
+| 30 | `0x1E` | `_sys_process_get_paramsfo` | a valid empty SFO header |
+| 403 | `0x193` | `sys_tty_write` | bytes to the PPE UART |
+| 22 | `0x16` | `_sys_process_exit` | flush the console, end the run |
+| 128/129/134/137 | `0x80`, `0x81`, `0x86`, `0x89` | event queue and port create, destroy, disconnect | id / succeed |
+| 324/325 | `0x144`/`0x145` | memory container create/destroy | id, 1 MiB granularity |
+| 352 | `0x160` | `sys_memory_get_user_memory_size` | total RAM and what the heap has left |
+
+`_sys_process_get_paramsfo` was what used to stop the boot: liblv2 asks for
+the process's PARAM.SFO, and with `-ENOSYS` it printed `liblv2 can't get
+PARAM.SFO` and called `_sys_process_exit`.  It now gets a syntactically valid
+SFO header (magic, version, two empty tables), and the VSH continues into its
+own initialisation: mutexes and condition variables, event queues and ports,
+a 3 MiB memory container, and its library registrations.
+
+Where that run stops:
+
+```
+ps3-ppu console: prx.c:sys_prx_load_module_on_memcontainer:Error: res(id)=0x80010003
+ps3-ppu console: load /dev_flash/sys/internal/libfs_utility2.sprx failed 0x80010003
+```
+
+`_sys_prx_load_module*`, `_sys_prx_start_module` and `_sys_ppu_thread_create`
+are not modelled, and they are not handlers that can be faked: the first two
+need the PPU module loader (open the SELF, relocate it, publish its exports)
+and the third needs a scheduler.  With the load refused, the VSH's fallback
+branches to an unmapped address (`0x39800000`), which QEMU reports as a
+hypervisor-emulation exception and leaves the core at the `0x700` vector.
+That is the next piece of lv2 to build, not a fault in the handlers above.
 
 ## Using it with the low-level boot chain
 
