@@ -563,6 +563,8 @@ struct PS3BootROMState {
     char *dev_flash3;
     bool vsh_run;
     uint32_t vsh_entry;
+    uint32_t vsh_toc;
+    uint32_t vsh_last_sc;
     unsigned vsh_segments;
     uint64_t vsh_bytes;
     char vsh_why[160];
@@ -1868,6 +1870,13 @@ static void ps3_ppu_reset_entry(void *opaque)
     cpu->env.nip = s->ppu_entry;
     cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME);
     cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
+
+    if (s->vsh_run && s->vsh_toc) {
+        cpu->env.gpr[2] = s->vsh_toc;
+        cpu->env.gpr[1] = memory_region_size(s->ram) - 0x100;
+        cpu->env.gpr[3] = 0;
+        cpu->env.gpr[4] = 0;
+    }
 }
 
 static void ps3_ppu_tick(void *opaque)
@@ -1878,6 +1887,17 @@ static void ps3_ppu_tick(void *opaque)
 
     s->ppu_last_pc = cpu->env.nip;
     s->ppu_tick_count++;
+
+    if (s->vsh_run) {
+        uint32_t sc = ps3_be32(memory_region_get_ram_ptr(s->ram) + 0x800);
+
+        if (sc && sc != s->vsh_last_sc) {
+            info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64 ", "
+                        "pc=0x%" PRIX64 ")", sc, (uint64_t)cpu->env.lr,
+                        (uint64_t)cpu->env.nip);
+            s->vsh_last_sc = sc;
+        }
+    }
 
     if (s->ppu_trace) {
         info_report("ps3-ppu: tick %" PRIu64 " pc=0x%" PRIx64
@@ -2062,6 +2082,315 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
         s->ppu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_ppu_tick, s);
         timer_mod(s->ppu_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ppu_tick_ns);
+    }
+
+    return true;
+}
+
+/*
+ * Open vsh.self.  It is an application SELF, not a loader one: the metadata
+ * root header is under the application keyset, so ps3_self_decrypt_app() is
+ * the right opener.  A plain ELF is accepted too, which is what the
+ * "decrypted" files in a dev_flash dump can be.
+ */
+static const uint8_t *ps3_vsh_open(uint8_t *img, size_t len,
+                                   uint64_t *header_len, uint32_t *meta_offset,
+                                   char *why, size_t why_len)
+{
+    const uint8_t *elf;
+
+    *header_len = 0;
+    *meta_offset = 0;
+
+    if (len < 0x40 || memcmp(img, "SCE\0", 4)) {
+        if (len < 64 || memcmp(img, "\177ELF", 4) || img[4] != 2 ||
+            img[5] != 2) {
+            snprintf(why, why_len, "neither a SCE container nor a 64-bit "
+                     "big-endian ELF");
+            return NULL;
+        }
+        return img;
+    }
+
+    if (!ps3_self_decrypt_app(img, len, why, why_len)) {
+        return NULL;
+    }
+
+    *header_len = ps3_be64(img + 0x10);
+    *meta_offset = ps3_be32(img + 0x0C);
+
+    /* The extended header names the ELF header directly (offset 0x30). */
+    elf = NULL;
+    if (ps3_be64(img + 0x30) + 0x40 <= len) {
+        const uint8_t *p = img + ps3_be64(img + 0x30);
+
+        if (!memcmp(p, "\177ELF", 4)) {
+            elf = p;
+        }
+    }
+
+    if (!elf) {
+        for (size_t i = 0x20; i + 0x40 < MIN(len, (size_t)0x400); i += 4) {
+            if (!memcmp(img + i, "\177ELF", 4)) {
+                elf = img + i;
+                break;
+            }
+        }
+    }
+
+    if (!elf) {
+        snprintf(why, why_len, "no ELF header inside the application SELF");
+        return NULL;
+    }
+
+    return elf;
+}
+
+/*
+ * Map the VSH into RAM the way lv2's ELF loader would: each PT_LOAD lands at
+ * its physical address, its metadata section (when the container has one)
+ * supplies the stored range, and compression 2 is zlib.  The segment headers
+ * are the source of the stored range for a SELF; for a plain ELF the program
+ * header's own file offset is used.
+ */
+static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
+{
+    g_autoptr(GError) err = NULL;
+    g_autofree uint8_t *img = NULL;
+    gsize len = 0;
+    const uint8_t *elf;
+    uint8_t *ram;
+    uint64_t ram_size, header_len, phoff, entry;
+    uint32_t meta_offset;
+    unsigned phnum, phentsize, loaded = 0, section_count = 0;
+    uint64_t bytes = 0;
+    char why[160];
+    bool is_self;
+
+    if (!s->ram) {
+        error_setg(errp, "ps3-vsh: no RAM link");
+        return false;
+    }
+
+    if (!g_file_get_contents(s->vsh_self, (gchar **)&img, &len, &err)) {
+        error_setg(errp, "ps3-vsh: cannot read %s: %s", s->vsh_self,
+                   err->message);
+        return false;
+    }
+
+    is_self = len >= 4 && !memcmp(img, "SCE\0", 4);
+    elf = ps3_vsh_open(img, len, &header_len, &meta_offset, why, sizeof(why));
+    if (!elf) {
+        error_setg(errp, "ps3-vsh: %s: %s", s->vsh_self, why);
+        return false;
+    }
+
+    phoff = is_self ? ps3_be64(img + 0x38) : ps3_be64(elf + 0x20);
+    phentsize = ((unsigned)elf[0x36] << 8) | elf[0x37];
+    phnum = ((unsigned)elf[0x38] << 8) | elf[0x39];
+
+    if (phentsize < 0x38 || phnum > 0x20 ||
+        phoff + (uint64_t)phnum * phentsize > len) {
+        error_setg(errp, "ps3-vsh: %s: program header table 0x%" PRIX64
+                   "/%u does not fit", s->vsh_self, phoff, phnum);
+        return false;
+    }
+
+    if (is_self) {
+        section_count = ps3_be32(img + meta_offset + 0x60 + 0x0C);
+        if (section_count > 0x40 ||
+            meta_offset + 0x80 + 0x30 * (uint64_t)section_count > header_len) {
+            error_setg(errp, "ps3-vsh: %s: section table %u does not fit",
+                       s->vsh_self, section_count);
+            return false;
+        }
+    }
+
+    ram = memory_region_get_ram_ptr(s->ram);
+    ram_size = memory_region_size(s->ram);
+
+    for (unsigned i = 0; i < phnum; i++) {
+        const uint8_t *p = img + phoff + (size_t)i * phentsize;
+        uint32_t type = ps3_be32(p);
+        uint64_t p_off = ps3_be64(p + 0x08);
+        uint64_t vaddr = ps3_be64(p + 0x10);
+        uint64_t paddr = ps3_be64(p + 0x18);
+        uint64_t filesz = ps3_be64(p + 0x20);
+        uint64_t memsz = ps3_be64(p + 0x28);
+        uint64_t pa = (paddr ? paddr : vaddr) & 0x0FFFFFFF;
+        uint64_t src_off = 0, src_len = 0;
+        uint32_t compression = 1;
+        const uint8_t *src;
+
+        if (type != 1 || !memsz) {
+            continue;
+        }
+
+        if (is_self) {
+            const uint8_t *entries = img + meta_offset + 0x80;
+
+            for (unsigned j = 0; j < section_count; j++) {
+                const uint8_t *e = entries + 0x30 * j;
+
+                if (ps3_be32(e + 0x10) == 2 &&
+                    ps3_be32(e + 0x14) == i) {
+                    src_off = ps3_be64(e);
+                    src_len = ps3_be64(e + 8);
+                    compression = ps3_be32(e + 0x2C);
+                    break;
+                }
+            }
+        }
+
+        if (!src_len) {
+            src_off = header_len + p_off;
+            src_len = filesz;
+            compression = 1;
+        }
+
+        if (src_off > len || src_len > len - src_off) {
+            error_setg(errp, "ps3-vsh: %s: segment %u data runs past the "
+                       "file", s->vsh_self, i);
+            return false;
+        }
+
+        if (pa + memsz > ram_size) {
+            pa &= 0x0FFFFFFF;
+        }
+        if (pa + memsz > ram_size) {
+            error_setg(errp, "ps3-vsh: %s: segment %u (0x%" PRIX64
+                       "/0x%" PRIX64 ") does not fit RAM",
+                       s->vsh_self, i, pa, memsz);
+            return false;
+        }
+
+        src = img + src_off;
+        memset(ram + pa, 0, memsz);
+
+        if (compression == 2) {
+            uLongf out = MIN(filesz ? filesz : memsz, memsz);
+            uint8_t *buf = g_malloc0(MAX(out, (uLongf)1));
+            int rc = uncompress(buf, &out, src, src_len);
+
+            if (rc != Z_OK) {
+                g_free(buf);
+                error_setg(errp, "ps3-vsh: %s: segment %u zlib error %d",
+                           s->vsh_self, i, rc);
+                return false;
+            }
+
+            memcpy(ram + pa, buf, MIN((uint64_t)out, memsz));
+            bytes += out;
+            g_free(buf);
+        } else {
+            memcpy(ram + pa, src, MIN(src_len, memsz));
+            bytes += MIN(src_len, memsz);
+        }
+
+        loaded++;
+        info_report("ps3-vsh: segment %u: 0x%" PRIX64 " + 0x%" PRIX64
+                    " -> RAM 0x%" PRIX64 " (stored 0x%" PRIX64
+                    ", compression %u)", i, vaddr, memsz, pa, src_len,
+                    compression);
+    }
+
+    if (!loaded) {
+        error_setg(errp, "ps3-vsh: %s carries no loadable segment",
+                   s->vsh_self);
+        return false;
+    }
+
+    entry = ps3_be64(elf + 0x18) & 0x0FFFFFFF;
+
+    if (s->vsh_entry) {
+        entry = s->vsh_entry;
+    }
+
+    if (entry + 4 > ram_size) {
+        error_setg(errp, "ps3-vsh: entry 0x%" PRIX64 " is outside RAM", entry);
+        return false;
+    }
+
+    s->vsh_entry = entry;
+    s->vsh_segments = loaded;
+    s->vsh_bytes = bytes;
+
+    if (s->vsh_dump) {
+        if (!g_file_set_contents(s->vsh_dump, (const char *)img, len, &err)) {
+            error_setg(errp, "ps3-vsh: cannot write %s: %s", s->vsh_dump,
+                       err->message);
+            return false;
+        }
+        info_report("ps3-vsh: decrypted container written to %s", s->vsh_dump);
+    }
+
+    info_report("ps3-vsh: %s: entry=0x%" PRIX64 ", %u segment(s), "
+                "0x%" PRIu64 " bytes mapped into RAM%s", s->vsh_self, entry,
+                loaded, bytes,
+                s->vsh_run ? ", PPU entering it" : " (load-only)");
+
+    if (s->vsh_run) {
+        CPUState *cs = qemu_get_cpu(0);
+        PowerPCCPU *cpu;
+        uint32_t code = entry, rtoc = 0;
+
+        if (!cs) {
+            error_setg(errp, "ps3-vsh: no CPU");
+            return false;
+        }
+
+        /*
+         * e_entry names an OPD, not code: the descriptor's first word is the
+         * function address and its second is the TOC the compiled code loads
+         * into r2.  Entry code for this VSH begins with the usual
+         * lis/ori/lwz TOC setup, which also confirms the descriptor.
+         */
+        if (entry + 8 <= ram_size) {
+            uint32_t addr = ps3_be32(ram + entry);
+            uint32_t toc = ps3_be32(ram + entry + 4);
+
+            if (addr >= 0x10000 && addr < ram_size) {
+                code = addr;
+                rtoc = toc;
+                info_report("ps3-vsh: OPD 0x%" PRIX64 " -> code 0x%X, TOC "
+                            "0x%X", entry, code, rtoc);
+            }
+        }
+
+        cpu = POWERPC_CPU(cs);
+        s->vsh_toc = rtoc;
+        cpu->env.nip = code;
+        cpu->env.gpr[2] = rtoc;
+        cpu->env.gpr[1] = ram_size - 0x100;
+        cpu->env.gpr[3] = 0;
+        cpu->env.gpr[4] = 0;
+        cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME);
+        cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
+        /*
+         * The lv2 syscall boundary.  A bare PPU has no handler at the 0xC00
+         * vector, so the first sc would run zeros and take a program
+         * exception.  This trampoline records the syscall number in low RAM,
+         * returns -ENOSYS in r3 and rfid's back to the caller, which lets the
+         * guest's own startup path continue far enough to show which lv2
+         * services it needs.  It is a bring-up probe, not an lv2 model.
+         */
+        ps3_put_be32(ram + 0xC00, 0x3D800000); /* lis   r12, 0        */
+        ps3_put_be32(ram + 0xC04, 0x618C0800); /* ori   r12, r12, 0x800 */
+        ps3_put_be32(ram + 0xC08, 0x916C0000); /* stw   r11, 0(r12)   */
+        ps3_put_be32(ram + 0xC0C, 0x3860FFDA); /* li    r3, -ENOSYS   */
+        ps3_put_be32(ram + 0xC10, 0x7D80D2A6); /* mfspr r12, SRR0     */
+        ps3_put_be32(ram + 0xC14, 0x7D80D3A6); /* mtspr SRR0, r12     */
+        ps3_put_be32(ram + 0xC18, 0x4C000024); /* rfid                */
+
+        s->ppu_entry = code;
+        s->ppu_last_pc = code;
+        qemu_register_reset(ps3_ppu_reset_entry, s);
+
+        if (s->ppu_ticks) {
+            s->ppu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_ppu_tick, s);
+            timer_mod(s->ppu_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ppu_tick_ns);
+        }
     }
 
     return true;

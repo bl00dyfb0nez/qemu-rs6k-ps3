@@ -509,7 +509,7 @@ static bool self_decrypt_tables(uint8_t *img, size_t len,
      * 3. Is this file already unselfed?  Ask its largest encrypted section.
      */
     {
-        uint8_t *keys = img + meta_offset + 0x80 + 0x30 * section_count;
+        uint8_t *key_table = img + meta_offset + 0x80 + 0x30 * section_count;
         uint64_t biggest = 0;
         bool plaintext = false;
 
@@ -526,7 +526,7 @@ static bool self_decrypt_tables(uint8_t *img, size_t len,
             }
 
             biggest = size;
-            plaintext = self_sections_are_plaintext(keys, entry,
+            plaintext = self_sections_are_plaintext(key_table, entry,
                                                     img + offset, size);
         }
 
@@ -543,7 +543,7 @@ static bool self_decrypt_tables(uint8_t *img, size_t len,
      */
     for (unsigned i = 0; i < section_count; i++) {
         uint8_t *entry = img + meta_offset + 0x80 + 0x30 * i;
-        uint8_t *keys = img + meta_offset + 0x80 + 0x30 * section_count;
+        uint8_t *key_table = img + meta_offset + 0x80 + 0x30 * section_count;
         uint64_t offset = self_be64(entry);
         uint64_t size = self_be64(entry + 8);
         uint32_t key_id = self_be32(entry + 0x24);
@@ -559,7 +559,7 @@ static bool self_decrypt_tables(uint8_t *img, size_t len,
             return false;
         }
 
-        aes128_ctr(keys + 0x10 * key_id, keys + 0x10 * iv_id,
+        aes128_ctr(key_table + 0x10 * key_id, key_table + 0x10 * iv_id,
                    img + offset, img + offset, (size_t)size);
     }
 
