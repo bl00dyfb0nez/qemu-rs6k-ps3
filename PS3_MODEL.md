@@ -10,47 +10,37 @@ Nothing here is needed to build or use the rest of QEMU.
 
 # Credits
 
-zecoxao
+> I do not take any credit it will be stated in the PS3_MODEL.md.
+>
+> - zecoxao
 
-wildcard
+The boot-chain research this model rests on is theirs, not mine:
 
-ZeroTolerance
+- zecoxao
+- wildcard
+- ZeroTolerance
+- jestero
+- MikeM64
+- DJ
+- flat_z
+- Mina Ralwasser
+- sagemono
+- Kafuu
+- esc0rtd3w
+- naehrwert
+- mysis
+- skgleba
+- xorloser
+- Myria
+- bguerville
+- Proxima
+- golden
+- bguerville
+- Anonymous
 
-jestero
-
-MikeM64
-
-DJ
-
-flat_z
-
-Mina Ralwasser
-
-sagemono
-
-Kafuu
-
-esc0rtd3w
-
-naehrwert
-
-mysis
-
-skgleba
-
-xorloser
-
-Myria
-
-bguerville
-
-Proxima
-
-golden
-
-bguerville
-
-and last but not least...Anonymous
+and last but not least...Anonymous. Nothing above is a claim of
+authorship by whoever wrote this file; it is a list of where the
+knowledge came from.
 
 ## Files
 
@@ -502,6 +492,4 @@ together, as in the sample above.
 | `container verified, N bytes of payload` | tag check passed, payload copied to LS `0x400` |
 | `stop 2, MAC mismatch (...)` | wrong or missing channel-66 readout (zeros by default) |
 | `stop 1, invalid payload length (...)` | header length field rejected |
-| `no flash image (...)` / `no ... container ...` | no `-drive if=pflash`, or the name is not in the image |
-| `the mask ROM is N bytes, expected 0x400` | wrong `-bios` file; a 32-bit byte-swapped dump is converted automatically |
-| `selftest FAILED (...)` | interpreter or crypto regression; do not trust later results |
+| 
