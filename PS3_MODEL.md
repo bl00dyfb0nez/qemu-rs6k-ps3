@@ -8,6 +8,50 @@ loader stages. It is an experiment, not an upstream contribution - see
 
 Nothing here is needed to build or use the rest of QEMU.
 
+# Credits
+
+zecoxao
+
+wildcard
+
+ZeroTolerance
+
+jestero
+
+MikeM64
+
+DJ
+
+flat_z
+
+Mina Ralwasser
+
+sagemono
+
+Kafuu
+
+esc0rtd3w
+
+naehrwert
+
+mysis
+
+skgleba
+
+xorloser
+
+Myria
+
+bguerville
+
+Proxima
+
+golden
+
+bguerville
+
+and last but not least...Anonymous
+
 ## Files
 
 | Path | Contents |

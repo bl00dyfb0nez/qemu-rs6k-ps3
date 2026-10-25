@@ -566,7 +566,6 @@ struct PS3BootROMState {
     bool vsh_run;
     uint32_t vsh_entry;
     uint32_t vsh_toc;
-    uint32_t vsh_last_sc;
     unsigned vsh_segments;
     uint64_t vsh_bytes;
     char vsh_why[160];
@@ -1219,15 +1218,14 @@ static void ps3_rom_regs_write(void *opaque, hwaddr offset, uint64_t value,
         }
         break;
     case 0x14: {
-        /* The vsh-run syscall trampoline reports r11 here. */
+        /* The vsh-run syscall shim reports r11 here. */
         CPUState *cs = qemu_get_cpu(0);
 
-        s->vsh_last_sc = (uint32_t)value;
         if (s->ppu_trace && cs) {
             PowerPCCPU *cpu = POWERPC_CPU(cs);
 
             info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64
-                        ", pc=0x%" PRIX64 ")", s->vsh_last_sc,
+                        ", pc=0x%" PRIX64 ")", (uint32_t)value,
                         (uint64_t)cpu->env.lr, (uint64_t)cpu->env.nip);
         }
         break;
@@ -1948,17 +1946,6 @@ static void ps3_ppu_tick(void *opaque)
 
     s->ppu_last_pc = cpu->env.nip;
     s->ppu_tick_count++;
-
-    if (s->vsh_run) {
-        uint32_t sc = ps3_be32(memory_region_get_ram_ptr(s->ram) + 0x800);
-
-        if (sc && sc != s->vsh_last_sc) {
-            info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64 ", "
-                        "pc=0x%" PRIX64 ")", sc, (uint64_t)cpu->env.lr,
-                        (uint64_t)cpu->env.nip);
-            s->vsh_last_sc = sc;
-        }
-    }
 
     if (s->ppu_trace) {
         info_report("ps3-ppu: tick %" PRIu64 " pc=0x%" PRIx64
