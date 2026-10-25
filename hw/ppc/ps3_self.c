@@ -431,7 +431,18 @@ static bool self_sections_are_plaintext(const uint8_t *keys,
            raw_known >= dec_known;
 }
 
-bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len)
+static const struct SelfKey self_app_keys[] = {
+    /* application key revision 0x1C, the VSH key for the 4.xx firmware tree */
+    { "CFF025375BA0079226BE01F4A31F346D79F62CFB643CA910E16CF60BD9092752",
+      "FD40664E2EBBA01BF359B0DCDF543DA4" },
+    /* revision 0x1D, used by the later 4.xx application builds */
+    { "D202174EB65A62048F3674B59EF6FE72E1872962F3E1CD658DE8D7AF71DA1F3E",
+      "ACB9945914EBB7B9A31ECE320AE09F2D" },
+};
+
+static bool self_decrypt_tables(uint8_t *img, size_t len,
+                                const struct SelfKey *keys, unsigned key_count,
+                                char *why, size_t why_len)
 {
     uint8_t key[32], iv[16], root[0x40], ctr_iv[16];
     uint32_t meta_offset, section_count;
@@ -454,9 +465,9 @@ bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len)
     }
 
     /* 1. The root header: the keyset whose key and iv padding are zero. */
-    for (unsigned k = 0; k < ARRAY_SIZE(self_keys); k++) {
-        if (!hex_to_bytes(self_keys[k].erk, key, sizeof(key)) ||
-            !hex_to_bytes(self_keys[k].riv, iv, sizeof(iv))) {
+    for (unsigned k = 0; k < key_count; k++) {
+        if (!hex_to_bytes(keys[k].erk, key, sizeof(key)) ||
+            !hex_to_bytes(keys[k].riv, iv, sizeof(iv))) {
             continue;
         }
 
@@ -473,8 +484,8 @@ bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len)
     }
 
     if (opened < 0) {
-        snprintf(why, why_len, "no loader keyset opened the root header "
-                 "(%u candidates)", (unsigned)ARRAY_SIZE(self_keys));
+        snprintf(why, why_len, "no applicable keyset opened the root header "
+                 "(%u candidates)", key_count);
         return false;
     }
 
@@ -555,6 +566,18 @@ bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len)
     snprintf(why, why_len, "opened with key %d, %u section(s)",
              opened, section_count);
     return true;
+}
+
+bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len)
+{
+    return self_decrypt_tables(img, len, self_keys,
+                               (unsigned)ARRAY_SIZE(self_keys), why, why_len);
+}
+
+bool ps3_self_decrypt_app(uint8_t *img, size_t len, char *why, size_t why_len)
+{
+    return self_decrypt_tables(img, len, self_app_keys,
+                               (unsigned)ARRAY_SIZE(self_app_keys), why, why_len);
 }
 
 int ps3_self_load_ls(uint8_t *img, size_t len, uint8_t *ls, size_t ls_size,

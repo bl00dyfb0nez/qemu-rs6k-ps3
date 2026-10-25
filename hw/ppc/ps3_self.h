@@ -40,6 +40,13 @@ unsigned ps3_self_key_count(void);
 bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len);
 
 /*
+ * The application / VSH keyset, used by the SELF that appldr loads from
+ * /dev_flash/vsh/module.  Same format as the loader table; kept separate so a
+ * loader image never lands on an application key by accident.
+ */
+bool ps3_self_decrypt_app(uint8_t *img, size_t len, char *why, size_t why_len);
+
+/*
  * Decrypt `img`, then place its segments into `ls` at their link addresses and
  * return the entry point.  Segments with no file data are zero-filled, which is
  * what the loader does for .bss.  Returns 0 on success, 1 when no keyset opened

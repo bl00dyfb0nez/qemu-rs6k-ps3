@@ -87,6 +87,8 @@
 #include "ps3_spu.h"
 #include "ps3_self.h"
 
+#include <zlib.h>
+
 #define TYPE_PS3_MIC "ps3-mic"
 OBJECT_DECLARE_SIMPLE_TYPE(PS3MICState, PS3_MIC)
 
@@ -545,6 +547,25 @@ struct PS3BootROMState {
     uint64_t ppu_last_pc;
     bool ppu_trace;
     char ppu_why[160];
+
+    /*
+     * The application layer: appldr opens /dev_flash/vsh/module/vsh.self and
+     * hands it to lv2, which is what actually creates the VSH process.  The
+     * loader below does the container work - application keyset, zlib segment
+     * expansion, ELF mapping - so the image is in RAM exactly where lv2 would
+     * put it.  vsh-run hands the PPU that entry point for a bare LLE run; the
+     * lv2 layer itself is not modelled yet, so a run stops at the first lv2
+     * call and the trace says which one.
+     */
+    char *vsh_self;
+    char *vsh_dump;
+    char *dev_flash;
+    char *dev_flash3;
+    bool vsh_run;
+    uint32_t vsh_entry;
+    unsigned vsh_segments;
+    uint64_t vsh_bytes;
+    char vsh_why[160];
 
     uint8_t rom[PS3_ROM_SIZE];
     size_t rom_len;
@@ -1208,6 +1229,7 @@ static void ps3_rom_reset(DeviceState *dev)
 static int ps3_spu_stage(PS3BootROMState *s);
 static int ps3_ppu_dump(PS3BootROMState *s);
 static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp);
+static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp);
 static void ps3_ppu_reset_entry(void *opaque);
 
 /*
@@ -1531,6 +1553,28 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     if (s->ppu_elf) {
         if (!ps3_ppu_stage(s, errp)) {
             return;
+        }
+    }
+
+    /*
+     * The application layer.  With vsh-run off this is a load-and-map test:
+     * the image is in RAM and described, then the run ends before the CPU
+     * starts, so the mapping can be checked on its own.  With vsh-run on the
+     * PPU enters the VSH and the tick timer reports how far it gets before it
+     * needs an lv2 service the model does not provide yet.
+     */
+    if (!s->vsh_self && s->dev_flash) {
+        s->vsh_self = g_build_filename(s->dev_flash, "vsh", "module",
+                                       "vsh.self", NULL);
+    }
+
+    if (s->vsh_self) {
+        if (!ps3_vsh_stage(s, errp)) {
+            return;
+        }
+
+        if (!s->vsh_run) {
+            exit(0);
         }
     }
 }
@@ -2041,6 +2085,11 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("stage-limit", PS3BootROMState, stage_limit, 0),
     DEFINE_PROP_UINT64("stage-wait", PS3BootROMState, stage_wait, 0),
     DEFINE_PROP_UINT64("stage-version", PS3BootROMState, stage_version, 0),
+    DEFINE_PROP_STRING("vsh-self", PS3BootROMState, vsh_self),
+    DEFINE_PROP_STRING("vsh-dump", PS3BootROMState, vsh_dump),
+    DEFINE_PROP_STRING("dev-flash", PS3BootROMState, dev_flash),
+    DEFINE_PROP_STRING("dev-flash3", PS3BootROMState, dev_flash3),
+    DEFINE_PROP_BOOL("vsh-run", PS3BootROMState, vsh_run, false),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
     DEFINE_PROP_STRING("readout", PS3BootROMState, readout),
