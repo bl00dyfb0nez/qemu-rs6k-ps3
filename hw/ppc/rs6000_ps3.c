@@ -501,6 +501,7 @@ struct PS3BootROMState {
 
     /* One SPU stage image run on its own, for the boot-chain tests. */
     char *stage_elf;
+    char *stage_dump;
     uint32_t stage_entry;
     uint64_t stage_limit;
 
@@ -1324,6 +1325,36 @@ static int ps3_spu_stage(PS3BootROMState *s)
     }
 
     /*
+     * A dump is extraction, not a run: open the container, decrypt its
+     * sections in place and write the result back out.  It is how the
+     * encapsulated images a loader carries are taken out for inspection
+     * without a PC-side tool.  An ELF needs no opening and is copied as-is.
+     */
+    if (s->stage_dump) {
+        if (len >= 0x200 && !memcmp(img, "SCE\0", 4)) {
+            if (!ps3_self_decrypt(img, len, why, sizeof(why))) {
+                info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
+                return 1;
+            }
+        } else if (len < 52 || memcmp(img, "\177ELF", 4) ||
+                   img[4] != 1 || img[5] != 2) {
+            info_report("ps3-spu-stage: %s is neither a SELF nor a 32-bit "
+                        "big-endian ELF", s->stage_elf);
+            return 2;
+        }
+
+        if (!g_file_set_contents(s->stage_dump, (const char *)img, len, &err)) {
+            info_report("ps3-spu-stage: cannot write %s: %s", s->stage_dump,
+                        err->message);
+            return 2;
+        }
+
+        info_report("ps3-spu-stage: %s: %" G_GSIZE_FORMAT " bytes written to %s",
+                    s->stage_elf, len, s->stage_dump);
+        return 0;
+    }
+
+    /*
      * A stage is either a decrypted SPU ELF or the SELF it is delivered in.
      * The SELF is opened here with the loader keysets the chain itself uses,
      * so a stage test needs nothing on the PC side but the firmware file.
@@ -1338,6 +1369,9 @@ static int ps3_spu_stage(PS3BootROMState *s)
             info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
             return opened == 1 ? 1 : 2;
         }
+
+        /* Which keyset opened it, and whether the sections needed decrypting. */
+        info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
 
         if (s->stage_entry) {
             stage_entry = s->stage_entry;
@@ -1429,6 +1463,7 @@ static int ps3_spu_stage(PS3BootROMState *s)
 static const Property ps3_rom_properties[] = {
     DEFINE_PROP_DRIVE("drive", PS3BootROMState, blk),
     DEFINE_PROP_STRING("stage-elf", PS3BootROMState, stage_elf),
+    DEFINE_PROP_STRING("stage-dump", PS3BootROMState, stage_dump),
     DEFINE_PROP_UINT32("stage-entry", PS3BootROMState, stage_entry, 0),
     DEFINE_PROP_UINT64("stage-limit", PS3BootROMState, stage_limit, 0),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),

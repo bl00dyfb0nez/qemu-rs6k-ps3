@@ -354,6 +354,18 @@ static const struct SelfKey self_keys[] = {
       "BBE7799B9A37CB272E386618FDFD4AEC" },
     { "0CAF212B6FA53C0DA7E2C575ADF61DBE68F34A33433B1B891ABF5C4251406A03",
       "9B79374722AD888EB6A35A2DF25A8B3E" },
+    /*
+     * The .2 SELF keys, added after the older loader table because those
+     * entries are still the common case.  The first pair opens the .2 SPU
+     * loader headers (lv1ldr.2, lv2ldr.2, appldr.2, isoldr.2).  The second
+     * opens the lv0.2 header in the CoreOS image; lv0.2 is the .2 revision of
+     * lv0 and is not lv0ldr.2, metldr.2 or bootldr.2, which are separate
+     * containers with their own key paths.
+     */
+    { "5B548E7D5B375B9C43C1F1D80B77124BF4C2AE8019F918EEA2A7FC21459FDCA7",
+      "3CAF87A6C0039BA20FF026C1C30BD666" },
+    { "38417A8AA9E14E485E2BB0058F97D9F24C138CDB2A2EF3C14DF88700CE3AA8CD",
+      "081A427E0231CA0C71CDB74805C2B147" },
 };
 
 unsigned ps3_self_key_count(void)
