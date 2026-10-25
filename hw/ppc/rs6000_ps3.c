@@ -819,7 +819,7 @@ static void ps3_rom_boot(PS3BootROMState *s)
             ps3_spu_set_ch66(s->spu, ch66);
             ps3_spu_set_sig(s->spu, 0, s->container_offset);
             ps3_spu_set_trace(s->spu, s->spu_trace);
-            s->spu_status = ps3_spu_run(s->spu, 0x400, 1 << 26,
+            s->spu_status = ps3_spu_run(s->spu, 0x400, 1 << 28,
                                         s->spu_why, sizeof(s->spu_why));
             s->spu_insns = ps3_spu_insns(s->spu);
 
