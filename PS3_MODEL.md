@@ -107,6 +107,12 @@ Ctrl-A x.
 | `stage-elf` | - | load this SELF/ELF into local storage, run it, exit |
 | `stage-entry` | 0 | override the entry address for `stage-elf` |
 | `stage-limit` | `1<<22` | instruction budget for `stage-elf` |
+| `ppu-elf` | - | 64-bit PPU SELF/ELF (lv0 and above), loaded into RAM before reset |
+| `ppu-entry` | 0 | entry override for `ppu-elf` (lv0's loader entry is `0xC40`) |
+| `ppu-dump` | - | open `ppu-elf` and write the decrypted container out, then exit |
+| `ppu-ticks` | 0 | stop after this many `ppu-tick-ns` periods (0 keeps running) |
+| `ppu-tick-ns` | `10000000` | period between PPU progress reports |
+| `ppu-trace` | off | log PC/LR/MSR each period and the first console reads |
 | `flash-base` | `0x20000000` | window the flash image is mapped at |
 
 Without a readout the device feeds channel 66 32 zero bytes, which is what the
@@ -166,6 +172,80 @@ ps3-spu-stage: <file> entry=0x12C00 segments=3 steps=450 result=stop stop=48 :: 
 A loader that has been unselfed already is detected by its section content and
 loaded as-is; a still-sealed SELF goes through the key ladder in `ps3_self.c`.
 
+### The PPU stage: lv0 and above
+
+`lv0` is 64-bit PowerPC, not SPU code, so it runs on the 970FX core rather than
+on the SPU interpreter.  `ppu-elf` accepts either a plain 64-bit big-endian ELF
+or the sealed SELF it is delivered in; the SELF is opened with the same loader
+keysets `ps3_self.c` uses for the SPU stages.  The image is placed in RAM before
+the machine reset, and the PPU is entered from the reset handler, so the SPU
+half of the first stage has already run when the core starts.
+
+lv0's ELF header names `0xC60`, but that address is in the zero-filled first
+segment.  The real loader entry is `0xC40`, which sets up the stack and TOC:
+
+```
+0xC40  lis  r1, 0xBFF        r1 = 0xBFFFFF80
+0xC44  ori  r1, r1, 0xFF80
+0xC48  lis  r2, 0x080C       r2 = 0x080CDDE0 (TOC)
+0xC4C  ori  r2, r2, 0xDDE0
+0xC50  lis  r3, 0x0800
+0xC54  ori  r3, r3, 0
+0xC58  mtlr r3
+0xC5C  blrl                  -> 0x08000000
+```
+
+Run it with:
+
+```sh
+./build-ps3/qemu-system-ppc64.exe -M rs6000-ps3 -display none \
+    -global ps3-boot-rom.ppu-elf=lv0.self \
+    -global ps3-boot-rom.ppu-entry=0xc40 \
+    -global ps3-boot-rom.ppu-ticks=5
+```
+
+Observed with the 4.93 lv0 carve: two segments (0x0/0xC70 and
+0x8000000/0xCBD50), entry `0xC40`, and the loader runs through its early setup
+to `0x800CCB4`, the console path.  lv0 prints
+`send_and_receive: write_init_msg fail -8` and loops at `0x800C5C0`: that is
+lv0 talking to the System Controller over its virtual UART, which this model
+only acknowledges (status word `0x100`, data at `0xFFF31C`) and does not answer
+with a syscon reply.  The PPU is therefore running the real hypervisor code up
+to its first hardware handshake, not failing on an unimplemented PPC opcode.
+
+`ppu-dump` is the extraction half of the same path:
+
+```sh
+./build-ps3/qemu-system-ppc64.exe -M rs6000-ps3 -display none \
+    -global ps3-boot-rom.ppu-elf=lv0.self \
+    -global ps3-boot-rom.ppu-dump=lv0.dec
+```
+
+It opens the SELF, writes the full decrypted container and exits 0.  The ELF at
+`0x90` then has real PowerPC segments; load it in IDA at `0x8000000` with the
+PPC64 loader.
+
+### lv0.2 is metadata, not a runnable stage
+
+The CoreOS image also carries `lv0.2`, a 0x500-byte SELF header and metadata
+record (1280 bytes, MD5 `b0c6e3ea17ee81a05fa173dca0590cd0` in the 4.93 PUP).
+It is present only on the newer hardware revisions (late CECH-25xx, CECH-3xxx
+and CECH-4xxx), where the revised lv0ldr.1 loads it so bootldr can check lv0's
+signature with the non-vulnerable key.  Its section table points into lv0's
+body, so it is not a program and has no entry point.  First-generation and
+2xxx consoles do not carry it and keep the original sigfail path.  Do not pass it to
+`ppu-elf`: the opener rejects it with
+
+```
+ps3-ppu: .../lv0.2: section 0 (0x10500/0xC70) runs past the file
+```
+
+This is also why `lv0.2` is not one of the `.2` loaders: `lv1ldr.2`,
+`lv2ldr.2`, `appldr.2` and `isoldr.2` are sealed SPU SELFs, `metldr.2` and
+`bootldr.2` (lv0ldr.2) are separate containers, and `lv0.2` is only the
+signed record of lv0.  Older consoles without lv0.2 keep the original sigfail
+path.
+
 ## Using it with the low-level boot chain
 
 The chain this model follows, in order:
@@ -176,6 +256,7 @@ The chain this model follows, in order:
 | 2 | `lv0ldr.2` container in flash, opened with the channel-66 readout | same run; the ROM jumps to LS `0x400` when the tag checks |
 | 3 | the decrypted lv0ldr payload (SPU) | same run, on the SPU interpreter |
 | 4 | `lv1ldr`, `lv2ldr`, `appldr`, `isoldr` SELFs | `stage-elf`, one run per loader |
+| 5 | `lv0` (PPU hypervisor) | `ppu-elf` + `ppu-entry=0xc40`, runs on the 970FX |
 
 Steps 1-3 are one command. Step 4 has no automatic hand-off: each loader is
 handed its work through the local store (wait flag at `0x3E000`, arguments at
@@ -270,6 +351,10 @@ Observed with the loader SELFs in the ps3tools tree:
 | `lv2ldr.self` | `0x12C00` | 3 | 530 | `stop` 0x30 at `0x12E18` |
 | `appldr.self` | `0x12C00` | 3 | 1252 | `stop` 0x30 at `0x13078` |
 | `isoldr.self` | `0x25B50` | 2 | (limit) | spins at `0x25990`/`0x25998`, no MFC traffic |
+| `lv1ldr.2.self` | `0x12C00` | 3 | 450 | `stop` 0x30 at `0x13D8C`, key 18 |
+| `lv2ldr.2.self` | `0x12C00` | 3 | 530 | `stop` 0x30 at `0x12E18`, key 18 |
+| `appldr.2.self` | `0x12C00` | 3 | 1252 | `stop` 0x30 at `0x13078`, key 18 |
+| `isoldr.2.self` | `0x25B50` | 2 | (limit) | spins at `0x25990`/`0x25998`, no MFC traffic |
 
 A decrypted ELF runs the same way and prints the byte count too:
 `.tmp_lv1/lv1ldr.elf` gives entry `0x12C00`, 3 segments, 152368 bytes and the

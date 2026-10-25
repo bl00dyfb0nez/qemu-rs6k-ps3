@@ -358,9 +358,10 @@ static const struct SelfKey self_keys[] = {
      * The .2 SELF keys, added after the older loader table because those
      * entries are still the common case.  The first pair opens the .2 SPU
      * loader headers (lv1ldr.2, lv2ldr.2, appldr.2, isoldr.2).  The second
-     * opens the lv0.2 header in the CoreOS image; lv0.2 is the .2 revision of
-     * lv0 and is not lv0ldr.2, metldr.2 or bootldr.2, which are separate
-     * containers with their own key paths.
+     * opens the 0x500-byte lv0.2 record in the CoreOS image, which is signed
+     * metadata used by bootldr to check lv0, not a runnable image: its
+     * section table points into lv0's body.  lv0.2 is not lv0ldr.2, metldr.2
+     * or bootldr.2; those are separate containers with their own key paths.
      */
     { "5B548E7D5B375B9C43C1F1D80B77124BF4C2AE8019F918EEA2A7FC21459FDCA7",
       "3CAF87A6C0039BA20FF026C1C30BD666" },

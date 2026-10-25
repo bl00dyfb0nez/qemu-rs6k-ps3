@@ -468,6 +468,17 @@ static const TypeInfo ps3_mic_info = {
 #define PS3_CONTAINER_HDR   0x40
 #define PS3_ROM_MAX_BLOCKS  0x3DC0
 
+/*
+ * lv0's early console.  Its putchar walks a pointer whose value is
+ * 0x24000000000; the PPU's physical address reduction in this model lands the
+ * status and data words at 0xFFF308 and 0xFFF31C.  The status bit it polls is
+ * 0x100 (transmit holding register empty); the data word is one character.
+ */
+#define PS3_PPE_UART_BASE   0x000FFF000
+#define PS3_PPE_UART_SIZE   0x1000
+#define PS3_PPE_UART_STATUS 0x308
+#define PS3_PPE_UART_DATA   0x31C
+
 enum {
     PS3_BOOT_OK = 1,
     PS3_BOOT_BAD_HEADER,
@@ -483,6 +494,11 @@ struct PS3BootROMState {
     MemoryRegion ls_mr;       /* 256 KiB local store, plaintext lands at 0x400 */
     MemoryRegion regs_mr;     /* status and control */
     MemoryRegion flash_mr;    /* the console's flash image, when a drive is given */
+    MemoryRegion uart_mr;     /* the PPU-side console lv0 polls */
+    MemoryRegion uart_alias_mr;
+    char uart_line[256];
+    size_t uart_len;
+    unsigned uart_hits;
 
     BlockBackend *blk;
     char *rom_file;
@@ -1186,11 +1202,13 @@ static void ps3_rom_reset(DeviceState *dev)
 
         ps3_rom_boot(s);
     }
+
 }
 
 static int ps3_spu_stage(PS3BootROMState *s);
 static int ps3_ppu_dump(PS3BootROMState *s);
 static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp);
+static void ps3_ppu_reset_entry(void *opaque);
 
 /*
  * The loaders' local-store hand-off, from docs/ldrs.txt in the ps3tools tree:
@@ -1325,6 +1343,55 @@ static bool ps3_readout_from_hex(const char *text, uint8_t out[32])
     return true;
 }
 
+static uint64_t ps3_ppe_uart_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PS3BootROMState *s = opaque;
+
+    if (s->ppu_trace && s->uart_hits < 4) {
+        info_report("ps3-ppu: uart read 0x%" HWADDR_PRIX " size %u", addr,
+                    size);
+        s->uart_hits++;
+    }
+
+    if (addr == PS3_PPE_UART_STATUS) {
+        return 0x100;      /* THR empty: lv0 may write the next character */
+    }
+    return 0;
+}
+
+static void ps3_ppe_uart_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size)
+{
+    PS3BootROMState *s = opaque;
+    uint8_t ch = value & 0xFF;
+
+    if (addr != PS3_PPE_UART_DATA) {
+        return;
+    }
+
+    if (ch == '\r') {
+        return;
+    }
+
+    if (ch == '\n' || s->uart_len + 1 >= sizeof(s->uart_line)) {
+        s->uart_line[s->uart_len] = 0;
+        info_report("ps3-ppu console: %s", s->uart_line);
+        s->uart_len = 0;
+    } else {
+        s->uart_line[s->uart_len++] = ch;
+    }
+}
+
+static const MemoryRegionOps ps3_ppe_uart_ops = {
+    .read = ps3_ppe_uart_read,
+    .write = ps3_ppe_uart_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static void ps3_rom_realize(DeviceState *dev, Error **errp)
 {
     PS3BootROMState *s = PS3_BOOT_ROM(dev);
@@ -1343,6 +1410,16 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     memory_region_init_ram(&s->rom_mr, OBJECT(s), "ps3.spu-rom", PS3_ROM_SIZE,
                            &error_fatal);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->rom_mr);
+
+    memory_region_init_io(&s->uart_mr, OBJECT(s), &ps3_ppe_uart_ops, s,
+                          "ps3-ppe-uart", PS3_PPE_UART_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        PS3_PPE_UART_BASE, &s->uart_mr, 1);
+    memory_region_init_alias(&s->uart_alias_mr, OBJECT(s), "ps3-ppe-uart-hi",
+                             &s->uart_mr, 0, PS3_PPE_UART_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        0x24000FFF000ULL,
+                                        &s->uart_alias_mr, 1);
 
     if (s->readout) {
         if (!ps3_readout_from_hex(s->readout, s->readout_bytes)) {
@@ -1444,6 +1521,13 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         exit(ps3_ppu_dump(s));
     }
 
+    /*
+     * Load the PPU half here, before the machine reset runs: the reset handler
+     * below then enters it after the SPU has run the mask ROM and the loader
+     * payload in ps3_rom_reset.  The image is named separately because the SPU
+     * model's external memory is a private copy of the flash image, not the
+     * guest's RAM; wiring the two memories together is the next hand-off step.
+     */
     if (s->ppu_elf) {
         if (!ps3_ppu_stage(s, errp)) {
             return;
@@ -1923,14 +2007,8 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
     cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME);
     cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
     s->ppu_entry = entry;
-    s->ppu_last_pc = entry;
-
-    /*
-     * The machine's reset handler runs after the devices are realized and
-     * points the PPU at the boot vector.  Registering this afterwards puts the
-     * stage entry back on every reset, which is what makes the hand-off stick.
-     */
     qemu_register_reset(ps3_ppu_reset_entry, s);
+    s->ppu_last_pc = entry;
 
     info_report("ps3-ppu: %s: entry=0x%" PRIX64 ", %u segment(s), "
                 "0x%" PRIX64 " bytes; PPU started", s->ppu_elf, entry,
