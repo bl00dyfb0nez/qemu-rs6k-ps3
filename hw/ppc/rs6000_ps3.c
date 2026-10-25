@@ -1643,10 +1643,13 @@ static uint64_t ps3_be64(const uint8_t *p)
  * or NULL with `why' set.
  */
 static const uint8_t *ps3_ppu_open(uint8_t *img, size_t len,
+                                   uint64_t *seg_shift,
                                    char *why, size_t why_len)
 {
     const uint8_t *elf = img;
     size_t elf_len = len;
+
+    *seg_shift = 0;
 
     if (len >= 4 && !memcmp(img, "SCE\0", 4)) {
         if (!ps3_self_decrypt(img, len, why, why_len)) {
@@ -1666,6 +1669,16 @@ static const uint8_t *ps3_ppu_open(uint8_t *img, size_t len,
             snprintf(why, why_len, "no ELF header inside the SELF");
             return NULL;
         }
+
+        /*
+         * A SELF's program-header file offsets are relative to the certified
+         * file, which starts header_len bytes into the container.  The section
+         * table uses absolute offsets (lv0's first section is 0x10500 for a
+         * 0x10000 ELF offset and a 0x500 header), so the same shift applies to
+         * every loadable segment.  Without it the loader reads the header
+         * block instead of the image and the PPU starts on ciphertext.
+         */
+        *seg_shift = ps3_be64(img + 0x10);
     }
 
     if (elf_len < 64 || memcmp(elf, "\177ELF", 4) ||
@@ -1687,6 +1700,7 @@ static int ps3_ppu_dump(PS3BootROMState *s)
     g_autofree uint8_t *img = NULL;
     gsize len = 0;
     char why[160];
+    uint64_t seg_shift;
     const uint8_t *elf;
 
     if (!g_file_get_contents(s->ppu_elf, (gchar **)&img, &len, &err)) {
@@ -1694,7 +1708,7 @@ static int ps3_ppu_dump(PS3BootROMState *s)
         return 2;
     }
 
-    elf = ps3_ppu_open(img, len, why, sizeof(why));
+    elf = ps3_ppu_open(img, len, &seg_shift, why, sizeof(why));
     if (!elf) {
         info_report("ps3-ppu: %s: %s", s->ppu_elf, why);
         return 1;
@@ -1710,6 +1724,22 @@ static int ps3_ppu_dump(PS3BootROMState *s)
                 s->ppu_elf, len, s->ppu_dump,
                 (uintptr_t)(elf - img));
     return 0;
+}
+
+static void ps3_ppu_reset_entry(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+    CPUState *cs = qemu_get_cpu(0);
+
+    if (!cs || !s->ppu_entry) {
+        return;
+    }
+
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+
+    cpu->env.nip = s->ppu_entry;
+    cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME);
+    cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
 }
 
 static void ps3_ppu_tick(void *opaque)
@@ -1754,6 +1784,7 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
     g_autofree uint8_t *img = NULL;
     gsize len = 0;
     const uint8_t *elf;
+    uint64_t seg_shift;
     uint8_t *ram;
     uint64_t ram_size;
     uint64_t entry, phoff;
@@ -1774,7 +1805,7 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
         return false;
     }
 
-    elf = ps3_ppu_open(img, len, why, sizeof(why));
+    elf = ps3_ppu_open(img, len, &seg_shift, why, sizeof(why));
     if (!elf) {
         error_setg(errp, "ps3-ppu: %s: %s", s->ppu_elf, why);
         return false;
@@ -1804,18 +1835,20 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
         uint64_t filesz = ps3_be64(ph + 0x20);
         uint64_t memsz = ps3_be64(ph + 0x28);
         uint64_t pa = paddr ? paddr : vaddr;
-        const uint8_t *src = img + (elf - img) + off;
+        uint64_t file_off = seg_shift + off;
+        const uint8_t *src;
 
         if (type != 1) {
             continue;
         }
 
-        if (off > len - (size_t)(elf - img) ||
-            filesz > len - (size_t)(elf - img) - off || filesz > memsz) {
+        if (file_off > len || filesz > len - file_off || filesz > memsz) {
             error_setg(errp, "ps3-ppu: %s: segment %u runs past the file",
                        s->ppu_elf, i);
             return false;
         }
+
+        src = img + file_off;
 
         if (pa + memsz > ram_size) {
             pa &= 0x0FFFFFFF;
@@ -1846,6 +1879,28 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
 
     if (s->ppu_entry) {
         entry = s->ppu_entry;
+    } else if (entry + 4 <= ram_size) {
+        /*
+         * lv0's ELF header names 0xc60, which lands in the zero-filled first
+         * segment; the console starts it at 0x08000000.  If the named entry is
+         * a zero word or a branch-to-self, use the high segment instead, which
+         * is where every lv0 build puts its code.
+         */
+        uint32_t first = ps3_be32(ram + entry);
+
+        if (first == 0 || first == 0x48000000) {
+            for (unsigned i = 0; i < phnum; i++) {
+                const uint8_t *ph = elf + phoff + (size_t)i * phentsize;
+                uint64_t vaddr = ps3_be64(ph + 0x10);
+
+                if (ps3_be32(ph + 0x00) == 1 && vaddr >= 0x01000000) {
+                    info_report("ps3-ppu: entry 0x%" PRIX64 " is not code, "
+                                "using segment 0x%" PRIX64, entry, vaddr);
+                    entry = vaddr;
+                    break;
+                }
+            }
+        }
     }
 
     if (entry >= ram_size) {
@@ -1867,7 +1922,15 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
     cpu->env.nip = entry;
     cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME);
     cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
+    s->ppu_entry = entry;
     s->ppu_last_pc = entry;
+
+    /*
+     * The machine's reset handler runs after the devices are realized and
+     * points the PPU at the boot vector.  Registering this afterwards puts the
+     * stage entry back on every reset, which is what makes the hand-off stick.
+     */
+    qemu_register_reset(ps3_ppu_reset_entry, s);
 
     info_report("ps3-ppu: %s: entry=0x%" PRIX64 ", %u segment(s), "
                 "0x%" PRIX64 " bytes; PPU started", s->ppu_elf, entry,
@@ -1960,6 +2023,15 @@ static void rs6000_ps3_init(MachineState *machine)
     DriveInfo *dinfo;
 
     cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
+
+    /*
+     * lv0 programs the decrementer and the time base early in its entry path
+     * (mtspr 0x16 / mttbl / mttbu).  Without a timebase env those accesses
+     * dereference a NULL tb_env in QEMU, so give the Cell PPU the real 79.8 MHz
+     * timebase before it starts.
+     */
+    cpu_ppc_tb_init(&cpu->env, 79800000);
+
     qemu_register_reset(rs6000_ps3_cpu_reset, cpu);
     rs6000_ps3_cpu_reset(cpu);
 
