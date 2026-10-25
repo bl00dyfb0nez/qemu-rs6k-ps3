@@ -496,7 +496,29 @@ enum {
  */
 #define PS3_LV2_MODULE_MAX  16
 #define PS3_LV2_MODULE_PATH 96
-#define PS3_LV2_EXPORT_MAX  1024
+/*
+ * The VSH alone publishes 2,400 functions (paf is 973 of them), and every
+ * module adds its own, so the linkage table has to be roomier than a handful
+ * of libraries' worth.
+ */
+#define PS3_LV2_EXPORT_MAX  8192
+
+/*
+ * An unresolved import's stub OPD carries this placeholder as its code word:
+ * the linker had nothing to write, so it is the loader's job.
+ */
+#define PS3_PRX_STUB_PLACEHOLDER 0x39800000u
+
+/*
+ * Where the model plants stubs for imports lv2 cannot resolve: between the
+ * VSH image and the heap, one 0x20-byte OPD plus trap code per (library, NID).
+ */
+#define PS3_LV2_STUB_BASE  0x800000
+#define PS3_LV2_STUB_END   0xA00000
+#define PS3_LV2_STUB_STRIDE 0x40
+#define PS3_LV2_MISSING_CALL 0x7FF
+/* The stub leaves the NID here before it traps; the trap reads it back. */
+#define PS3_LV2_STUB_NID   0x0A00
 
 /*
  * One exported function: a NID a library publishes, and the guest address of
@@ -509,6 +531,18 @@ typedef struct PS3Lv2Export {
     uint32_t opd;
     uint8_t owner;            /* module index + 1, 0 for none */
 } PS3Lv2Export;
+
+/*
+ * What a planted stub stands for.  The trampoline can only carry the NID, and
+ * a NID alone does not name the library, so the linker records the pair.
+ */
+#define PS3_LV2_STUB_RECORDS 512
+
+typedef struct PS3Lv2Stub {
+    char lib[28];
+    uint32_t nid;
+    uint32_t at;
+} PS3Lv2Stub;
 
 typedef struct PS3Lv2Module {
     uint32_t id;
@@ -588,6 +622,7 @@ struct PS3BootROMState {
     uint64_t ppu_tick_count;
     uint64_t ppu_last_pc;
     bool ppu_trace;
+    unsigned ppu_fault_reports;
     char ppu_why[160];
 
     /*
@@ -615,11 +650,24 @@ struct PS3BootROMState {
     /* The lv2 layer vsh-run answers the guest's syscalls with. */
     uint32_t lv2_next_id;
     uint32_t lv2_container_size;
+    /*
+     * The container's bump pointer lives here, not at RAM 0x808.  0x808 is
+     * inside lv2's low page and the VSH's initialisation memsets that range;
+     * keeping the authority in the device is what makes the model immune to
+     * it.  The word at 0x808 is only a copy for dumps.
+     */
+    uint32_t lv2_heap;
     bool lv2_exited;
     int32_t lv2_exit_status;
+    uint8_t lv2_fan_policy;         /* 0 auto, 1 manual, 2 full */
+    uint8_t lv2_fan_duty;
     PS3Lv2Module lv2_mod[PS3_LV2_MODULE_MAX];
     unsigned lv2_mod_count;
     PS3Lv2Export lv2_export[PS3_LV2_EXPORT_MAX];
+    bool lv2_export_full;
+    uint32_t lv2_stub_next;
+    PS3Lv2Stub lv2_stub_record[PS3_LV2_STUB_RECORDS];
+    unsigned lv2_stub_records;
     unsigned lv2_export_count;
     /* The process image, scanned for the import table appldr would supply. */
     uint32_t vsh_lo, vsh_hi;
@@ -1561,10 +1609,10 @@ static const MemoryRegionOps ps3_ppe_uart_ops = {
  * calls hand out 256-byte aligned blocks from it, and free is a no-op, which
  * is all the guest's allocator needs from a container this simple.
  */
-static int32_t ps3_lv2_alloc(uint8_t *ram, uint64_t ram_size, uint32_t size,
-                             uint32_t out)
+static int32_t ps3_lv2_alloc(PS3BootROMState *s, uint8_t *ram,
+                             uint64_t ram_size, uint32_t size, uint32_t out)
 {
-    uint32_t heap = ps3_be32(ram + PS3_LV2_HEAP);
+    uint32_t heap = s->lv2_heap;
     uint32_t end = (heap + size + 0xFF) & ~0xFFu;
 
     if (!size) {
@@ -1578,6 +1626,7 @@ static int32_t ps3_lv2_alloc(uint8_t *ram, uint64_t ram_size, uint32_t size,
     }
 
     ps3_put_be32(ram + out, heap);
+    s->lv2_heap = end;
     ps3_put_be32(ram + PS3_LV2_HEAP, end);
     return 0;
 }
@@ -1830,6 +1879,11 @@ static void ps3_lv2_add_export(PS3BootROMState *s, const char *lib,
     PS3Lv2Export *e;
 
     if (s->lv2_export_count == PS3_LV2_EXPORT_MAX) {
+        if (!s->lv2_export_full) {
+            s->lv2_export_full = true;
+            info_report("ps3-ppu: lv2: export table full at %d, later "
+                        "libraries will not link", PS3_LV2_EXPORT_MAX);
+        }
         return;
     }
 
@@ -1838,6 +1892,99 @@ static void ps3_lv2_add_export(PS3BootROMState *s, const char *lib,
     e->nid = nid;
     e->opd = opd;
     e->owner = owner + 1;
+}
+
+/*
+ * Is this import slot still waiting for lv2?  A slot holds the address of the
+ * OPD the caller loads {code, toc} from.  It is pending when that OPD is
+ * missing, empty, or still carries the linker's placeholder.
+ */
+static bool ps3_lv2_slot_pending(const uint8_t *ram, uint64_t ram_size,
+                                 uint32_t slot)
+{
+    uint32_t opd, code;
+
+    if ((uint64_t)slot + 4 > ram_size) {
+        return false;
+    }
+
+    opd = ps3_be32(ram + slot);
+    if (!opd || (uint64_t)opd + 8 > ram_size) {
+        return true;
+    }
+
+    code = ps3_be32(ram + opd);
+    return !code || code == PS3_PRX_STUB_PLACEHOLDER;
+}
+
+/*
+ * A stub for an import lv2 cannot resolve.  It is an OPD whose code is a
+ * six-word trampoline: the NID goes in r12, the "missing import" call number
+ * in r11, and the trap returns -1, which is what an unimplemented lv2 service
+ * answers with.  The run continues and the work list says what was missing.
+ */
+static uint32_t ps3_lv2_stub(PS3BootROMState *s, uint8_t *ram,
+                             uint64_t ram_size, const char *lib,
+                             uint32_t nid)
+{
+    uint32_t at = s->lv2_stub_next;
+    uint8_t *code;
+
+    if (!at) {
+        at = PS3_LV2_STUB_BASE;
+    }
+
+    if ((uint64_t)at + PS3_LV2_STUB_STRIDE > PS3_LV2_STUB_END ||
+        (uint64_t)at + PS3_LV2_STUB_STRIDE > ram_size) {
+        return 0;
+    }
+
+    s->lv2_stub_next = at + PS3_LV2_STUB_STRIDE;
+    memset(ram + at, 0, PS3_LV2_STUB_STRIDE);
+
+    if (s->lv2_stub_records < PS3_LV2_STUB_RECORDS) {
+        PS3Lv2Stub *rec = &s->lv2_stub_record[s->lv2_stub_records++];
+
+        g_strlcpy(rec->lib, lib, sizeof(rec->lib));
+        rec->nid = nid;
+        rec->at = at;
+    }
+
+    code = ram + at + 8;
+    ps3_put_be32(ram + at, at + 8);                    /* OPD: code     */
+    ps3_put_be32(ram + at + 4, 0);                     /* OPD: toc      */
+    ps3_put_be32(code + 0x00, 0x3D800000u | (nid >> 16));
+    ps3_put_be32(code + 0x04, 0x618C0000u | (nid & 0xFFFF));
+    /*
+     * The NID goes to a fixed scratch cell, not a register: the syscall
+     * trampoline keeps the GPRs for the call's arguments and would otherwise
+     * hand back its own r12.
+     */
+    /*
+     * stw r12, PS3_LV2_STUB_NID(0): RS is r12, rA=0 means the displacement is
+     * absolute.  0x90000000 would be stw r0, which stores whatever the caller
+     * happened to leave in r0 - the module's own return address, in practice.
+     */
+    ps3_put_be32(code + 0x08, 0x91800000u | PS3_LV2_STUB_NID);
+    ps3_put_be32(code + 0x0C, 0x39600000u | PS3_LV2_MISSING_CALL);
+    ps3_put_be32(code + 0x10, 0x44000002u);            /* sc            */
+    ps3_put_be32(code + 0x14, 0x4E800020u);            /* blr           */
+
+    return at;
+}
+
+static const PS3Lv2Stub *ps3_lv2_stub_lookup_nid(const PS3BootROMState *s,
+                                               uint32_t nid)
+{
+    unsigned i;
+
+    for (i = 0; i < s->lv2_stub_records; i++) {
+        if (s->lv2_stub_record[i].nid == nid) {
+            return &s->lv2_stub_record[i];
+        }
+    }
+
+    return NULL;
 }
 
 static uint32_t ps3_lv2_find_export(PS3BootROMState *s, const char *lib,
@@ -1934,7 +2081,7 @@ static unsigned ps3_lv2_link_imports(PS3BootROMState *s, uint8_t *ram,
                                      uint32_t start, uint32_t end)
 {
     uint32_t addr;
-    unsigned total = 0, linked = 0;
+    unsigned total = 0, linked = 0, stubbed = 0;
 
     if (!start || end <= start || end > ram_size) {
         return 0;
@@ -1943,7 +2090,7 @@ static unsigned ps3_lv2_link_imports(PS3BootROMState *s, uint8_t *ram,
     for (addr = start; addr + PS3_PRX_ENTRY_MIN <= end; ) {
         PS3PrxEntry e;
         char lib[28];
-        unsigned got = 0;
+        unsigned got = 0, missed = 0;
 
         if (!ps3_prx_entry(ram, ram_size, addr, end, &e) ||
             !ps3_lv2_guest_string(ram, ram_size, e.name, lib, sizeof(lib)) ||
@@ -1962,17 +2109,33 @@ static unsigned ps3_lv2_link_imports(PS3BootROMState *s, uint8_t *ram,
             total++;
 
             if (!opd) {
-                continue;
+                /*
+                 * Leave the module's own stub alone when it already runs
+                 * real code: that is its syscall thunk, and the shim answers
+                 * the trap.  Only a placeholder needs lv2 to fill it in.
+                 */
+                if (!ps3_lv2_slot_pending(ram, ram_size, slot) ||
+                    !(opd = ps3_lv2_stub(s, ram, ram_size, lib, nid))) {
+                    continue;
+                }
+                missed++;
+                stubbed++;
             }
 
             ps3_put_be32(ram + slot, opd);
             got++;
-            linked++;
+            linked += missed ? 0 : 1;
         }
 
         if (got) {
-            info_report("ps3-ppu: prx: %s: linked %u/%u import(s) from %s",
-                        m->path, got, e.num_func, lib);
+            info_report("ps3-ppu: prx: %s: linked %u/%u import(s) from %s%s",
+                        m->path, got, e.num_func, lib,
+                        missed ? " (placeholder stubs)" : "");
+        }
+        if (missed) {
+            info_report("ps3-ppu: prx: %s: %u import(s) from %s have no "
+                        "provider yet; they trap to the model",
+                        m->path, missed, lib);
         }
 
         addr += e.size;
@@ -1982,8 +2145,8 @@ static unsigned ps3_lv2_link_imports(PS3BootROMState *s, uint8_t *ram,
     m->imports_end = end;
 
     if (total && !linked) {
-        info_report("ps3-ppu: prx: %s: %u import(s) still unresolved",
-                    m->path, total);
+        info_report("ps3-ppu: prx: %s: %u import(s) unresolved, %u stubbed",
+                    m->path, total, stubbed);
     }
 
     return linked;
@@ -2138,11 +2301,18 @@ static unsigned ps3_lv2_register_process_exports(PS3BootROMState *s,
     return added;
 }
 
+/*
+ * The process's imports: one slot per imported function, holding the address
+ * of the OPD whose {code, toc} pair the caller's thunk loads.  A link rewrites
+ * the slot, which is what lv2 does - the stub itself is left alone, so a slot
+ * that still points at an unresolved stub OPD is recognisable by that stub's
+ * placeholder code word.
+ */
 static unsigned ps3_lv2_link_process(PS3BootROMState *s, uint8_t *ram,
                                      uint64_t ram_size)
 {
     uint32_t addr;
-    unsigned linked = 0;
+    unsigned linked = 0, missing = 0, stubbed = 0, entries = 0;
 
     if (!s->vsh_lo || s->vsh_hi <= s->vsh_lo) {
         return 0;
@@ -2160,20 +2330,36 @@ static unsigned ps3_lv2_link_process(PS3BootROMState *s, uint8_t *ram,
             continue;
         }
 
+        entries++;
         for (unsigned i = 0; i < e.num_func; i++) {
             uint32_t slot = e.addrs + 4 * i;
-            uint32_t opd = ps3_lv2_find_export(s, lib,
-                                               ps3_be32(ram + e.nids + 4 * i));
+            uint32_t nid = ps3_be32(ram + e.nids + 4 * i);
+            uint32_t opd = ps3_lv2_find_export(s, lib, nid);
 
             if (!opd) {
-                continue;
+                missing++;
+                /* Same rule as a module's imports: keep a working stub. */
+                if (!ps3_lv2_slot_pending(ram, ram_size, slot) ||
+                    !(opd = ps3_lv2_stub(s, ram, ram_size, lib, nid))) {
+                    continue;
+                }
+                stubbed++;
             }
 
             if (ps3_be32(ram + slot) != opd) {
                 ps3_put_be32(ram + slot, opd);
             }
-            linked++;
+            if (!stubbed || opd < PS3_LV2_STUB_BASE) {
+                linked++;
+            }
         }
+    }
+
+    if (entries) {
+        info_report("ps3-ppu: lv2: process imports: %u of %u function(s) "
+                    "linked over %u librar%s, %u trapped",
+                    linked, linked + missing, entries,
+                    entries == 1 ? "y" : "ies", stubbed);
     }
 
     return linked;
@@ -2293,7 +2479,7 @@ static int32_t ps3_lv2_prx_load(PS3BootROMState *s, uint8_t *ram,
 
     /* The module gets its own 64 KiB-aligned block above the heap. */
     mod_size = (span + 0xFFFF) & ~(uint64_t)0xFFFF;
-    heap = ps3_be32(ram + PS3_LV2_HEAP);
+    heap = s->lv2_heap;
     base = (heap + 0xFFFF) & ~(uint64_t)0xFFFF;
     if (!base || base + mod_size > ram_size ||
         base + mod_size > 0xFFFFFFFFull) {
@@ -2303,7 +2489,8 @@ static int32_t ps3_lv2_prx_load(PS3BootROMState *s, uint8_t *ram,
     }
 
     memset(ram + base, 0, mod_size);
-    ps3_put_be32(ram + PS3_LV2_HEAP, (uint32_t)(base + mod_size));
+    s->lv2_heap = (uint32_t)(base + mod_size);
+    ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
 
     for (i = 0; i < phnum; i++) {
         const uint8_t *ph = elf + phoff + (uint64_t)i * phentsize;
@@ -2637,7 +2824,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     case 0x160: {               /* sys_memory_get_user_memory_size(info*) */
-        uint32_t used = ps3_be32(ram + PS3_LV2_HEAP) - 0x01000000;
+        uint32_t used = s->lv2_heap - 0x01000000;
 
         if ((uint64_t)a0 + 8 > ram_size) {
             ret = PS3_LV2_EFAULT;
@@ -2646,6 +2833,26 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ps3_put_be32(ram + a0, (uint32_t)ram_size);
         ps3_put_be32(ram + a0 + 4, (uint32_t)ram_size - used);
         ret = 0;
+        break;
+    }
+    case PS3_LV2_MISSING_CALL: {  /* an import with no provider */
+        /*
+         * The trap returns into the stub, so lr is the word after its sc and
+         * names the stub exactly.  The NID cell is only a cross-check: low
+         * memory is not the model's alone once the guest starts writing it.
+         */
+        uint32_t nid = ps3_be32(ram + PS3_LV2_STUB_NID);
+        const PS3Lv2Stub *stub = ps3_lv2_stub_lookup_nid(s, nid);
+
+        if (stub) {
+            info_report("ps3-ppu: lv2: unresolved import %s:0x%08X called, "
+                        "answering -1", stub->lib, stub->nid);
+        } else {
+            info_report("ps3-ppu: lv2: unresolved import NID 0x%08X called "
+                        "(lr=0x%" PRIX64 "), answering -1", nid,
+                        (uint64_t)cpu->env.lr);
+        }
+        ret = -1;
         break;
     }
     case 0x072:                 /* sys_semaphore_get_value(id, val*) */
@@ -2669,6 +2876,51 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ps3_put_be32(ram + a3 + 4, 7);
         ret = 0;
         break;
+    case 0x185:                 /* sys_sm_set_fan_policy(policy, unknown,
+                                 * duty) */
+        /*
+         * The thermal loop only needs the console to answer: there is no fan
+         * to turn, so the policy is state and the duty is what the policy
+         * says.  policy 0 = auto, 1 = manual, 2 = full.
+         */
+        s->lv2_fan_policy = a0 > 2 ? 0 : a0;
+        s->lv2_fan_duty = (uint8_t)a2;
+        info_report("ps3-ppu: lv2: fan policy %u, manual duty 0x%02X",
+                    s->lv2_fan_policy, s->lv2_fan_duty);
+        ret = 0;
+        break;
+    case 0x199: {               /* sys_sm_get_fan_policy(setting, unknown*,
+                                 * duty*, temp*) */
+        uint8_t duty;
+
+        if ((a1 && (uint64_t)a1 + 1 > ram_size) ||
+            (a2 && (uint64_t)a2 + 1 > ram_size) ||
+            (a3 && (uint64_t)a3 + 1 > ram_size)) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+
+        if (s->lv2_fan_policy == 2) {
+            duty = 0xFF;                /* full speed */
+        } else if (s->lv2_fan_policy == 1) {
+            duty = s->lv2_fan_duty;     /* manual */
+        } else {
+            duty = 0x4E;                /* auto, the idle curve */
+        }
+
+        if (a1) {
+            ram[a1] = 0;                /* unknown */
+        }
+        if (a2) {
+            ram[a2] = duty;
+        }
+        if (a3) {
+            ram[a3] = 45;               /* an idle CELL, degrees Celsius */
+        }
+        s->lv2_fan_duty = duty;
+        ret = 0;
+        break;
+    }
     case 0x15D:                 /* sys_memory_free(addr) */
         ret = 0;
         break;
@@ -2856,11 +3108,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 79800000;
         break;
     case 0x15C:                 /* sys_memory_allocate(size, flags, addr*) */
-        ret = ps3_lv2_alloc(ram, ram_size, a0, a2);
+        ret = ps3_lv2_alloc(s, ram, ram_size, a0, a2);
         break;
     case 0x15E:                 /* sys_memory_allocate_from_container(id,
                                  * size, flags, addr*) */
-        ret = ps3_lv2_alloc(ram, ram_size, a1, a3);
+        ret = ps3_lv2_alloc(s, ram, ram_size, a1, a3);
         break;
     case 0x193: {               /* sys_tty_write(channel, buf, len, written) */
         uint32_t n;
@@ -3366,6 +3618,30 @@ static void ps3_ppu_reset_entry(void *opaque)
     }
 }
 
+/* The 970's exception vectors, so a run that lands on one says why. */
+static const char *ps3_ppu_vector_name(uint64_t nip)
+{
+    switch (nip) {
+    case 0x100: return "system reset";
+    case 0x200: return "machine check";
+    case 0x300: return "data storage interrupt";
+    case 0x380: return "data segment interrupt";
+    case 0x400: return "instruction storage interrupt";
+    case 0x480: return "instruction segment interrupt";
+    case 0x500: return "external interrupt";
+    case 0x600: return "alignment interrupt";
+    case 0x700: return "program interrupt";
+    case 0x800: return "FP unavailable";
+    case 0x900: return "decrementer interrupt";
+    case 0xC00: return "system call";
+    case 0xD00: return "trace interrupt";
+    case 0xE00: return "performance monitor interrupt";
+    case 0xF00: return "vector unavailable";
+    case 0xF20: return "VSX unavailable";
+    default: return NULL;
+    }
+}
+
 static void ps3_ppu_tick(void *opaque)
 {
     PS3BootROMState *s = opaque;
@@ -3374,6 +3650,29 @@ static void ps3_ppu_tick(void *opaque)
 
     s->ppu_last_pc = cpu->env.nip;
     s->ppu_tick_count++;
+
+    /*
+     * A fault leaves the core at a vector with SRR0 naming the instruction and
+     * SRR1 the interrupt cause.  Report the first one once: it is the only
+     * useful thing a bring-up run can say about a vector it has no handler for.
+     */
+    {
+        const char *vector = ps3_ppu_vector_name(s->ppu_last_pc);
+
+        if (vector && s->ppu_fault_reports < 3) {
+            s->ppu_fault_reports++;
+            info_report("ps3-ppu: %s at pc 0x%" PRIx64 " (srr0=0x%" PRIx64
+                        ", srr1=0x%" PRIx64 ", lr=0x%" PRIx64
+                        ", ctr=0x%" PRIx64 ", r3=0x%" PRIx64
+                        ", r4=0x%" PRIx64 ", r31=0x%" PRIx64 ")",
+                        vector, s->ppu_last_pc,
+                        (uint64_t)cpu->env.spr[SPR_SRR0],
+                        (uint64_t)cpu->env.spr[SPR_SRR1],
+                        (uint64_t)cpu->env.lr, (uint64_t)cpu->env.ctr,
+                        (uint64_t)cpu->env.gpr[3], (uint64_t)cpu->env.gpr[4],
+                        (uint64_t)cpu->env.gpr[31]);
+        }
+    }
 
     if (s->ppu_trace) {
         info_report("ps3-ppu: tick %" PRIu64 " pc=0x%" PRIx64
@@ -3857,16 +4156,13 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
                         (1ULL << MSR_FP) | (1ULL << MSR_VR);
         cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
         /*
-         * The lv2 syscall boundary.  A bare PPU has no handler at the 0xC00
-         * vector, so the first sc would run zeros and take a program
-         * exception.  The shim is a bring-up lv2, not a full kernel: it
-         * handles the calls the VSH's C runtime makes while it initializes
-         * (memory, locks, timebase, tty), reports each number at 0xF1040014,
-         * and returns -ENOSYS for anything else.
+         * The lv2 syscall boundary at 0xC00 is a ROM region the board puts
+         * there (rs6000_ps3_lv2_page), so the guest cannot overwrite it.  The
+         * shim is a bring-up lv2, not a full kernel: it handles the calls the
+         * VSH's C runtime makes while it initializes (memory, locks, timebase,
+         * tty), reports each number at 0xF1040014, and returns -ENOSYS for
+         * anything else.
          */
-        for (size_t i = 0; i < ARRAY_SIZE(ps3_lv2_shim); i++) {
-            ps3_put_be32(ram + 0xC00 + i * 4, ps3_lv2_shim[i]);
-        }
 
         /* lv2 scratch, then the heap above the VSH image and below the stack. */
         memset(ram + PS3_LV2_SCRATCH, 0, 8);
@@ -3877,8 +4173,13 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         ps3_lv2_register_process_exports(s, ram, ram_size);
         ps3_lv2_link_process(s, ram, ram_size);
         s->lv2_exited = false;
+        s->lv2_fan_policy = 0;
+        s->lv2_fan_duty = 0;
+        s->lv2_stub_next = 0;
+        s->lv2_export_full = false;
         s->lv2_exit_status = 0;
-        ps3_put_be32(ram + PS3_LV2_HEAP, 0x01000000);
+        s->lv2_heap = 0x01000000;
+        ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
 
         s->ppu_entry = code;
         s->ppu_last_pc = code;
@@ -3969,6 +4270,147 @@ static void rs6000_ps3_cpu_reset(void *opaque)
     env->nip = PS3_BOOT_ROM_BASE + 0x100;
 }
 
+/*
+ * lv2's low page, protected from the process.
+ *
+ * On hardware the first 32 KiB belong to lv2: a user process cannot store
+ * there, and the 0xC00 syscall vector is the kernel's.  This model runs the
+ * PPU with translation off, so a guest store reaches RAM directly, and the
+ * VSH's later initialisation memsets a table straight through the page - it
+ * takes out the trampoline and the next `sc` runs the fill pattern.
+ *
+ * Two overlays stand in for the mapping the model does not have:
+ *
+ *   0x800..0x900  the bump pointer at 0x808 and the result block at 0x880.
+ *                 Reads pass through to RAM; stores are dropped, and the first
+ *                 one is reported with the pc, lr and argument registers so the
+ *                 writer is identified rather than guessed at.
+ *   0xC00..0xC60  the syscall trampoline as ROM.  It is executable, reads the
+ *                 result block as usual, and a store from the guest is a no-op
+ *                 instead of the next `sc` faulting at 0x700.
+ *
+ * The container's authority is in the device (lv2_heap), so the fill cannot
+ * move the heap even where it does land.
+ */
+#define PS3_LV2_TRAP_BASE   0x800
+#define PS3_LV2_TRAP_SIZE   0x100
+#define PS3_LV2_VECTOR      0xC00
+#define PS3_LV2_VECTOR_SIZE 0x60
+
+typedef struct PS3Lv2Trap {
+    MemoryRegion *ram;
+    bool reported;
+    uint64_t stores;
+} PS3Lv2Trap;
+
+static uint64_t ps3_lv2_trap_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PS3Lv2Trap *t = opaque;
+    const uint8_t *p = memory_region_get_ram_ptr(t->ram) +
+                       PS3_LV2_TRAP_BASE + addr;
+    uint64_t v = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        v = (v << 8) | p[i];
+    }
+
+    return v;
+}
+
+static void ps3_lv2_trap_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned size)
+{
+    PS3Lv2Trap *t = opaque;
+    CPUState *cs = qemu_get_cpu(0);
+
+    t->stores++;
+
+    if (t->reported || !cs) {
+        return;
+    }
+
+    t->reported = true;
+    {
+        CPUPPCState *env = &POWERPC_CPU(cs)->env;
+
+        info_report("ps3-ppu: lv2: store of 0x%" PRIX64 " to 0x%X ignored "
+                    "(pc=0x%" PRIX64 ", lr=0x%" PRIX64 ", r3=0x%" PRIX64
+                    ", r4=0x%" PRIX64 ", r5=0x%" PRIX64 ", ctr=0x%" PRIX64
+                    ")",
+                    value, (unsigned)(PS3_LV2_TRAP_BASE + addr),
+                    (uint64_t)env->nip, (uint64_t)env->lr,
+                    (uint64_t)env->gpr[3], (uint64_t)env->gpr[4],
+                    (uint64_t)env->gpr[5], (uint64_t)env->ctr);
+
+        /* The top of the stack names the caller chain that got here. */
+        {
+            const uint8_t *base = memory_region_get_ram_ptr(t->ram);
+            uint64_t ram_len = memory_region_size(t->ram);
+            uint32_t sp = env->gpr[1];
+            unsigned row;
+
+            for (row = 0; row < 4; row++) {
+                uint64_t at = (uint64_t)sp + row * 0x20;
+
+                if (at + 0x20 > ram_len) {
+                    break;
+                }
+
+                info_report("ps3-ppu: lv2:   sp+0x%02X: %08X %08X %08X %08X "
+                            "%08X %08X %08X %08X",
+                            row * 0x20, ps3_be32(base + at),
+                            ps3_be32(base + at + 4), ps3_be32(base + at + 8),
+                            ps3_be32(base + at + 12), ps3_be32(base + at + 16),
+                            ps3_be32(base + at + 20), ps3_be32(base + at + 24),
+                            ps3_be32(base + at + 28));
+            }
+        }
+    }
+}
+
+static const MemoryRegionOps ps3_lv2_trap_ops = {
+    .read = ps3_lv2_trap_read,
+    .write = ps3_lv2_trap_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+static void rs6000_ps3_lv2_page(MemoryRegion *sysmem, MemoryRegion *ram)
+{
+    PS3Lv2Trap *trap = g_new0(PS3Lv2Trap, 1);
+    MemoryRegion *trap_mr = g_new0(MemoryRegion, 1);
+    MemoryRegion *vector = g_new0(MemoryRegion, 1);
+    uint8_t *p;
+    size_t i;
+
+    trap->ram = ram;
+    memory_region_init_io(trap_mr, NULL, &ps3_lv2_trap_ops, trap,
+                          "ps3.lv2-scratch", PS3_LV2_TRAP_SIZE);
+    memory_region_add_subregion_overlap(sysmem, PS3_LV2_TRAP_BASE, trap_mr, 1);
+
+    memory_region_init_rom(vector, NULL, "ps3.lv2-vector",
+                           PS3_LV2_VECTOR_SIZE, &error_fatal);
+    p = memory_region_get_ram_ptr(vector);
+    memset(p, 0, PS3_LV2_VECTOR_SIZE);
+    for (i = 0; i < ARRAY_SIZE(ps3_lv2_shim); i++) {
+        ps3_put_be32(p + i * 4, ps3_lv2_shim[i]);
+    }
+    memory_region_add_subregion_overlap(sysmem, PS3_LV2_VECTOR, vector, 1);
+
+    info_report("rs6000-ps3: lv2 low page: %u-word sc vector at 0x%X as ROM, "
+                "scratch 0x%X..0x%X trapped",
+                (unsigned)ARRAY_SIZE(ps3_lv2_shim), PS3_LV2_VECTOR,
+                PS3_LV2_TRAP_BASE, PS3_LV2_TRAP_BASE + PS3_LV2_TRAP_SIZE);
+}
+
 static void rs6000_ps3_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -3998,6 +4440,7 @@ static void rs6000_ps3_init(MachineState *machine)
     }
 
     memory_region_add_subregion(sysmem, 0, ram);
+    rs6000_ps3_lv2_page(sysmem, ram);
 
     /*
      * The PPU's reset vector lands here.  The real console's first code runs

@@ -275,6 +275,71 @@ This is also why `lv0.2` is not one of the `.2` loaders: `lv1ldr.2`,
 signed record of lv0.  Older consoles without lv0.2 keep the original sigfail
 path.
 
+### metldr.2 opens, and what is inside it
+
+A superslim `metldr.2` from the console's own flash opens with the channel-66
+readout this tree already carries (PCK0), no other key:
+
+| Container field | Value |
+| --- | --- |
+| sealed image | 63,776 bytes, MD5 `f317cf234ae6c0be803164d6d9fbc511`; header length field `0x00000F8E` |
+| per-image key field | `953034B3CC0E4DA463D528B3` at `0x14` |
+| key | the channel-66 readout mixed with that field (the sample tool's `Kp` derivation), *not* a static ERK/RIV pair |
+| body | 63,712 bytes, MD5 `a0995a4a00d9f0a6566752ad4b286c5b`, `metldr.dec` next to the sample |
+
+The result is not a SELF or an ELF: it is the loader's flat SPU image, linked
+at LS `0x400`.  Decoding it as SPU code shows the shape of the stage:
+
+* `0x400` is `ila $14, 0x6D0; bi $14` - the real entry is `0x6D0`.
+* `0x6D0` sets the stack (`ila $2, 0x3DFA0`, so `r1` ends just below 256 KiB),
+  saves the nine arguments in `r81..r89`, then walks the list at `0xFCC4`
+  downwards, calling every entry until the `0xFFFFFFFF` sentinel: here `0x36D8`
+  then `0x2738`, through `bisl $0,$3`.
+* `0x410` is a second entry: a stage dispatcher.  It reads the byte at LS
+  `0x8C`, subtracts `0x1E`, bounds-checks it against 6 and indexes a jump
+  table at `0x43C` (`0x480`, `0x460`, `0x468`, `0x478`, `0x470`, `0x458`,
+  `0x488`); each arm is a `stop` with its own signal (`0x1E`..`0x24` in
+  selector order, `0x15` for an out-of-range one), so the hypervisor drives
+  the stage by writing a command byte and reading the stop code back.
+* the text decodes continuously `0x400..0xD6CC`; 383 `brsl` sites reach 143
+  distinct functions, hottest `0xB5B8` (31 calls), `0x9108` (28), `0x8D90`
+  (11), `0x8D48` and `0x8DF8` (10 each).
+* `0xE460..0xFCA0` is 6,208 bytes at entropy 7.9 with 2% zeros - data, not
+  code, and the stage's only high-entropy region.
+* three sentinel-terminated pointer runs close the image: `0xFCB4`
+  (`0x780`, `0x1B00`, `0x1C20`), `0xFCC0` (`0x2738`, `0x36D8`) and `0xFCCC`
+  (`0x1AF0`, `0x1C10`, `0x2748`).
+
+The 4301C NOR's `metldr` at `0x840` is a *different* image (63,920 bytes against
+63,776 here), so a decryption of one says nothing about the other's bytes; both
+open with the same kind of container, and this is the one from the second
+sample's flash.
+
+### Superslim keys: PCK0 and PCK1 are different keys
+
+The superslim (CECH-4xxx) chain uses two per-console keys, and they are not
+interchangeable:
+
+| Key | Where it lives | What it opens |
+| --- | --- | --- |
+| PCK0 (`per_console_root_key_0`) | the channel-66 efuse readout (already in this tree as the ROM readout) | `metldr` / `metldr.2` and `bootldr` / `lv0ldr.2`, i.e. the sealed `.2` stage containers |
+| PCK1 (`per_console_root_key_1`, `EID_root_key`) | derived from PCK0, held inside `metldr`, copied to HDD sector 0 by `metldr`, cleared by `isoldr` | part of the EID, and it is the root for the further per-console keys |
+| PCK2 (`per_console_root_key_2`, `EID0_key`) | AES-256-CBC over the EID0 seed with `isoldr`'s key and RIV, algorithm inside `isoldr` | the EID0 store |
+
+So the channel-66 readout this model already carries is PCK0 and stops at the
+`.2` loaders.  PCK1 is not a second efuse: it is *derived from PCK0* by
+`metldr`, which is why the chain can be continued from the readout already in
+the tree instead of needing a dump - the derivation and the `sector 0` copy are
+what a superslim run has to model next.  PCK1 only exists between `metldr` and
+`isoldr` (a patched `isoldr` is the usual way to dump it), and `isoldr` clearing
+it is the reason EID0 work has to be gated on that stage not having run.  From
+PCK1 come PCK2 and the rest of the per-console keys (naehrwert's
+`ps3_decrypt_tools`), and the system controller side - cVTRM's SRK/SRH, with
+AES-CBC-128 from an encrypted key table in Syscon, or AES-XTS-128 with keys
+from the EID root key and Syscon seeds - hangs off the same root.
+
+Key names and provenance here follow `docs/PCK.txt` in the ps3tools tree.
+
 ### The application stage: vsh.self
 
 `appldr` is the last loader: it opens `/dev_flash/vsh/module/vsh.self` and
@@ -350,6 +415,8 @@ The calls the VSH asks for, in the order it first asks for them:
 | 128/129/134/137 | `0x80`, `0x81`, `0x86`, `0x89` | event queue and port create, destroy, disconnect | id / succeed |
 | 324/325 | `0x144`/`0x145` | memory container create/destroy | id, 1 MiB granularity |
 | 352 | `0x160` | `sys_memory_get_user_memory_size` | total RAM and what the heap has left |
+| 389 | `0x185` | `sys_sm_set_fan_policy` | policy and manual duty are state; nothing turns |
+| 409 | `0x199` | `sys_sm_get_fan_policy` | duty from the policy (auto `0x4E`, full `0xFF`), 45 C |
 
 `_sys_process_get_paramsfo` was what used to stop the boot: liblv2 asks for
 the process's PARAM.SFO, and with `-ENOSYS` it printed `liblv2 can't get
@@ -358,20 +425,111 @@ SFO header (magic, version, two empty tables), and the VSH continues into its
 own initialisation: mutexes and condition variables, event queues and ports,
 a 3 MiB memory container, and its library registrations.
 
-Where that run stops:
+The thermal loop only needs an answer, so the fan is a stub with state: auto
+reports the idle curve, full reports `0xFF`, manual reports what was set.  The
+`temperature` out-pointer gets 45 (degrees C), which is what an idle CELL
+reads as.  Calls the model does not implement answer `-1` (or `-ENOSYS`) and
+are otherwise passed through, so a missing service does not stop the run by
+itself.
+
+### Import and export linkage
+
+lv2 links a process and its modules the way the loader left them: an import
+slot holds the address of the OPD whose `{code, toc}` pair the caller's thunk
+loads, and a link is a rewrite of that slot.  The model recovers the tables
+from the images rather than from a linker map:
+
+* the process's exports are a run of `PS3PrxEntry` records in its `.rodata`;
+  a record only counts when its neighbour is one too, its name is a library
+  name, and its first NID points at an OPD-shaped descriptor inside the image.
+  The VSH publishes 16 libraries and 2,400 functions that way (`paf` alone is
+  973), which is why the linkage table is 8,192 entries.
+* both linkers run after every module load, so a library that arrives late
+  still gets its slots filled.
+* an import whose OPD still carries the linker placeholder `0x39800000` is
+  filled by lv2.  When nothing provides the NID, the model plants a stub in
+  `0x800000..0xA00000`: an OPD over a six-word trampoline that stores the NID
+  at `0xA00`, calls `0x7FF`, and returns `-1`.  That is what an unimplemented
+  lv2 service answers, and it keeps a missing library from becoming a branch to
+  `0x39800000`.
+* slots that already point at working stub code are left alone - those are the
+  VSH's own `li r11, <n>; sc` thunks, and the `0xC00` trampoline answers them.
+
+With that in place the run loads and starts `libfs_utility2.sprx` (module 205,
+680 relocations, 11/11 `sysPrxForUser` imports linked) and then
+`sys_audio.sprx` (module 206, 3,164 relocations), which is where the VSH's own
+module loading begins to drive the model.
+
+### lv2's low page and the `0xB0FAC0DE` fill
+
+The VSH's initialisation builds a pool table in low memory.  The constructor is
+at `0x52A2F0`; it zeroes `count * 24` bytes through the memset helper at
+`0xAE5E8`, then stamps `0xB0FAC0DE` into the first two words of every 24-byte
+record:
 
 ```
-ps3-ppu console: prx.c:sys_prx_load_module_on_memcontainer:Error: res(id)=0x80010003
-ps3-ppu console: load /dev_flash/sys/internal/libfs_utility2.sprx failed 0x80010003
+0x52A328  lwz   r5, 0x2288(r9)     r9 = 0x00700000, so count = 1300
+0x52A32C  mulli r5, r5, 0x18       31,200 bytes
+0x52A334  bl    0xAE5E8            memset(base, 0, 31,200)
+0x52A33C  lis   r10, 0xB0FA
+0x52A344  ori   r10, r10, 0xC0DE
+0x52A36C  lwz   r0, 0(r31)         base
+0x52A370  mulli r9, r8, 0x18       r9 = base + i * 24
+0x52A374  add   r9, r9, r0
+0x52A380  stw   r10, 4(r9)         record[i].+4 = 0xB0FAC0DE
+0x52A384  stw   r10, 0(r9)         record[i].+0 = 0xB0FAC0DE
+0x52A388  bdnz  0x52A36C
 ```
 
-`_sys_prx_load_module*`, `_sys_prx_start_module` and `_sys_ppu_thread_create`
-are not modelled, and they are not handlers that can be faked: the first two
-need the PPU module loader (open the SELF, relocate it, publish its exports)
-and the third needs a scheduler.  With the load refused, the VSH's fallback
-branches to an unmapped address (`0x39800000`), which QEMU reports as a
-hypervisor-emulation exception and leaves the core at the `0x700` vector.
-That is the next piece of lv2 to build, not a fault in the handlers above.
+It is called with the arena argument `0x24`, so the table lands on
+`0x24..0x79F0` - lv2's page, where a user store faults on hardware.  Two things
+in that range are the model's, and the fill took both out:
+
+* the `0xC00` `sc` trampoline, so the next `sc` executed the pattern and took
+  the program exception at `0x700`;
+* the heap word at `0x808`, which is `record[84].+4`, so the old bump pointer
+  became `0xB0FAC0DE` and every later allocation handed the guest a block built
+  on the pattern.
+
+`rs6000_ps3_lv2_page` now gives lv2's page the properties the missing MMU would
+have given it:
+
+* `0x800..0x900` is an I/O window over the bump pointer and the result block.
+  Reads pass through to RAM, stores are dropped, and the first one is reported
+  with `pc`, `lr`, the argument registers and the top of the stack - that is how
+the writer above was identified rather than guessed at.
+* `0xC00..0xC60` is a ROM region holding the 23-word shim.  It is executable, a
+  store from the guest is a no-op, and the vector therefore survives the fill.
+* the container's bump pointer is device state (`lv2_heap`); `0x808` is only a
+  copy for dumps, so no guest store can move the heap.
+
+The fill still happens and is now harmless.  Verified by having the guest run
+two stores itself (a `stw` of `0xB0FAC0DE` to `0xC00` and one to `0x808`, code
+placed through the gdbstub): the vector still reads `9421FFE0` and the heap word
+still reads 0.  A gdb `M` packet is not a valid test here - the debug stub
+writes ROM on purpose (`address_space_write_rom`).
+
+### Where that run stops now
+
+With the page protected the run goes past the fill and much further: 167 lv2
+calls in 40 ticks, `libfs_utility2` and `sys_audio` loaded and linked, and the
+VSH printing its own console output:
+
+```
+MakePath : /dev_flash2/etc failed 8003051e
+/home/tetsu/work/sys/trunk/lv2/src/library/libpad/libpadconfig/libpadconfig_stub.cc:34 ret == CELL_OK -- assertion failed
+abort() is called from 0x00000000000acd18
+                  from 0x00000000005d46d4
+                  ...
+                  from 0x0000000000010250
+Continue... (Lv-2 is still running.)
+```
+
+So it gets through liblv2's start-up, the mutex/cond/queue set, module loading,
+and into `libpadconfig`, where a stub asserts because a `cellPad` import is one
+of the 194 trapped ones and answers -1.  The last unmodelled service it asks
+for is `0x209`; `_sys_ppu_thread_create` (`0x34`) is not reached in this run.
+That assertion, not the `0xC00` vector, is now where the boot stops.
 
 ## Using it with the low-level boot chain
 
