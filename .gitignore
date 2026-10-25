@@ -25,3 +25,4 @@ GTAGS
 
 # Run logs from the PS3 model and local tests
 /*.log
+/.tmp/

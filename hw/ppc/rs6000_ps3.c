@@ -2398,13 +2398,30 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
          * guest's own startup path continue far enough to show which lv2
          * services it needs.  It is a bring-up probe, not an lv2 model.
          */
-        ps3_put_be32(ram + 0xC00, 0x3D800000); /* lis   r12, 0        */
+        ps3_put_be32(ram + 0xC00, 0x3D800000); /* lis   r12, 0          */
         ps3_put_be32(ram + 0xC04, 0x618C0800); /* ori   r12, r12, 0x800 */
-        ps3_put_be32(ram + 0xC08, 0x916C0000); /* stw   r11, 0(r12)   */
-        ps3_put_be32(ram + 0xC0C, 0x3860FFDA); /* li    r3, -ENOSYS   */
-        ps3_put_be32(ram + 0xC10, 0x7D80D2A6); /* mfspr r12, SRR0     */
-        ps3_put_be32(ram + 0xC14, 0x7D80D3A6); /* mtspr SRR0, r12     */
-        ps3_put_be32(ram + 0xC18, 0x4C000024); /* rfid                */
+        ps3_put_be32(ram + 0xC08, 0x916C0000); /* stw   r11, 0(r12)     */
+        ps3_put_be32(ram + 0xC0C, 0x2C0B015C); /* cmpwi r11, 0x15C      */
+        ps3_put_be32(ram + 0xC10, 0x41820020); /* beq   0xC30           */
+        ps3_put_be32(ram + 0xC14, 0x3860FFDA); /* li    r3, -ENOSYS     */
+        ps3_put_be32(ram + 0xC18, 0x7D80D2A6); /* mfspr r12, SRR0       */
+        ps3_put_be32(ram + 0xC1C, 0x7D80D3A6); /* mtspr SRR0, r12       */
+        ps3_put_be32(ram + 0xC20, 0x4C000024); /* rfid                  */
+
+        /* sys_memory_allocate(size, flags, u32 *addr) */
+        ps3_put_be32(ram + 0xC30, 0x800C0008); /* lwz   r0, 8(r12)      */
+        ps3_put_be32(ram + 0xC34, 0x90050000); /* stw   r0, 0(r5)       */
+        ps3_put_be32(ram + 0xC38, 0x7C001A14); /* add   r0, r0, r3      */
+        ps3_put_be32(ram + 0xC3C, 0x380000FF); /* addi  r0, r0, 0xFF    */
+        ps3_put_be32(ram + 0xC40, 0x5400063E); /* clrrwi r0, r0, 8      */
+        ps3_put_be32(ram + 0xC44, 0x900C0008); /* stw   r0, 8(r12)      */
+        ps3_put_be32(ram + 0xC48, 0x38600000); /* li    r3, 0           */
+        ps3_put_be32(ram + 0xC4C, 0x7D80D2A6); /* mfspr r12, SRR0       */
+        ps3_put_be32(ram + 0xC50, 0x7D80D3A6); /* mtspr SRR0, r12       */
+        ps3_put_be32(ram + 0xC54, 0x4C000024); /* rfid                  */
+
+        /* lv2 heap: above the VSH image and below the initial stack. */
+        ps3_put_be32(ram + 0x808, 0x01000000);
 
         s->ppu_entry = code;
         s->ppu_last_pc = code;
