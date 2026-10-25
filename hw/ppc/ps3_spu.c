@@ -91,6 +91,7 @@ struct PS3SPU {
     uint32_t last_put_lsa;
 
     bool trace;
+    bool log_events;
     unsigned stop_code;   /* the stop instruction's immediate, when it stops */
 };
 
@@ -379,6 +380,16 @@ static void mfc_start(PS3SPU *spu)
         spu->last_put_ea = (uint32_t)ea;
         spu->last_put_size = size;
         spu->last_put_lsa = lsa;
+
+        /* Few enough to be worth a line each, and the only trace of where the
+         * loader sent its output. */
+        if (spu->log_events) {
+            fprintf(stderr,
+                    "[spu] put %u bytes lsa=0x%X -> ea=0x%" PRIX64
+                    " at 0x%X ($1=0x%X $3=0x%X $4=0x%X $5=0x%X $6=0x%X)\n",
+                    size, lsa, ea, spu->last_pc, scw(spu, 1), scw(spu, 3),
+                    scw(spu, 4), scw(spu, 5), scw(spu, 6));
+        }
     }
 
     tag_complete(spu);
@@ -510,6 +521,7 @@ PS3SPU *ps3_spu_new(uint8_t *ls, size_t ls_size,
      * loader to put its output past the end of the flash window. */
     spu->ext_size = flash_size + 4 * MiB;
     spu->ext = g_malloc0(spu->ext_size);
+    spu->log_events = true;
 
     if (flash) {
         memcpy(spu->ext, flash, flash_size);
