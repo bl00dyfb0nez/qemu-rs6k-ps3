@@ -772,6 +772,35 @@ static void ps3_rom_set_status(PS3BootROMState *s, uint32_t status,
     }
 }
 
+/*
+ * The local store after a run, in the layout ls_sift.py reads: 256 KiB of
+ * local store and 16 KiB of zero padding.  It is the only way to see what a
+ * stage built in place, so both the container path and the stage path write
+ * it when `ls-dump` is set.
+ */
+static void ps3_ls_write_dump(PS3BootROMState *s)
+{
+    uint8_t *ram;
+    g_autofree uint8_t *blob = NULL;
+    g_autoptr(GError) err = NULL;
+
+    if (!s->ls_dump || !*s->ls_dump) {
+        return;
+    }
+
+    ram = memory_region_get_ram_ptr(&s->ls_mr);
+    blob = g_malloc(PS3_LS_SIZE + 0x4000);
+    memcpy(blob, ram, PS3_LS_SIZE);
+    memset(blob + PS3_LS_SIZE, 0, 0x4000);
+
+    if (!g_file_set_contents(s->ls_dump, (const char *)blob,
+                             PS3_LS_SIZE + 0x4000, &err)) {
+        info_report("ps3-spu: cannot write %s: %s", s->ls_dump, err->message);
+    } else {
+        info_report("ps3-spu: local store written to %s", s->ls_dump);
+    }
+}
+
 static void ps3_rom_boot(PS3BootROMState *s)
 {
     const char *name = s->container ?: "lv0ldr.2";
@@ -855,29 +884,7 @@ static void ps3_rom_boot(PS3BootROMState *s)
                             ps3_spu_last_put_ea(s->spu));
             }
 
-            /*
-             * The local store after the run is the interesting artefact: it is
-             * what ls_sift.py wants, and it is the only way to see whether the
-             * loader built its next stage in place or pushed it out over the
-             * MFC.  Dumped only when asked, because it is 256 KiB per boot.
-             */
-            if (s->ls_dump && *s->ls_dump) {
-                uint8_t *ram = memory_region_get_ram_ptr(&s->ls_mr);
-                g_autofree uint8_t *blob = g_malloc(PS3_LS_SIZE + 0x4000);
-                g_autoptr(GError) err = NULL;
-
-                memcpy(blob, ram, PS3_LS_SIZE);
-                memset(blob + PS3_LS_SIZE, 0, 0x4000);
-
-                if (!g_file_set_contents(s->ls_dump, (const char *)blob,
-                                         PS3_LS_SIZE + 0x4000, &err)) {
-                    info_report("ps3-spu: cannot write %s: %s", s->ls_dump,
-                                err->message);
-                } else {
-                    info_report("ps3-spu: local store written to %s",
-                                s->ls_dump);
-                }
-            }
+            ps3_ls_write_dump(s);
         }
     }
 
@@ -1323,12 +1330,12 @@ static int ps3_spu_stage(PS3BootROMState *s)
     if (len >= 0x200 && !memcmp(img, "SCE\0", 4)) {
         uint32_t stage_entry = 0;
         unsigned segments = 0;
-        int rc = ps3_self_load_ls(img, len, ls, PS3_LS_SIZE, &stage_entry,
-                                  &segments, why, sizeof(why));
+        int opened = ps3_self_load_ls(img, len, ls, PS3_LS_SIZE, &stage_entry,
+                                      &segments, why, sizeof(why));
 
-        if (rc) {
+        if (opened) {
             info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
-            return rc == 1 ? 1 : 2;
+            return opened == 1 ? 1 : 2;
         }
 
         if (s->stage_entry) {
@@ -1338,6 +1345,7 @@ static int ps3_spu_stage(PS3BootROMState *s)
         ps3_spu_set_trace(s->spu, s->spu_trace);
         rc = ps3_spu_run(s->spu, stage_entry, s->stage_limit ?: (1 << 22),
                          why, sizeof(why));
+        ps3_ls_write_dump(s);
         info_report("ps3-spu-stage: %s entry=0x%X segments=%u steps=%" PRIu64
                     " result=%s stop=%u :: %s",
                     s->stage_elf, stage_entry, segments,

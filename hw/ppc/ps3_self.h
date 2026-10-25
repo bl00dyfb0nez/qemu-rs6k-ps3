@@ -14,6 +14,14 @@
  * ps3tools, the same table scetool and readself search).  A candidate is only
  * accepted when the decrypted root header's two padding fields are zero, which
  * is what the loader's own check tests.
+ *
+ * The loader SELFs carved out of a decrypted lv0 are not all still sealed: some
+ * have already been unselfed, and their section table keeps saying "encrypted"
+ * while the bytes are the plaintext image.  The opener decides from the largest
+ * section (an SPU image decodes as instructions almost word for word where
+ * ciphertext manages a little over half by chance) and then treats the whole
+ * file the same way, so such a carve is left as it is instead of being decrypted
+ * a second time into noise.
  */
 #pragma once
 

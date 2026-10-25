@@ -637,6 +637,29 @@ uint8_t *ps3_spu_ext_ptr(PS3SPU *spu, size_t *size)
     return spu->ext;
 }
 
+unsigned ps3_spu_code_words(const uint8_t *bytes, size_t len,
+                            unsigned *total)
+{
+    unsigned known = 0, words = len / 4;
+
+    for (unsigned i = 0; i < words; i++) {
+        uint32_t w = ((uint32_t)bytes[i * 4] << 24) |
+                     ((uint32_t)bytes[i * 4 + 1] << 16) |
+                     ((uint32_t)bytes[i * 4 + 2] << 8) |
+                     (uint32_t)bytes[i * 4 + 3];
+
+        if (decode(w)) {
+            known++;
+        }
+    }
+
+    if (total) {
+        *total = words;
+    }
+
+    return known;
+}
+
 static bool fault(PS3SPU *spu, uint32_t pc, uint32_t word,
                   char *why, size_t why_len)
 {

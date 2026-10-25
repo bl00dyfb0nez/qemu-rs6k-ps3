@@ -19,9 +19,19 @@
  * (the form readself prints for lv2ldr.self), reimplemented here so the stage
  * tests run the console's own loader path inside the emulator rather than
  * shipping a PC tool next to it.
+ *
+ * One difference from the PC tools is deliberate: the carves of lv0 in this
+ * tree are a mix, lv1ldr still sealed and lv2ldr/appldr/isoldr already
+ * unselfed.  Those keep the "encrypted" flag in their section table, so before
+ * decrypting anything the largest section is decoded twice, as it stands and
+ * under its own key, and the reading that comes out as SPU instructions wins
+ * for the whole file (self_sections_are_plaintext).  Without that, decrypting a
+ * second time turns the carve's code into noise and the stage faults at its
+ * entry word.
  */
 #include "qemu/osdep.h"
 #include "ps3_self.h"
+#include "ps3_spu.h"
 
 /* ---------------------------------------------------------------------- */
 /* AES-128/256, CBC decrypt and CTR, self-contained                        */
@@ -379,6 +389,35 @@ static bool hex_to_bytes(const char *hex, uint8_t *out, size_t n)
     return true;
 }
 
+/*
+ * Some carves carry the loader SELFs already unselfed: the section table still
+ * says "encrypted" and names key/iv ids, but the bytes are the plaintext image
+ * (every word decodes as an instruction, where ciphertext manages a little over
+ * half by chance).  Decrypting such a section again turns its code into noise,
+ * so decide from the largest section whether this file is one of them and then
+ * treat every section the same way: a file that mixed the two would be a repack
+ * this path has never seen, and guessing section by section would corrupt the
+ * data sections, which never look like code in either reading.
+ */
+static bool self_sections_are_plaintext(const uint8_t *keys,
+                                       const uint8_t *entry,
+                                       const uint8_t *data, uint64_t size)
+{
+    uint8_t probe[4096];
+    unsigned raw_known, raw_total, dec_known, dec_total;
+    size_t n = MIN(size, sizeof(probe));
+    uint32_t key_id = self_be32(entry + 0x24);
+    uint32_t iv_id = self_be32(entry + 0x28);
+
+    raw_known = ps3_spu_code_words(data, n, &raw_total);
+    memcpy(probe, data, n);
+    aes128_ctr(keys + 0x10 * key_id, keys + 0x10 * iv_id, probe, probe, n);
+    dec_known = ps3_spu_code_words(probe, n, &dec_total);
+
+    return raw_total && raw_known * 100 >= raw_total * 95 &&
+           raw_known >= dec_known;
+}
+
 bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len)
 {
     uint8_t key[32], iv[16], root[0x40], ctr_iv[16];
@@ -443,7 +482,39 @@ bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len)
     }
 
     /*
-     * 3. Each section.  The key table sits right after the section table and
+     * 3. Is this file already unselfed?  Ask its largest encrypted section.
+     */
+    {
+        uint8_t *keys = img + meta_offset + 0x80 + 0x30 * section_count;
+        uint64_t biggest = 0;
+        bool plaintext = false;
+
+        for (unsigned i = 0; i < section_count; i++) {
+            uint8_t *entry = img + meta_offset + 0x80 + 0x30 * i;
+            uint64_t offset = self_be64(entry);
+            uint64_t size = self_be64(entry + 8);
+
+            if (size <= biggest || size < 0x400 ||
+                self_be32(entry + 0x24) == 0xFFFFFFFF ||
+                self_be32(entry + 0x28) == 0xFFFFFFFF ||
+                offset + size > len) {
+                continue;
+            }
+
+            biggest = size;
+            plaintext = self_sections_are_plaintext(keys, entry,
+                                                    img + offset, size);
+        }
+
+        if (plaintext) {
+            snprintf(why, why_len, "opened with key %d, %u section(s), "
+                     "already decrypted (left as is)", opened, section_count);
+            return true;
+        }
+    }
+
+    /*
+     * 4. Each section.  The key table sits right after the section table and
      * is indexed by the key/iv ids the section header carries.
      */
     for (unsigned i = 0; i < section_count; i++) {

@@ -1,2 +1,2 @@
-#define QEMU_PKGVERSION "v11.1.0-2787-g0253e6217b-dirty"
-#define QEMU_FULL_VERSION "11.1.50 (v11.1.0-2787-g0253e6217b-dirty)"
+#define QEMU_PKGVERSION "v11.1.0-2788-g555d7bb278-dirty"
+#define QEMU_FULL_VERSION "11.1.50 (v11.1.0-2788-g555d7bb278-dirty)"

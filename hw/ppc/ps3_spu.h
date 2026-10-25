@@ -70,3 +70,13 @@ uint32_t ps3_spu_last_put_size(const PS3SPU *spu);
 
 /* The writable external memory: the flash image plus whatever was PUT. */
 uint8_t *ps3_spu_ext_ptr(PS3SPU *spu, size_t *size);
+
+/*
+ * How many of the big-endian words in `bytes` decode to a real instruction,
+ * with the word count in `total`.  Ciphertext decodes at a little over half by
+ * chance and an SPU image at essentially all of it, so the pair tells the two
+ * apart; ps3_self.c uses it to recognise a SELF whose segments a previous
+ * unself already decrypted.
+ */
+unsigned ps3_spu_code_words(const uint8_t *bytes, size_t len,
+                            unsigned *total);
