@@ -1301,6 +1301,39 @@ bool qemu_console_is_gl_blocked(QemuConsole *con)
     return con->gl_block;
 }
 
+/*
+ * The status LED a machine model publishes for the display frontends.
+ *
+ * Only one machine runs at a time, so one string is enough.  Setting it
+ * notifies the frontends instead of polling, and setting the same text twice
+ * is a no-op so a guest that hammers the LED control does not repaint the
+ * window title for nothing.
+ */
+static char *console_status_led;
+static NotifierList console_status_led_notifiers =
+    NOTIFIER_LIST_INITIALIZER(console_status_led_notifiers);
+
+void qemu_console_set_status_led(const char *led)
+{
+    if (!g_strcmp0(console_status_led, led)) {
+        return;
+    }
+
+    g_free(console_status_led);
+    console_status_led = g_strdup(led);
+    notifier_list_notify(&console_status_led_notifiers, console_status_led);
+}
+
+const char *qemu_console_get_status_led(void)
+{
+    return console_status_led ? console_status_led : "";
+}
+
+void qemu_console_add_status_led_notifier(Notifier *notifier)
+{
+    notifier_list_add(&console_status_led_notifiers, notifier);
+}
+
 char *qemu_console_get_label(QemuConsole *con)
 {
     char *label = QEMU_CONSOLE_GET_CLASS(con)->get_label(con);

@@ -229,6 +229,7 @@ static void gd_update_caption(GtkDisplayState *s)
     const char *status = "";
     gchar *prefix;
     gchar *title;
+    gchar *led_part;
     const char *grab = "";
     bool is_paused = !runstate_is_running();
     int i;
@@ -252,9 +253,19 @@ static void gd_update_caption(GtkDisplayState *s)
                                    is_paused);
     s->external_pause_update = false;
 
-    title = g_strdup_printf("%s%s%s", prefix, status, grab);
+    /*
+     * The machine's front-panel LED, when it has one.  The PS3 publishes it
+     * from its sys_sm_control_led service, so the window title is where the
+     * console's power lamp lives in this emulation.
+     */
+    led_part = *qemu_console_get_status_led() ?
+        g_strdup_printf(" - %s LED", qemu_console_get_status_led()) :
+        g_strdup("");
+
+    title = g_strdup_printf("%s%s%s%s", prefix, led_part, status, grab);
     gtk_window_set_title(GTK_WINDOW(s->window), title);
     g_free(title);
+    g_free(led_part);
 
     for (i = 0; i < s->vcs->len; i++) {
         VirtualConsole *vc = g_ptr_array_index(s->vcs, i);
@@ -270,6 +281,28 @@ static void gd_update_caption(GtkDisplayState *s)
     }
 
     g_free(prefix);
+}
+
+/*
+ * A machine model changed its status LED.  The change comes from a vCPU, so
+ * the caption is refreshed from the main loop rather than from here.
+ */
+static gboolean gd_led_update(gpointer opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    s->led_update_source = 0;
+    gd_update_caption(s);
+    return G_SOURCE_REMOVE;
+}
+
+static void gd_led_notify(Notifier *n, void *data)
+{
+    GtkDisplayState *s = container_of(n, GtkDisplayState, led_notifier);
+
+    if (!s->led_update_source) {
+        s->led_update_source = g_idle_add(gd_led_update, s);
+    }
 }
 
 static void gd_update_geometry_hints(VirtualConsole *vc)
@@ -2865,6 +2898,9 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
 
     s->console_notifier.notify = gd_console_notify;
     qemu_console_add_notifier(&s->console_notifier);
+
+    s->led_notifier.notify = gd_led_notify;
+    qemu_console_add_status_led_notifier(&s->led_notifier);
 
     gd_connect_signals(s);
 

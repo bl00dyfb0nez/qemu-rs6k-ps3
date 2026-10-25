@@ -83,6 +83,7 @@
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "ui/console.h"
 
 #include "ps3_spu.h"
 #include "ps3_self.h"
@@ -503,6 +504,9 @@ enum {
  */
 #define PS3_LV2_EXPORT_MAX  8192
 
+/* The gamepad ports libpad numbers; sys_io describes all of them. */
+#define PS3_PAD_PORT_MAX    7
+
 /*
  * An unresolved import's stub OPD carries this placeholder as its code word:
  * the linker had nothing to write, so it is the loader's job.
@@ -661,6 +665,22 @@ struct PS3BootROMState {
     int32_t lv2_exit_status;
     uint8_t lv2_fan_policy;         /* 0 auto, 1 manual, 2 full */
     uint8_t lv2_fan_duty;
+
+    /*
+     * The console's gamepad ports (sys_io/cellPad) and its front LED
+     * (sys_sm_control_led).  There is no USB stack and no lamp: the ports are
+     * described by these fields and the LED is a string the display frontends
+     * show, which is as much hardware as this model pretends to have.
+     */
+    uint8_t pad_ports;              /* ports described, 1..7 */
+    uint8_t pad_types[PS3_PAD_PORT_MAX]; /* index into ps3_pad_products[] */
+    char *pad_types_prop;           /* the pad-types property text */
+    uint32_t pad_max_connect;       /* cellPadInit's argument, 0 = closed */
+    uint32_t pad_setting[PS3_PAD_PORT_MAX];
+    uint8_t pad_motor[PS3_PAD_PORT_MAX][2]; /* the two vibration motors */
+    uint32_t hid_next_handle;       /* sys_hid_manager_open's handles */
+    uint8_t led_action[3];          /* green, red, blue: 0 off 1 on 2 blink */
+    char led_text[24];
     PS3Lv2Module lv2_mod[PS3_LV2_MODULE_MAX];
     unsigned lv2_mod_count;
     PS3Lv2Export lv2_export[PS3_LV2_EXPORT_MAX];
@@ -2698,6 +2718,728 @@ static int32_t ps3_lv2_prx_load(PS3BootROMState *s, uint8_t *ram,
     }
 }
 
+/* ---------------------------------------------------------------------- */
+/*
+ * The console's gamepad ports.
+ *
+ * There is no USB stack under this model.  The seven ports libpad numbers are
+ * described directly, and each one is told which product the guest should find
+ * in it (property `pad-types`).  The products, their class ids, class profiles
+ * and capability masks are the ones RPCS3 uses, so libpad classifies a guitar
+ * as a guitar and a drum kit as a drum kit instead of calling every port a
+ * DualShock 3.
+ *
+ * A port's data is a CellPadData: a big-endian length in bytes followed by 64
+ * big-endian 16-bit words.  The word numbers used here are libpad's own
+ * (CELL_PAD_BTN_OFFSET_*): 2 and 3 are the digital button words, 4..7 the two
+ * sticks, 8..19 the pressure values, 20..23 the motion sensors and 24 upwards
+ * the controls a peripheral adds on top of them.
+ */
+#define PS3_PAD_CONNECT_MAX         127
+#define PS3_PAD_DATA_SIZE           (4 + 64 * 2)
+#define PS3_PAD_INFO_SIZE           (12 + 127 * 2 + 127 * 2 + 127)
+#define PS3_PAD_INFO2_SIZE          (12 + 4 * PS3_PAD_PORT_MAX * 4)
+#define PS3_PAD_PERIPH_INFO_SIZE    (12 + 6 * PS3_PAD_PORT_MAX * 4)
+#define PS3_PAD_PERIPH_DATA_SIZE    (8 + PS3_PAD_DATA_SIZE)
+#define PS3_PAD_CAPABILITY_SIZE     (32 * 4)
+
+#define PS3_PAD_STATUS_CONNECTED    0x1
+#define PS3_PAD_SETTING_PRESS_ON    0x2
+#define PS3_PAD_SETTING_SENSOR_ON   0x4
+
+#define PS3_PAD_CAP_CONFORMITY      0x01
+#define PS3_PAD_CAP_PRESS_MODE      0x02
+#define PS3_PAD_CAP_SENSOR_MODE     0x04
+#define PS3_PAD_CAP_HP_STICK        0x08
+#define PS3_PAD_CAP_ACTUATOR        0x10
+#define PS3_PAD_CAP_STANDARD        0x1F    /* all of a DualShock 3's */
+
+/* libpad's errors, the ones these services answer with. */
+#define PS3_PAD_E_INVALID_PARAMETER   ((int32_t)0x80121102u)
+#define PS3_PAD_E_ALREADY_INITIALIZED ((int32_t)0x80121103u)
+#define PS3_PAD_E_UNINITIALIZED       ((int32_t)0x80121104u)
+#define PS3_PAD_E_NO_DEVICE           ((int32_t)0x80121107u)
+#define PS3_PAD_E_UNSUPPORTED_GAMEPAD ((int32_t)0x80121108u)
+#define PS3_PAD_E_TOO_MANY_DEVICES    ((int32_t)0x80121109u)
+
+/* libpad's data word numbers, and the peripheral ones this model reports. */
+enum {
+    PS3_PAD_W_DIGITAL1 = 2,
+    PS3_PAD_W_DIGITAL2 = 3,
+    PS3_PAD_W_ANALOG_RX = 4,
+    PS3_PAD_W_ANALOG_RY = 5,
+    PS3_PAD_W_ANALOG_LX = 6,
+    PS3_PAD_W_ANALOG_LY = 7,
+    PS3_PAD_W_SENSOR_X = 20,
+    PS3_PAD_W_DJ_DECK1_PLATTER = 30,
+    PS3_PAD_W_GUITAR_WHAMMY = 31,
+    PS3_PAD_W_DJ_DECK2_PLATTER = 34,
+    PS3_PAD_W_GUITAR_5WAY = 37,
+};
+
+typedef struct PS3PadProduct {
+    const char *name;
+    uint16_t vendor;
+    uint16_t product;
+    uint32_t pclass;                /* CELL_PAD_PCLASS_TYPE_* */
+    uint32_t profile;               /* CELL_PAD_PCLASS_PROFILE_* */
+    uint32_t capability;            /* CELL_PAD_CAPABILITY_* */
+} PS3PadProduct;
+
+/*
+ * One entry per product libpad knows a class profile for.  The vendor and
+ * product ids are the ones the peripherals report over USB; the class profile
+ * says which of the peripheral's controls the device has.
+ */
+static const PS3PadProduct ps3_pad_products[] = {
+    /* name          vid     pid    class   profile     capabilities */
+    { "standard",   0x054C, 0x0268, 0x0000, 0x00000000, PS3_PAD_CAP_STANDARD },
+    { "guitar",     0x12BA, 0x0100, 0x0001, 0x000000FF, PS3_PAD_CAP_STANDARD },
+    { "guitar-rb",  0x12BA, 0x0200, 0x0001, 0x00007FFF, PS3_PAD_CAP_STANDARD },
+    { "drums",      0x12BA, 0x0120, 0x0002, 0x000000BB, PS3_PAD_CAP_STANDARD },
+    { "drums-rb",   0x12BA, 0x0210, 0x0002, 0x000000FF, PS3_PAD_CAP_STANDARD },
+    { "drums-rb3",  0x12BA, 0x0218, 0x0002, 0x000000BF, PS3_PAD_CAP_STANDARD },
+    { "drums-rr",   0x12BA, 0x0300, 0x0002, 0x000000FB, PS3_PAD_CAP_STANDARD },
+    { "dj",         0x12BA, 0x0140, 0x0003, 0x000007FF, PS3_PAD_CAP_STANDARD },
+    { "dancemat",   0x1CCF, 0x1010, 0x0004, 0x000000FF, PS3_PAD_CAP_STANDARD },
+    { "navigation", 0x054C, 0x042F, 0x0005, 0x00000000, PS3_PAD_CAP_STANDARD },
+    /* A skateboard has no sticks, no pressures and no rumble. */
+    { "skateboard", 0x12BA, 0x0400, 0x8001, 0x00000000,
+      PS3_PAD_CAP_CONFORMITY | PS3_PAD_CAP_PRESS_MODE |
+      PS3_PAD_CAP_SENSOR_MODE },
+};
+
+/* The sys_io services this layer answers, by NID as the VSH imports them. */
+#define PS3_NID_SYS_CONFIG_START            0x068FCBC6u
+#define PS3_NID_SYS_CONFIG_ADD_LISTENER     0x6AE10596u
+#define PS3_NID_SYS_CONFIG_REGISTER_SERVICE 0x78F058A2u
+#define PS3_NID_SYS_CONFIG_REMOVE_LISTENER  0xF5D9D571u
+#define PS3_NID_SYS_CONFIG_UNREGISTER_SRV   0x5F81900Cu
+#define PS3_NID_CELLPAD_CLEAR_BUF           0x0D5F2C14u
+#define PS3_NID_CELLPAD_INFO_PRESS_MODE     0x0E2DFAADu
+#define PS3_NID_CELLPAD_INIT                0x1CF98800u
+#define PS3_NID_CELLPAD_LDD_REGISTER        0x20A97BA2u
+#define PS3_NID_CELLPAD_GET_INFO            0x3AAAD464u
+#define PS3_NID_CELLPAD_GET_RAW_DATA        0x3F797DFFu
+#define PS3_NID_CELLPAD_PERIPH_GET_INFO     0x4CC9B68Du
+#define PS3_NID_CELLPAD_END                 0x4D9B75D5u
+#define PS3_NID_CELLPAD_SET_PORT_SETTING    0x578E3C98u
+#define PS3_NID_CELLPAD_GET_DATA_EXTRA      0x6BC09C61u
+#define PS3_NID_CELLPAD_INFO_SENSOR_MODE    0x78200559u
+#define PS3_NID_CELLPAD_PERIPH_GET_DATA     0x8A00F264u
+#define PS3_NID_CELLPAD_GET_DATA            0x8B72CDA1u
+#define PS3_NID_CELLPAD_LDD_GET_PORT        0x8B8231E5u
+#define PS3_NID_CELLPAD_GET_INFO2           0xA703A51Du
+#define PS3_NID_CELLPAD_LDD_INSERT          0xBAFD6409u
+#define PS3_NID_CELLPAD_SET_SENSOR_MODE     0xBE5BE3BAu
+#define PS3_NID_CELLPAD_GET_CAPABILITY      0xDBF4C59Cu
+#define PS3_NID_CELLPAD_LDD_UNREGISTER      0xE442FAA8u
+#define PS3_NID_CELLPAD_SET_ACT_DIRECT      0xF65544EEu
+#define PS3_NID_CELLPAD_SET_PRESS_MODE      0xF83F8182u
+
+/* The sysPrxForUser helpers libpad's threading needs. */
+#define PS3_NID_SYS_PPU_THREAD_CREATE       0x24A1EA07u
+#define PS3_NID_SYS_MEMSET                  0x68B9B011u
+
+static const struct {
+    uint32_t nid;
+    const char *name;
+} ps3_sys_io_names[] = {
+    { PS3_NID_SYS_CONFIG_START,            "sys_config_start" },
+    { PS3_NID_SYS_CONFIG_ADD_LISTENER,     "sys_config_add_service_listener" },
+    { PS3_NID_SYS_CONFIG_REGISTER_SERVICE, "sys_config_register_service" },
+    { PS3_NID_SYS_CONFIG_REMOVE_LISTENER,  "sys_config_remove_service_listener" },
+    { PS3_NID_SYS_CONFIG_UNREGISTER_SRV,   "sys_config_unregister_service" },
+    { PS3_NID_CELLPAD_INIT,                "cellPadInit" },
+    { PS3_NID_CELLPAD_END,                 "cellPadEnd" },
+    { PS3_NID_CELLPAD_GET_DATA,            "cellPadGetData" },
+    { PS3_NID_CELLPAD_GET_RAW_DATA,        "cellPadGetRawData" },
+    { PS3_NID_CELLPAD_GET_DATA_EXTRA,      "cellPadGetDataExtra" },
+    { PS3_NID_CELLPAD_GET_INFO,            "cellPadGetInfo" },
+    { PS3_NID_CELLPAD_GET_INFO2,           "cellPadGetInfo2" },
+    { PS3_NID_CELLPAD_PERIPH_GET_INFO,     "cellPadPeriphGetInfo" },
+    { PS3_NID_CELLPAD_PERIPH_GET_DATA,     "cellPadPeriphGetData" },
+    { PS3_NID_CELLPAD_GET_CAPABILITY,      "cellPadGetCapabilityInfo" },
+    { PS3_NID_CELLPAD_SET_ACT_DIRECT,      "cellPadSetActDirect" },
+    { PS3_NID_CELLPAD_SET_PORT_SETTING,    "cellPadSetPortSetting" },
+    { PS3_NID_CELLPAD_SET_PRESS_MODE,      "cellPadSetPressMode" },
+    { PS3_NID_CELLPAD_SET_SENSOR_MODE,     "cellPadSetSensorMode" },
+    { PS3_NID_CELLPAD_INFO_PRESS_MODE,     "cellPadInfoPressMode" },
+    { PS3_NID_CELLPAD_INFO_SENSOR_MODE,    "cellPadInfoSensorMode" },
+    { PS3_NID_CELLPAD_CLEAR_BUF,           "cellPadClearBuf" },
+    { PS3_NID_CELLPAD_LDD_REGISTER,        "cellPadLddRegisterController" },
+    { PS3_NID_CELLPAD_LDD_GET_PORT,        "cellPadLddGetPortNo" },
+    { PS3_NID_CELLPAD_LDD_INSERT,          "cellPadLddDataInsert" },
+    { PS3_NID_CELLPAD_LDD_UNREGISTER,      "cellPadLddUnregisterController" },
+    { PS3_NID_SYS_PPU_THREAD_CREATE,       "sys_ppu_thread_create" },
+    { PS3_NID_SYS_MEMSET,                  "_sys_memset" },
+};
+
+static const char *ps3_sys_io_name(uint32_t nid)
+{
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(ps3_sys_io_names); i++) {
+        if (ps3_sys_io_names[i].nid == nid) {
+            return ps3_sys_io_names[i].name;
+        }
+    }
+
+    return NULL;
+}
+
+static const PS3PadProduct *ps3_pad_product(const PS3BootROMState *s,
+                                            unsigned port)
+{
+    return &ps3_pad_products[s->pad_types[port]];
+}
+
+/* How many of the described ports the guest currently sees connected. */
+static unsigned ps3_pad_connect(const PS3BootROMState *s)
+{
+    return MIN(s->pad_ports, MIN(s->pad_max_connect, PS3_PAD_PORT_MAX));
+}
+
+/* A CellPadData word, in place: the length is four bytes, then the words. */
+static void ps3_pad_put_word(uint8_t *p, unsigned word, uint16_t v)
+{
+    p[4 + 2 * word] = v >> 8;
+    p[5 + 2 * word] = v;
+}
+
+/*
+ * One port's CellPadData.  Nothing is pressed: both sticks sit in the middle,
+ * a sensor-mode pad reports the DS3's rest orientation, and a peripheral
+ * reports the neutral value of the controls its profile has.  The length says
+ * how much of it is valid - 8 bytes, 20 with pressures, 24 with sensors - the
+ * way a real pad does, and `len' 0 is never returned because this model has no
+ * input to lose.
+ */
+static void ps3_pad_data(const PS3BootROMState *s, unsigned port, uint8_t *d,
+                         bool periph)
+{
+    const PS3PadProduct *p = ps3_pad_product(s, port);
+    uint32_t setting = s->pad_setting[port];
+    unsigned len = 8;
+
+    if (setting & PS3_PAD_SETTING_SENSOR_ON) {
+        len = 24;
+    } else if (setting & PS3_PAD_SETTING_PRESS_ON) {
+        len = 20;
+    }
+
+    memset(d, 0, PS3_PAD_DATA_SIZE);
+
+    ps3_put_be32(d, len);
+    /* Word 0 is reserved; word 1 holds the length in halfwords. */
+    ps3_pad_put_word(d, 1, (0x7 << 4) | MIN(len / 2, 15));
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RX, 128);
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RY, 128);
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_LX, 128);
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_LY, 128);
+
+    if (len == 24) {
+        ps3_pad_put_word(d, PS3_PAD_W_SENSOR_X, 512);
+        ps3_pad_put_word(d, PS3_PAD_W_SENSOR_X + 1, 399); /* 512 - 1 G */
+        ps3_pad_put_word(d, PS3_PAD_W_SENSOR_X + 2, 512);
+        ps3_pad_put_word(d, PS3_PAD_W_SENSOR_X + 3, 512);
+    }
+
+    if (!periph) {
+        return;
+    }
+
+    switch (p->pclass) {
+    case 0x0001:                /* guitar: whammy and the 5-way switch */
+        ps3_pad_put_word(d, PS3_PAD_W_GUITAR_WHAMMY, 0x80);
+        ps3_pad_put_word(d, PS3_PAD_W_GUITAR_5WAY, 0x19);
+        break;
+    case 0x0003:                /* turntable: both platters at rest */
+        ps3_pad_put_word(d, PS3_PAD_W_DJ_DECK1_PLATTER, 0x80);
+        ps3_pad_put_word(d, PS3_PAD_W_DJ_DECK2_PLATTER, 0x80);
+        break;
+    default:
+        break;
+    }
+}
+
+static void ps3_pad_info(const PS3BootROMState *s, uint8_t *info)
+{
+    unsigned connected = ps3_pad_connect(s);
+    unsigned i;
+
+    memset(info, 0, PS3_PAD_INFO_SIZE);
+    ps3_put_be32(info, s->pad_max_connect);
+    ps3_put_be32(info + 4, connected);
+
+    for (i = 0; i < connected; i++) {
+        const PS3PadProduct *p = ps3_pad_product(s, i);
+
+        info[12 + 2 * i] = p->vendor >> 8;
+        info[12 + 2 * i + 1] = p->vendor;
+        info[12 + 2 * 127 + 2 * i] = p->product >> 8;
+        info[12 + 2 * 127 + 2 * i + 1] = p->product;
+        info[12 + 4 * 127 + i] = PS3_PAD_STATUS_CONNECTED;
+    }
+}
+
+static void ps3_pad_info2(const PS3BootROMState *s, uint8_t *info)
+{
+    unsigned connected = ps3_pad_connect(s);
+    unsigned i;
+
+    memset(info, 0, PS3_PAD_INFO2_SIZE);
+    ps3_put_be32(info, MIN(s->pad_max_connect, PS3_PAD_PORT_MAX));
+    ps3_put_be32(info + 4, connected);
+
+    for (i = 0; i < connected; i++) {
+        const PS3PadProduct *p = ps3_pad_product(s, i);
+        unsigned at = 12 + 4 * i;
+
+        ps3_put_be32(info + at, PS3_PAD_STATUS_CONNECTED);
+        ps3_put_be32(info + at + 4 * PS3_PAD_PORT_MAX, s->pad_setting[i]);
+        ps3_put_be32(info + at + 8 * PS3_PAD_PORT_MAX, p->capability);
+        ps3_put_be32(info + at + 12 * PS3_PAD_PORT_MAX, 0); /* standard */
+    }
+}
+
+static void ps3_pad_periph_info(const PS3BootROMState *s, uint8_t *info)
+{
+    unsigned connected = ps3_pad_connect(s);
+    unsigned i;
+
+    memset(info, 0, PS3_PAD_PERIPH_INFO_SIZE);
+    ps3_put_be32(info, s->pad_max_connect);
+    ps3_put_be32(info + 4, connected);
+
+    for (i = 0; i < connected; i++) {
+        const PS3PadProduct *p = ps3_pad_product(s, i);
+        unsigned at = 12 + 4 * i;
+
+        ps3_put_be32(info + at, PS3_PAD_STATUS_CONNECTED);
+        ps3_put_be32(info + at + 4 * PS3_PAD_PORT_MAX, s->pad_setting[i]);
+        ps3_put_be32(info + at + 8 * PS3_PAD_PORT_MAX, p->capability);
+        ps3_put_be32(info + at + 12 * PS3_PAD_PORT_MAX, 0); /* standard */
+        ps3_put_be32(info + at + 16 * PS3_PAD_PORT_MAX, p->pclass);
+        ps3_put_be32(info + at + 20 * PS3_PAD_PORT_MAX, p->profile);
+    }
+}
+
+/*
+ * A thread the guest asked lv2 to create.
+ *
+ * One PPU context and no scheduler: the call is given an id and reported, but
+ * the body never runs.  The services that thread would call are answered by
+ * this model anyway, which is why the VSH can get through its startup with
+ * threads that exist only on paper.
+ */
+static void ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
+                                   uint64_t ram_size, uint32_t name)
+{
+    char text[32];
+
+    g_strlcpy(text, "?", sizeof(text));
+    if (name &&
+        !ps3_lv2_guest_string(ram, ram_size, name, text, sizeof(text))) {
+        g_strlcpy(text, "?", sizeof(text));
+    }
+
+    info_report("ps3-ppu: lv2: thread \"%s\" created (id 0x%X) but not "
+                "scheduled: this model runs one thread", text, s->lv2_next_id);
+}
+
+/*
+ * sys_io's exports, answered from the port table above.
+ *
+ * The VSH reaches cellPad through libpad, which reaches this library directly;
+ * libpadconfig also uses the sys_config services to be told when a pad is
+ * plugged in.  Nothing here blocks and nothing is asynchronous: the ports are
+ * always in the state the properties described, so a port is either there with
+ * a product or absent, and the services say which.
+ *
+ * Returns true when the NID is one of ours, with the result in *ret.
+ */
+static bool ps3_lv2_sys_io(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
+                           uint64_t ram_size, uint32_t nid, int32_t *ret)
+{
+    uint32_t a0 = env->gpr[3];
+    uint32_t a1 = env->gpr[4];
+    uint32_t a2 = env->gpr[5];
+    uint32_t a5 = env->gpr[8];
+    uint32_t a6 = env->gpr[9];
+    unsigned connected = ps3_pad_connect(s);
+    unsigned port;
+    int32_t r = 0;
+
+    if (!ps3_sys_io_name(nid)) {
+        return false;
+    }
+
+    switch (nid) {
+    case PS3_NID_SYS_CONFIG_START:
+        info_report("ps3-ppu: sys_io: sys_config_start()");
+        break;
+    case PS3_NID_SYS_CONFIG_ADD_LISTENER:       /* cfg, service, verbosity,
+                                                 * in, size, type, out* */
+        if (!a6 || (uint64_t)a6 + 4 > ram_size) {
+            r = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a6, ++s->lv2_next_id);
+        info_report("ps3-ppu: sys_io: sys_config_add_service_listener"
+                    "(service 0x%X, verbosity %u, type %u)", a1, a2, a5);
+        break;
+    case PS3_NID_SYS_CONFIG_REGISTER_SERVICE:   /* cfg, service, user,
+                                                 * verbosity, data, size,
+                                                 * out* */
+        if (!a6 || (uint64_t)a6 + 4 > ram_size) {
+            r = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a6, ++s->lv2_next_id);
+        info_report("ps3-ppu: sys_io: sys_config_register_service"
+                    "(service 0x%X, user %u, %u byte(s))", a1, a2, a5);
+        break;
+    case PS3_NID_SYS_CONFIG_REMOVE_LISTENER:
+    case PS3_NID_SYS_CONFIG_UNREGISTER_SRV:
+        break;
+    case PS3_NID_CELLPAD_INIT:                  /* max_connect */
+        if (!a0) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else if (s->pad_max_connect) {
+            r = PS3_PAD_E_ALREADY_INITIALIZED;
+        } else {
+            s->pad_max_connect = a0;
+            info_report("ps3-ppu: sys_io: cellPadInit(%u): %u port(s), "
+                        "port 0 is a %s", a0, s->pad_ports,
+                        ps3_pad_product(s, 0)->name);
+        }
+        break;
+    case PS3_NID_CELLPAD_END:
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+            break;
+        }
+        s->pad_max_connect = 0;
+        for (port = 0; port < PS3_PAD_PORT_MAX; port++) {
+            s->pad_setting[port] = 0;
+        }
+        break;
+    case PS3_NID_CELLPAD_GET_INFO:              /* info* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (!a0 || (uint64_t)a0 + PS3_PAD_INFO_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else {
+            ps3_pad_info(s, ram + a0);
+        }
+        break;
+    case PS3_NID_CELLPAD_GET_INFO2:             /* info* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (!a0 || (uint64_t)a0 + PS3_PAD_INFO2_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else {
+            ps3_pad_info2(s, ram + a0);
+        }
+        break;
+    case PS3_NID_CELLPAD_PERIPH_GET_INFO:       /* info* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (!a0 ||
+                   (uint64_t)a0 + PS3_PAD_PERIPH_INFO_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else {
+            ps3_pad_periph_info(s, ram + a0);
+        }
+        break;
+    case PS3_NID_CELLPAD_GET_DATA:              /* port, data* */
+    case PS3_NID_CELLPAD_GET_RAW_DATA:
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (a0 >= PS3_PAD_CONNECT_MAX || !a1 ||
+                   (uint64_t)a1 + PS3_PAD_DATA_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else if (a0 >= s->pad_max_connect) {
+            r = PS3_PAD_E_NO_DEVICE;
+        } else if (a0 >= connected) {
+            r = PS3_PAD_E_NO_DEVICE;    /* described, but not plugged in */
+        } else if (nid == PS3_NID_CELLPAD_GET_RAW_DATA) {
+            ps3_pad_data(s, a0, ram + a1, false);
+        } else {
+            ps3_pad_data(s, a0, ram + a1, false);
+        }
+        break;
+    case PS3_NID_CELLPAD_GET_DATA_EXTRA:        /* port, device_type*, data* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+            break;
+        }
+        if (a0 >= s->pad_max_connect || a0 >= connected) {
+            r = PS3_PAD_E_NO_DEVICE;
+            break;
+        }
+        if (!a2 || (uint64_t)a2 + PS3_PAD_DATA_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+            break;
+        }
+        ps3_pad_data(s, a0, ram + a2, false);
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, 0);  /* CELL_PAD_DEV_TYPE_STANDARD */
+        }
+        break;
+    case PS3_NID_CELLPAD_PERIPH_GET_DATA:       /* port, data* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (a0 >= PS3_PAD_PORT_MAX || !a1 ||
+                   (uint64_t)a1 + PS3_PAD_PERIPH_DATA_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else if (a0 >= s->pad_max_connect || a0 >= connected) {
+            r = PS3_PAD_E_NO_DEVICE;
+        } else {
+            const PS3PadProduct *p = ps3_pad_product(s, a0);
+
+            ps3_put_be32(ram + a1, p->pclass);
+            ps3_put_be32(ram + a1 + 4, p->profile);
+            ps3_pad_data(s, a0, ram + a1 + 8, true);
+        }
+        break;
+    case PS3_NID_CELLPAD_GET_CAPABILITY:        /* port, info* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (a0 >= PS3_PAD_CONNECT_MAX || !a1 ||
+                   (uint64_t)a1 + PS3_PAD_CAPABILITY_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else if (a0 >= s->pad_max_connect || a0 >= connected) {
+            r = PS3_PAD_E_NO_DEVICE;
+        } else {
+            memset(ram + a1, 0, PS3_PAD_CAPABILITY_SIZE);
+            ps3_put_be32(ram + a1, ps3_pad_product(s, a0)->capability);
+        }
+        break;
+    case PS3_NID_CELLPAD_SET_ACT_DIRECT:        /* port, param* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+            break;
+        }
+        if (a0 >= PS3_PAD_CONNECT_MAX || !a1 || (uint64_t)a1 + 8 > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+            break;
+        }
+        if (a0 >= s->pad_max_connect || a0 >= connected) {
+            r = PS3_PAD_E_NO_DEVICE;
+            break;
+        }
+        if (!(ps3_pad_product(s, a0)->capability & PS3_PAD_CAP_ACTUATOR)) {
+            r = PS3_PAD_E_UNSUPPORTED_GAMEPAD;
+            break;
+        }
+        /* There is nothing to shake: remember the motors and carry on. */
+        s->pad_motor[a0][0] = ram[a1];
+        s->pad_motor[a0][1] = ram[a1 + 1];
+        break;
+    case PS3_NID_CELLPAD_SET_PORT_SETTING:      /* port, setting */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (a0 >= PS3_PAD_CONNECT_MAX) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else if (a0 < PS3_PAD_PORT_MAX) {
+            if (a1 & PS3_PAD_SETTING_PRESS_ON) {
+                s->pad_setting[a0] |= PS3_PAD_SETTING_PRESS_ON;
+            } else {
+                s->pad_setting[a0] &= ~PS3_PAD_SETTING_PRESS_ON;
+            }
+            if (a1 & PS3_PAD_SETTING_SENSOR_ON) {
+                s->pad_setting[a0] |= PS3_PAD_SETTING_SENSOR_ON;
+            } else {
+                s->pad_setting[a0] &= ~PS3_PAD_SETTING_SENSOR_ON;
+            }
+        }
+        break;
+    case PS3_NID_CELLPAD_SET_PRESS_MODE:        /* port, mode */
+    case PS3_NID_CELLPAD_SET_SENSOR_MODE:
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+            break;
+        }
+        if (a0 >= PS3_PAD_CONNECT_MAX || a1 > 1) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+            break;
+        }
+        if (a0 >= PS3_PAD_PORT_MAX) {
+            break;
+        }
+        if (nid == PS3_NID_CELLPAD_SET_PRESS_MODE) {
+            if (!(ps3_pad_product(s, a0)->capability & PS3_PAD_CAP_PRESS_MODE)) {
+                r = PS3_PAD_E_UNSUPPORTED_GAMEPAD;
+                break;
+            }
+            if (a1) {
+                s->pad_setting[a0] |= PS3_PAD_SETTING_PRESS_ON;
+            } else {
+                s->pad_setting[a0] &= ~PS3_PAD_SETTING_PRESS_ON;
+            }
+        } else {
+            if (!(ps3_pad_product(s, a0)->capability &
+                  PS3_PAD_CAP_SENSOR_MODE)) {
+                r = PS3_PAD_E_UNSUPPORTED_GAMEPAD;
+                break;
+            }
+            if (a1) {
+                s->pad_setting[a0] |= PS3_PAD_SETTING_SENSOR_ON;
+            } else {
+                s->pad_setting[a0] &= ~PS3_PAD_SETTING_SENSOR_ON;
+            }
+        }
+        break;
+    case PS3_NID_CELLPAD_INFO_PRESS_MODE:       /* port */
+    case PS3_NID_CELLPAD_INFO_SENSOR_MODE:
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+            break;
+        }
+        if (a0 >= PS3_PAD_CONNECT_MAX) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+            break;
+        }
+        if (a0 >= s->pad_max_connect || a0 >= connected) {
+            r = PS3_PAD_E_NO_DEVICE;
+            break;
+        }
+        {
+            uint32_t want = nid == PS3_NID_CELLPAD_INFO_PRESS_MODE ?
+                PS3_PAD_CAP_PRESS_MODE : PS3_PAD_CAP_SENSOR_MODE;
+
+            r = !!(ps3_pad_product(s, a0)->capability & want);
+        }
+        break;
+    case PS3_NID_CELLPAD_CLEAR_BUF:             /* port */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (a0 >= PS3_PAD_CONNECT_MAX) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else if (a0 >= s->pad_max_connect || a0 >= connected) {
+            r = PS3_PAD_E_NO_DEVICE;
+        }
+        break;
+    case PS3_NID_CELLPAD_LDD_REGISTER:          /* no LDD pad */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else {
+            r = PS3_PAD_E_TOO_MANY_DEVICES;
+        }
+        break;
+    case PS3_NID_CELLPAD_LDD_GET_PORT:          /* handle */
+        r = PS3_PAD_E_INVALID_PARAMETER;
+        break;
+    case PS3_NID_CELLPAD_LDD_INSERT:            /* handle, data* */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else if (!a1 || (uint64_t)a1 + PS3_PAD_DATA_SIZE > ram_size) {
+            r = PS3_PAD_E_INVALID_PARAMETER;
+        } else {
+            r = PS3_PAD_E_NO_DEVICE;    /* no handle was ever registered */
+        }
+        break;
+    case PS3_NID_CELLPAD_LDD_UNREGISTER:        /* handle */
+        if (!s->pad_max_connect) {
+            r = PS3_PAD_E_UNINITIALIZED;
+        } else {
+            r = PS3_PAD_E_NO_DEVICE;
+        }
+        break;
+    case PS3_NID_SYS_MEMSET:                    /* ptr, byte, size */
+        if ((uint64_t)a0 + a2 > ram_size) {
+            r = -1;
+            break;
+        }
+        memset(ram + a0, a1 & 0xFF, a2);
+        r = (int32_t)a0;
+        break;
+    case PS3_NID_SYS_PPU_THREAD_CREATE:         /* id*, entry, arg, prio,
+                                                 * stack, flags, name* */
+        if (!a0 || (uint64_t)a0 + 4 > ram_size) {
+            r = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a0, ++s->lv2_next_id);
+        ps3_lv2_thread_created(s, ram, ram_size, a6);
+        break;
+    default:
+        return false;
+    }
+
+    *ret = r;
+    return true;
+}
+
+/*
+ * The console's front LED.
+ *
+ * sys_sm_control_led is the only path the guest has to the front panel, and a
+ * virtual console has no lamp: the state is kept and published to the display
+ * frontends, whose window title shows it (`green on', `red blink', ...).  led 0
+ * is the power LED, 1 the standby one and 2 the blue disc LED of the later
+ * revisions; action 0 is off, 1 on and anything else the blink the boot code
+ * asks for while the system is coming up.
+ */
+static void ps3_console_led(PS3BootROMState *s, uint32_t led, uint32_t action)
+{
+    const char *colour = led == 0 ? "green" : led == 1 ? "red" :
+                         led == 2 ? "blue" : "aux";
+    const char *state = action == 0 ? "off" : action == 1 ? "on" : "blink";
+
+    if (led < ARRAY_SIZE(s->led_action)) {
+        s->led_action[led] = action;
+    }
+
+    snprintf(s->led_text, sizeof(s->led_text), "%s %s", colour, state);
+    qemu_console_set_status_led(s->led_text);
+    info_report("ps3-ppu: lv2: front LED: %s %s", colour, state);
+}
+
+/*
+ * Read the pad properties.  `pad-count' is how many of the seven ports exist,
+ * and `pad-types' names the product in each of them, comma separated; a single
+ * name applies to every port.  The names are the ones in ps3_pad_products.
+ */
+static bool ps3_pad_defaults(PS3BootROMState *s, Error **errp)
+{
+    gchar **names = s->pad_types_prop ?
+        g_strsplit(s->pad_types_prop, ",", -1) : NULL;
+    unsigned count = names ? g_strv_length(names) : 0;
+    unsigned port, i;
+
+    if (s->pad_ports < 1) {
+        s->pad_ports = 1;
+    } else if (s->pad_ports > PS3_PAD_PORT_MAX) {
+        s->pad_ports = PS3_PAD_PORT_MAX;
+    }
+
+    for (port = 0; port < s->pad_ports; port++) {
+        const char *want = count ? names[MIN(port, count - 1)] : "standard";
+
+        for (i = 0; i < ARRAY_SIZE(ps3_pad_products); i++) {
+            if (!g_strcmp0(ps3_pad_products[i].name, want)) {
+                break;
+            }
+        }
+        if (i == ARRAY_SIZE(ps3_pad_products)) {
+            error_setg(errp, "ps3-boot-rom: unknown pad type '%s' (try "
+                       "\"standard\", \"guitar\", \"guitar-rb\", "
+                       "\"drums\", \"drums-rb\", \"drums-rb3\", "
+                       "\"drums-rr\", \"dj\", \"dancemat\", "
+                       "\"navigation\" or \"skateboard\")", want);
+            g_strfreev(names);
+            return false;
+        }
+        s->pad_types[port] = i;
+    }
+
+    g_strfreev(names);
+    return true;
+}
+
 /*
  * The lv2 services vsh-run answers, in the order the VSH asks for them.
  *
@@ -2843,6 +3585,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
          */
         uint32_t nid = ps3_be32(ram + PS3_LV2_STUB_NID);
         const PS3Lv2Stub *stub = ps3_lv2_stub_lookup_nid(s, nid);
+
+        /* sys_io and the helpers libpad's threading needs come first. */
+        if (ps3_lv2_sys_io(s, &cpu->env, ram, ram_size, nid, &ret)) {
+            break;
+        }
 
         if (stub) {
             info_report("ps3-ppu: lv2: unresolved import %s:0x%08X called, "
@@ -3128,6 +3875,192 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
+    case 0x32:                  /* sys_ppu_thread_stop(thread_id) */
+    case 0x33:                  /* sys_ppu_thread_restart(thread_id) */
+    case 0x35:                  /* sys_ppu_thread_start(thread_id) */
+        ret = 0;
+        break;
+    case 0x34: {                /* _sys_ppu_thread_create(id*, entry, arg,
+                                 * prio, stack, flags, name*) */
+        uint32_t name = cpu->env.gpr[9];
+
+        if (!a0 || (uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a0, ++s->lv2_next_id);
+        ps3_lv2_thread_created(s, ram, ram_size, name);
+        ret = 0;
+        break;
+    }
+    case 0x182:                 /* sys_sm_control_led(led, action) */
+        ps3_console_led(s, a0, a1);
+        ret = 0;
+        break;
+    case 0x1F4: {               /* sys_hid_manager_open(device_type, port,
+                                 * handle*) */
+        uint32_t type = a0, port_no = a1;
+
+        if (type > 3) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (!a2 || (uint64_t)a2 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (!s->hid_next_handle) {
+            s->hid_next_handle = 0x100;     /* where real lv2 starts */
+        }
+        ps3_put_be32(ram + a2, s->hid_next_handle);
+
+        if (type == 1) {
+            /*
+             * Opening a pad port through sys_hid is what the VSH's
+             * hidportassign thread does, and lv2 answers it by bringing the
+             * pad library up and turning press and sensor mode on for that
+             * port.
+             */
+            if (!s->pad_max_connect) {
+                s->pad_max_connect = PS3_PAD_PORT_MAX;
+            }
+            if (port_no < PS3_PAD_PORT_MAX) {
+                s->pad_setting[port_no] |= PS3_PAD_SETTING_PRESS_ON |
+                                           PS3_PAD_SETTING_SENSOR_ON;
+            }
+        }
+
+        info_report("ps3-ppu: lv2: sys_hid_manager_open(type %u, port %u) -> "
+                    "handle 0x%X", type, port_no, s->hid_next_handle);
+        s->hid_next_handle++;
+        ret = 0;
+        break;
+    }
+    case 0x1F5:                 /* sys_hid_manager_close(handle) */
+    case 0x1F8:                 /* sys_hid_manager_map_logical_id_to_port_id */
+    case 0x1F9:                 /* ...unmap... */
+    case 0x1FA:                 /* sys_hid_manager_add_hot_key_observer */
+    case 0x1FB:                 /* sys_hid_manager_remove_hot_key_observer */
+    case 0x1FC:                 /* sys_hid_manager_grab_focus */
+    case 0x1FD:                 /* sys_hid_manager_release_focus */
+    case 0x1FF:                 /* sys_hid_manager_set_master_process */
+    case 0x201:                 /* sys_hid_manager_513 */
+    case 0x202:                 /* sys_hid_manager_514 */
+        ret = 0;
+        break;
+    case 0x1FE:                 /* sys_hid_manager_check_focus */
+    case 0x200:                 /* sys_hid_manager_is_process_permission_root */
+        ret = 1;
+        break;
+    case 0x1F6: {               /* sys_hid_manager_read(handle, pkg, buf,
+                                 * size) */
+        uint8_t data[PS3_PAD_DATA_SIZE];
+        unsigned words;
+
+        if (!a2) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if ((a1 == 2 || a1 == 0x81) && ps3_pad_connect(s) &&
+            (uint64_t)a2 + 2 <= ram_size) {
+            ps3_pad_data(s, 0, data, false);
+            words = MIN(ps3_be32(data) / 2, MIN(a3, 64));
+            if ((uint64_t)a2 + words * 2 > ram_size) {
+                ret = PS3_LV2_EFAULT;
+                break;
+            }
+            memcpy(ram + a2, data + 4, words * 2);
+            ret = a1 == 2 ? (int32_t)(words * 2) : (int32_t)words;
+        } else {
+            ret = 0;
+        }
+        break;
+    }
+    case 0x1F7: {               /* sys_hid_manager_ioctl(handle, pkg, buf,
+                                 * size) */
+        const PS3PadProduct *p = ps3_pad_product(s, 0);
+
+        if (!a2) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (a1 == 2 && (uint64_t)a2 + 4 <= ram_size) {
+            /*
+             * A DualShock 3's ids followed by the tail of its HID report
+             * descriptor, which is what a real console answers here.
+             */
+            static const uint8_t hid[] = {
+                0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x08, 0x03, 0x50, 0x00, 0x00, 0x1C, 0x1F,
+            };
+            unsigned n = MIN(a3, (uint32_t)sizeof(hid));
+
+            ram[a2] = p->vendor >> 8;
+            ram[a2 + 1] = p->vendor;
+            ram[a2 + 2] = p->product >> 8;
+            ram[a2 + 3] = p->product;
+            if ((uint64_t)a2 + 4 + n > ram_size) {
+                n = ram_size - a2 - 4;
+            }
+            memcpy(ram + a2 + 4, hid, n);
+        } else if (a1 == 5 && (uint64_t)a2 + 4 <= ram_size) {
+            ram[a2] = p->vendor >> 8;
+            ram[a2 + 1] = p->vendor;
+            ram[a2 + 2] = p->product >> 8;
+            ram[a2 + 3] = p->product;
+        }
+        ret = 0;
+        break;
+    }
+    case 0x204:                 /* sys_config_open(queue, config*) */
+        if (!a1 || (uint64_t)a1 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a1, ++s->lv2_next_id);
+        ret = 0;
+        break;
+    case 0x205:                 /* sys_config_close(config) */
+        ret = 0;
+        break;
+    case 0x206:                 /* sys_config_get_service_event(...) */
+        /* No service event is ever queued: the ports do not change. */
+        ret = PS3_LV2_ESRCH;
+        break;
+    case 0x207: {               /* sys_config_add_service_listener(cfg,
+                                 * service, verbosity, in, size, type,
+                                 * listener*) */
+        uint32_t out = cpu->env.gpr[9];
+
+        if (!out || (uint64_t)out + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + out, ++s->lv2_next_id);
+        ret = 0;
+        break;
+    }
+    case 0x208:                 /* sys_config_remove_service_listener */
+        ret = 0;
+        break;
+    case 0x209: {               /* sys_config_register_service(cfg, service,
+                                 * user, verbosity, data, size, service*) */
+        uint32_t out = cpu->env.gpr[9];
+
+        if (!out || (uint64_t)out + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + out, ++s->lv2_next_id);
+        info_report("ps3-ppu: lv2: sys_config_register_service(service 0x%X, "
+                    "user %u, %u byte(s))", a1, a2,
+                    (uint32_t)cpu->env.gpr[8]);
+        ret = 0;
+        break;
+    }
+    case 0x20A:                 /* sys_config_unregister_service */
+        ret = 0;
+        break;
     default:
         if (s->ppu_trace) {
             info_report("ps3-ppu: lv2 syscall 0x%X is not modelled", nr);
@@ -3144,6 +4077,17 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     gchar *buf = NULL;
     gsize len = 0;
     GError *err = NULL;
+
+    /*
+     * Describe the gamepad ports first: lv2 hands them to the VSH during its
+     * startup, and the front LED starts out as the pretend "console is on"
+     * green rather than dark.
+     */
+    if (!ps3_pad_defaults(s, errp)) {
+        return;
+    }
+    snprintf(s->led_text, sizeof(s->led_text), "green on");
+    qemu_console_set_status_led(s->led_text);
 
     memory_region_init_io(&s->regs_mr, OBJECT(s), &ps3_rom_regs_ops, s,
                           "ps3-boot-rom.regs", 0x40);
@@ -4207,6 +5151,8 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("ppu-tick-ns", PS3BootROMState, ppu_tick_ns,
                        10 * 1000 * 1000),
     DEFINE_PROP_BOOL("ppu-trace", PS3BootROMState, ppu_trace, false),
+    DEFINE_PROP_UINT8("pad-count", PS3BootROMState, pad_ports, 1),
+    DEFINE_PROP_STRING("pad-types", PS3BootROMState, pad_types_prop),
     DEFINE_PROP_STRING("stage-dump", PS3BootROMState, stage_dump),
     DEFINE_PROP_STRING("stage-args", PS3BootROMState, stage_args),
     DEFINE_PROP_UINT32("stage-entry", PS3BootROMState, stage_entry, 0),

@@ -144,6 +144,8 @@ struct GtkDisplayState {
     Notifier mouse_mode_notifier;
     VMChangeStateEntry *vmse;
     Notifier console_notifier;
+    Notifier led_notifier;
+    guint led_update_source;
     gboolean free_scale;
     gboolean keep_aspect_ratio;
 

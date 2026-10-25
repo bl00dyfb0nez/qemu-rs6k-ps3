@@ -372,6 +372,17 @@ bool qemu_console_is_graphic(QemuConsole *con);
 bool qemu_console_is_fixedsize(QemuConsole *con);
 bool qemu_console_is_gl_blocked(QemuConsole *con);
 char *qemu_console_get_label(QemuConsole *con);
+
+/*
+ * The machine's front-panel LED.  A virtual console has no lamp, so a machine
+ * model that has one (a PS3, say) publishes a short description of it here and
+ * the display frontends show it - the GTK window puts it in its title.  The
+ * text is a pretence the model keeps up, not a hardware register.
+ */
+void qemu_console_set_status_led(const char *led);
+const char *qemu_console_get_status_led(void);
+void qemu_console_add_status_led_notifier(Notifier *notifier);
+
 int qemu_console_get_index(QemuConsole *con);
 uint32_t qemu_console_get_head(QemuConsole *con);
 int qemu_console_get_width(QemuConsole *con, int fallback);
