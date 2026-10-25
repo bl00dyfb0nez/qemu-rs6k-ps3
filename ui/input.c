@@ -720,3 +720,37 @@ void qmp_send_key(KeyValueList *keys, bool has_hold_time, int64_t hold_time,
     }
     g_free(up);
 }
+
+/*
+ * Gamepads: a controller is not a console input device, so it does not go
+ * through the handler list.  The display that reads one publishes its whole
+ * state and the single machine that has pad ports keeps it; updating the whole
+ * state rather than sending button events means a dropped event cannot leave a
+ * stick pushed.
+ */
+static QemuGamepadHandler gamepad_handler;
+static void *gamepad_opaque;
+static bool gamepad_connected;
+
+void qemu_gamepad_set_handler(QemuGamepadHandler handler, void *opaque)
+{
+    gamepad_handler = handler;
+    gamepad_opaque = opaque;
+}
+
+void qemu_gamepad_update(const QemuGamepadState *state)
+{
+    if (gamepad_handler) {
+        gamepad_handler(gamepad_opaque, state);
+    }
+}
+
+void qemu_gamepad_set_connected(bool connected)
+{
+    gamepad_connected = connected;
+}
+
+bool qemu_gamepad_connected(void)
+{
+    return gamepad_connected;
+}

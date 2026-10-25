@@ -25,6 +25,9 @@ struct PS3Audio {
     AudioBackend *be;
     SWVoiceOut *voice;
     int16_t *pcm;           /* one block, converted for the backend */
+    SWVoiceIn *in;          /* the microphone's capture voice */
+    unsigned in_rate;       /* what the backend actually opened */
+    unsigned in_channels;
 };
 
 static int16_t ps3_audio_sample(const uint8_t *p)
@@ -116,4 +119,123 @@ void ps3_audio_play_f32be(PS3Audio *a, const uint8_t *block)
 
     audio_be_write(a->be, a->voice, a->pcm, sizeof(int16_t) *
                    PS3_AUDIO_FRAMES * PS3_AUDIO_CHANNELS);
+}
+
+/*
+ * Microphone capture.
+ *
+ * The backend raises this when it has delivered samples; the guest pulls them
+ * with ps3_audio_mic_read, so there is nothing to do here either.
+ */
+static void ps3_audio_mic_cb(void *opaque, int avail)
+{
+}
+
+bool ps3_audio_mic_open(PS3Audio *a, unsigned rate, unsigned channels,
+                        Error **errp)
+{
+    /*
+     * QEMU's audio core resamples between the device and the voice, but it
+     * only knows these rates.  The guest's own rate comes first so a 48 kHz
+     * capture is not needlessly resampled; the rest are the fallbacks RPCS3
+     * tries for the same reason (a host input often refuses 32 kHz).
+     */
+    static const unsigned candidates[] = {
+        48000, 44100, 32000, 16000, 8000,
+    };
+    struct audsettings as = {
+        .fmt = AUDIO_FORMAT_S16,
+        .big_endian = HOST_BIG_ENDIAN,
+    };
+    unsigned i;
+
+    if (!a || !a->be) {
+        error_setg(errp, "ps3-audio: no host audio backend for the "
+                   "microphone");
+        return false;
+    }
+
+    if (channels < 1) {
+        channels = 1;
+    }
+    if (channels > 2) {
+        channels = 2;
+    }
+
+    ps3_audio_mic_close(a);
+
+    for (i = 0; i <= ARRAY_SIZE(candidates); i++) {
+        unsigned cand = i == 0 ? rate : candidates[i - 1];
+
+        if (!cand || (i && cand == rate)) {
+            continue;               /* nothing to ask for, or already tried */
+        }
+        as.freq = cand;
+        as.nchannels = channels;
+
+        a->in = audio_be_open_in(a->be, NULL, "ps3-mic", a,
+                                 ps3_audio_mic_cb, &as);
+        if (!a->in) {
+            continue;
+        }
+
+        a->in_rate = cand;
+        a->in_channels = channels;
+        audio_be_set_active_in(a->be, a->in, true);
+
+        info_report("ps3-audio: microphone capture at %u Hz, %u channel(s) "
+                    "on \"%s\"%s", cand, channels, audio_be_get_id(a->be),
+                    cand == rate ? "" : " (the guest's rate was resampled)");
+        return true;
+    }
+
+    error_setg(errp, "ps3-audio: the backend opened no capture voice (is "
+               "there an input device?)");
+    return false;
+}
+
+void ps3_audio_mic_close(PS3Audio *a)
+{
+    if (!a || !a->in) {
+        return;
+    }
+
+    audio_be_set_active_in(a->be, a->in, false);
+    audio_be_close_in(a->be, a->in);
+    a->in = NULL;
+    a->in_rate = 0;
+    a->in_channels = 0;
+}
+
+void ps3_audio_mic_start(PS3Audio *a, bool on)
+{
+    if (!a || !a->in) {
+        return;
+    }
+
+    audio_be_set_active_in(a->be, a->in, on);
+}
+
+bool ps3_audio_mic_active(const PS3Audio *a)
+{
+    return a && a->be && a->in;
+}
+
+unsigned ps3_audio_mic_rate(const PS3Audio *a)
+{
+    return a && a->in ? a->in_rate : 0;
+}
+
+unsigned ps3_audio_mic_channels(const PS3Audio *a)
+{
+    return a && a->in ? a->in_channels : 0;
+}
+
+size_t ps3_audio_mic_read(PS3Audio *a, void *buf, size_t max_bytes)
+{
+    if (!ps3_audio_mic_active(a)) {
+        return 0;
+    }
+
+    return audio_be_read(a->be, a->in, buf, max_bytes);
 }

@@ -3,6 +3,8 @@
 
 #include "qapi/qapi-types-ui.h"
 #include "qemu/notify.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 #define INPUT_EVENT_MASK_KEY   (1<<INPUT_EVENT_KIND_KEY)
 #define INPUT_EVENT_MASK_BTN   (1<<INPUT_EVENT_KIND_BTN)
@@ -33,6 +35,55 @@ typedef struct QemuInputEvent {
         InputMultiTouchEvent mtt;
     };
 } QemuInputEvent;
+
+/*
+ * Gamepads.
+ *
+ * QEMU's console input is keys, buttons and pointer motion; a controller has a
+ * shape of its own and no console to send it to.  A display that can read one
+ * publishes the whole state here and a machine with pad ports maps it: the
+ * bits are the sixteen inputs a libpad port can report, and the axes are
+ * -0x7FFF..0x7FFF with up and left negative (SDL's convention), so a display
+ * does not have to know what a guest calls them.
+ */
+#define QEMU_GAMEPAD_SOUTH      (1u << 0)    /* cross / A */
+#define QEMU_GAMEPAD_EAST       (1u << 1)    /* circle / B */
+#define QEMU_GAMEPAD_NORTH      (1u << 2)    /* triangle / Y */
+#define QEMU_GAMEPAD_WEST       (1u << 3)    /* square / X */
+#define QEMU_GAMEPAD_TL         (1u << 4)
+#define QEMU_GAMEPAD_TR         (1u << 5)
+#define QEMU_GAMEPAD_TL2        (1u << 6)    /* L2, also set from its axis */
+#define QEMU_GAMEPAD_TR2        (1u << 7)
+#define QEMU_GAMEPAD_SELECT     (1u << 8)
+#define QEMU_GAMEPAD_START      (1u << 9)
+#define QEMU_GAMEPAD_MODE       (1u << 10)   /* PS */
+#define QEMU_GAMEPAD_THUMBL     (1u << 11)
+#define QEMU_GAMEPAD_THUMBR     (1u << 12)
+#define QEMU_GAMEPAD_DPAD_UP    (1u << 13)
+#define QEMU_GAMEPAD_DPAD_DOWN  (1u << 14)
+#define QEMU_GAMEPAD_DPAD_LEFT  (1u << 15)
+#define QEMU_GAMEPAD_DPAD_RIGHT (1u << 16)
+
+typedef struct QemuGamepadState {
+    uint32_t buttons;
+    int lx, ly;                 /* -0x7FFF..0x7FFF, up and left negative */
+    int rx, ry;
+} QemuGamepadState;
+
+typedef void (*QemuGamepadHandler)(void *opaque,
+                                   const QemuGamepadState *state);
+
+/* One machine has pads; a second registration replaces the first. */
+void qemu_gamepad_set_handler(QemuGamepadHandler handler, void *opaque);
+
+/* Called by the display on the thread that owns its events. */
+void qemu_gamepad_update(const QemuGamepadState *state);
+
+/* True while a display has a controller open, for a guest's attach report. */
+bool qemu_gamepad_connected(void);
+
+/* Announced by the display when it opens or loses the controller. */
+void qemu_gamepad_set_connected(bool connected);
 
 typedef void (*QemuInputHandlerEvent)(DeviceState *dev, QemuConsole *src,
                                       QemuInputEvent *evt);

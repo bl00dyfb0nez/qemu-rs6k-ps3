@@ -140,10 +140,164 @@ $Q -M rs6000-ps3 -bios .tmp/rom/rom.bin \
    -display sdl
 ```
 
+Once the container verifies, the scanout also gets the console's boot screen:
+`RS6K` with `Playstation 3 Emulator` under a rule, drawn below the stage lines
+(`-global ps3-boot-rom.boot-logo=off` disables it).  The glyphs are the console
+font scaled up; the artwork is the model's own.
+
 A third line appears above the two chain lines - `VSH: 2 SEGMENT(S), 7291232
 BYTES MAPPED, ENTERING` - and the log continues with the modules vsh.self
 loads (`libfs_utility2`, `sys_audio`, `sys_config`, the `_sys_micin_main` /
-`_sys_camera_main` workers).  A running window can be dumped from the monitor
+`_sys_camera_main` workers).  The real image is the one from `dev_flash`:
+entry `0x6D5AC8`, OPD to code `0x10230`, TOC `0x6F5558`, `7291232` bytes over
+two zlib segments.
+
+### Which application comes up: vsh.self or emer_init
+
+lv2 decides, and the model follows the firmware's rule: the chain is checked
+first (`ps3_chain_check`), then the application image.  With
+`-global ps3-boot-rom.emer-self=emer_init.self`:
+
+| Condition | Result |
+| --- | --- |
+| container verifies **and** `dev_flash/vsh/module/vsh.self` exists | `chain checks passed; lv2 starts /dev_flash/vsh.self` |
+| no flash image, no readout, container fails its tag, or no vsh.self | `### Vflash recovery mode`, then the emergency program is loaded |
+
+Observed on the recovery branch (a zeroed readout): `the lv0ldr.2 container
+does not verify (stop 0x3); creating the vflash recover process (emergency
+program)` and `ps3-vsh: emer_init.self: entry=0xE23F0, 2 segment(s),
+0x1257128 bytes mapped into RAM, PPU entering it`.
+
+What the emergency program needed to stay up, and now gets:
+
+| Piece | Why emer_init stopped without it |
+| --- | --- |
+| `argc`/`argv` at process entry | it printed `argc [0] argv[1] [(null)]`, then exited `-1`; the process now starts with `argc = 1` and its image path as `argv[0]`, built in the stack by both the loader and the reset path |
+| `sys_console_write` (0x18E) | its own printouts are the only progress it gives; they now reach the machine console |
+| `sys_dbg_..._ppu_exception_handler` (0x3DC) | registration succeeds (nothing to install) instead of returning an error |
+| `sys_ss_get_cache_of_flash_ext_flag` (0x36A) | one byte, `0xFE` (LSB clear = NOR); writing a word overran the caller's local, and the byte is also the recover mode emer_init reads back |
+| `sys_ss_update_manager` (0x35F), `sys_ss_appliance_info_manager` (0x363) | a refusal sent it to the "unsupported flash" error page; both now zero their out buffer and succeed |
+
+With those in place emer_init runs its own recovery code and stays alive:
+
+```
+is factory mode ret[fffffb03]
+ErrorPage[6] Code[-2147290384]
+TvSetting::cellSsAimGetDeviceType 80010003
+RescueUtilityGetTvSetting 80010003
+Gcm Init Memory Shortage.
+```
+
+Both of those gaps are now answered rather than stubbed.  `cellGcmSys`'s display
+half lives in the import table beside cellVideoOut:
+
+| NID | Service | What it does |
+| --- | --- | --- |
+| `0x8F71C2DF` | `cellSsAimGetDeviceType` | reports device type 1 (TV), the same sink the cellVideoOut EDID describes |
+| `0xB477F06A` | `cellGcmInit` | fills the caller's `CellGcmContextData` (begin/end/current/callback) over the guest's command buffer |
+| `0xE315A0B2` | `cellGcmGetConfiguration` | 240 MiB of local RSX memory and 240 MiB of io memory (the console's 256 MiB less the reserved part), plus the memory and core frequencies |
+| `0xA53D12AE` | `cellGcmSetDisplayBuffer` | records offset, pitch, width and height per display id |
+| `0xDC09357E` | `cellGcmSetFlip` | hands that buffer to `ps3_vga_guest_scanout()`, so a flip is what puts the guest's framebuffer on screen |
+
+The RSX side also needed lv2's mapper, because that is how the VSH's memory is
+backed: `sys_mmapper_allocate_address` (0x14A) and `sys_mmapper_search_and_map`
+(0x151) hand out 1 MiB-aligned addresses from `0x10000000` upwards, the
+shared-memory calls (0x14C/0x153) return ids, and map/unmap/access-right
+(0x146, 0x147, 0x149, 0x14D-0x150) succeed because the memory is the same flat
+RAM.  `sys_sm_initialize` (0x17E) and `sys_ss_get_cache_of_product_mode` (0x369,
+0x00 = CEX retail) are answered as well.
+
+What that changed in a run is measured, not assumed:
+
+* the `Gcm Init Memory Shortage.` line is gone, and no run asks for the AIM
+  device type through the import table any more - the recovery program in this
+  configuration prints its factory-mode line and exits 0 before either call, so
+  the shortage is fixed but the menu still is not drawn;
+* the VSH run now allocates mapper addresses (`mmapper address: 0x10000000 at
+  0x10000000`) instead of dying at an unmodelled 0x14A, and moves on to
+  `sys_uart_initialize` (0x16F) and the `sysPrxForUser` imports;
+* two 256 MiB allocations wrap back to the same address, because the model's
+  RAM is 256 MiB and the mapper range is allocated out of it - the VSH allocates
+  one, so it fits, but a guest asking for two would alias.
+
+### What emer_init does at the end, and why it never draws
+
+Disassembling the blocks the PPU executed shows the program's ending, not a
+menu loop.  At `0x3ba90` it checks the flash (`bl 0x3afc4`), and then always
+falls into a shutdown wrapper at `0x3bd04`:
+
+```
+0003bd10  li    r11, 0x17b      ; sys_sm_shutdown
+0003bd14  sc
+0003bd18  li    r3, 0
+...
+0003bd50  blr
+```
+
+The action is `0x100` when the check reports a restorable flash and `0`
+otherwise, so the recovery program's last act is to write its recover byte into
+the system controller's EEPROM and ask for a **restart in recovery mode**.  The
+screen that appears in recovery mode belongs to the next boot (VSH reading that
+byte), so making this program "stay in its loop" is not something the binary
+does.  What the model now does with the ending is accept it:
+
+```
+ps3-ppu: lv2: sys_sm_shutdown(0x100) - the recovery program asks for a restart
+         in recovery mode
+ps3-ppu: process exited with status 0
+```
+
+Before that it prints `factory mode ON  recover flag[ff]` and
+`ErrorPage[6] Code[-2147290383]`; the recover flag it reads comes through
+`sys_ss_update_manager(0x600B)`, which is the next section.
+
+### The syscon EEPROM, per RPCS3's `ps3_syscon`
+
+`sys_ss_update_manager` op `0x600B` is a *read* of the system controller's
+EEPROM (offset in the first argument, output byte pointer in the second) and
+`0x600C` is the matching write.  Treating them as a buffer, as this handler used
+to, wrote zeroes at the offset and left the caller's byte untouched, so
+emer_init read a stale `0xFF`.
+
+| Offset | Meaning | Value |
+| --- | --- | --- |
+| `0x48C07` | recover mode, the machine's state rather than a stored byte | `0x00` in service mode, `0xFF` otherwise |
+| anything else | stored byte | `0xFF` until the guest writes one |
+
+`0x6003` and `0x6011` report firmware 3.01 in the `0xVVVRRRPP` form RPCS3 writes
+(`0x3001000000000000`), and `0x6007`/`0x6008` (flash initialized) succeed.
+
+### The RSX front end
+
+cellGcmSys.sprx is real code: it does not call a modelled `cellGcmInit`, it asks
+lv2 for the device through `sys_rsx` and writes methods into a FIFO in RSX local
+memory.  That front end now exists, with the semantics RPCS3's `sys_rsx`
+documents:
+
+| Syscall | What it does here |
+| --- | --- |
+| `0x29A`/`0x29B` device open/close | succeed |
+| `0x29C` memory allocate | one 240 MiB region, handle 1, at local base `0x40000000` |
+| `0x29E` context allocate | context `0x55555555`, three 4 KiB areas from the lv2 heap (DMA control, driver info, reports) |
+| `0x2A0`/`0x2A1` iomap/iounmap | succeed; the local region is real RAM |
+| `0x2A2` context attribute | `0x001` FIFO get/put, `0x102` flip, `0x103` queued buffer, `0x104` display buffer; anything else is accepted |
+| `0x2A3` device map | writes the register window base `0x40000000` |
+
+Local memory is a real 256 MiB `MemoryRegion` at `0x40000000`, so the offsets
+`cellGcmSetDisplayBuffer` names are readable.  A flip (`0x102`) resolves the
+buffer id and hands `0x40000000 + offset` to `ps3_vga_guest_scanout()`, which is
+the same path the modelled `cellGcmSetFlip` used.  The FIFO front end at `0x001`
+decodes packets, logs the first 24 method ids under `ppu-trace` and advances
+get to put.
+
+The method handlers behind the FIFO — surfaces, clear, blit, draws, the shader
+pipeline and the DCP — are still missing, and no VSH run has reached `sys_rsx`
+at all: with every syscall in its bring-up answered, vsh.self now sits in a
+`sys_mutex_lock`/`sys_mutex_unlock` loop at `0x5390B8`/`0x52CA08`.  It is waiting
+for a worker thread, and the model's scheduler still does not run one, so the
+GPU work never starts.  That is the next wall, not the RSX syscalls.
+
+A running window can be dumped from the monitor
 (`-monitor tcp:127.0.0.1:55555,server,nowait`, then `screendump file.ppm`),
 which is how the two screenshots in this section were taken.
 
@@ -194,7 +348,8 @@ Ctrl-A x.
 | `ppu-tick-ns` | `10000000` | period between PPU progress reports |
 | `ppu-trace` | off | log PC/LR/MSR each period and the first console reads |
 | `pad-count` | 1 | gamepad ports the console has, 1..7 |
-| `pad-types` | `standard` | product in each port, comma separated (`standard`, `guitar`, `guitar-rb`, `drums`, `drums-rb`, `drums-rb3`, `drums-rr`, `dj`, `dancemat`, `navigation`, `skateboard`); one name applies to every port |
+| `pad-types` | `standard` | product in each port, comma separated (`standard`, `dualsense`, `guitar`, `guitar-rb`, `drums`, `drums-rb`, `drums-rb3`, `drums-rr`, `dj`, `dancemat`, `navigation`, `move`, `skateboard`); one name applies to every port |
+| `pad-selftest` | off | drive one controller state through the pad and check the guest's `CellPadData` |
 | `flash-base` | `0x20000000` | window the flash image is mapped at |
 
 Without a readout the device feeds channel 66 32 zero bytes, which is what the
@@ -520,16 +675,15 @@ The call is the one sysPrxForUser's wrapper makes:
 _sys_ppu_thread_create(id*, param*, arg, unk, prio, stack, flags, name*)
 ```
 
-and `param` is `{ u64 entry descriptor, u32 tls, u32 pad }`, which is the part
-that is easy to get wrong:
+and `param` is RPCS3's `sys_ppu_thread_param_t`, `{ u32 entry; u32 tls; }`, which
+is the part that is easy to get wrong:
 
-* `param` itself is a pointer into the caller's stack.  It is **not** a function
-  descriptor; the descriptor is the first word inside it, so the code and TOC
-  have to be read from `param->entry`.
+* `param` itself is a pointer into the caller's stack.  `entry` is the address of
+  the thread's OPD, so the code and TOC have to be read from that descriptor.
+  Reading the pair as one 64-bit value put the TLS word where the entry belongs
+  and started every such thread on whatever the TLS page happened to contain.
 * the descriptor is lv2's packed 8-byte form, `{ u32 code; u32 toc }` (a
-  16-byte word pair is accepted as a fallback).  Reading the parameter block as
-  an OPD instead put threads at `0x6DE770`, an export table, and the run died
-  at `0`/`0x700`.
+  16-byte word pair is accepted as a fallback).
 * the `tls` word is where lv2 takes `r13` from.  A user thread starts with
   `r3 = arg`, `r2 = toc`, `r13 = tls` and a zeroed register file, not with the
   creator's registers.
@@ -543,9 +697,44 @@ that is easy to get wrong:
 
 With those in place the VSH's worker threads enter their own module code (for
 example `sys_audio`'s `_sys_micin_main` at `0x14A8DAC`), make lv2 calls and
-exit.  What still faults is a service that calls an import the model has no
-provider for and then follows the `-1` return as a pointer - camera and mic
-have no hardware in this model yet - not the entry environment.
+exit.
+
+### What the workers wait in
+
+A worker that has no work does not spin: it blocks inside an lv2 call.  The
+model has to honour that or the pool burns the whole timeslice budget, so the
+blocking services are modelled with real parking:
+
+| Key | Service | Model |
+| --- | --- | --- |
+| `0x080` | `sys_event_queue_create` | a queue with key and depth in a 24-entry table |
+| `0x081` | `sys_event_queue_destroy` | drops it and fails its waiters with `ESRCH` |
+| `0x082` | `sys_event_queue_receive` | takes a queued event, or parks with the caller's timeout |
+| `0x083` | `sys_event_queue_tryreceive` | never blocks; reports how many it took |
+| `0x085` | `sys_event_queue_drain` | empties the queue |
+| `0x086`/`0x087` | port create/destroy | a port is a name and the queue it feeds |
+| `0x088`/`0x08C` | connect local/IPC | local ids, and a queue matched by key for IPC |
+| `0x08A` | `sys_event_port_send` | queues `{ source, data1..3 }` and wakes the first waiter |
+| `0x064`-`0x068` | mutex create/destroy/lock/trylock/unlock | owner-tracked; a contended lock parks |
+| `0x069`-`0x06E` | cond create/destroy/wait/signal | wait releases the mutex; a signal retakes it |
+| `0x05A`-`0x05E` | semaphore create/destroy/wait/post/value | counted; a wait at zero parks |
+
+The park is the same mechanism in every case: the call sets the trampoline's
+exit flag, the thread stops at `0xC58`, and the switch saves its frame with
+`SRR0`/`SRR1`.  When a send, an unlock, a post or the timeout completes the
+call, `ps3_thread_finish_call` runs the trampoline epilogue on that saved frame
+(`r3` = result, `r12`/`CR`/`r0` from the frame, `r1 += 0x20`, `nip = SRR0`,
+`MSR = SRR1`).  A receiver also gets the event in `r4..r7`.
+
+The timeout is lv2's microseconds divided by the 1 ms tick and capped at 400
+ticks, because `msmw2.sprx` polls a queue for 100 s during boot.  Zero means
+wait for as long as it takes.  The exit flag is written by the publishing call
+only, so a stale one cannot park the next call the guest makes - that mistake
+stopped `_sys_micin_main` right after its first queue was created.
+
+`sys_timer_usleep` stays a yield rather than a real sleep: a guest that asks
+for 100 ms between polls would otherwise stall the boot, and the scheduler
+already gives every runnable thread a slice.
 
 ### The sound driver
 
@@ -593,6 +782,61 @@ bring-up the VSH gets its `sys_audio` module loaded and running before it
 reaches `cellAudio` initialisation, so the ring is still empty there - the
 backend and the drain path are in place, not yet exercised by that run.
 
+### The microphone
+
+The console's microphone is a USB audio class device, and `cellMic` is the
+library in front of it: open, start, read, and the attributes.  Under LLE the
+samples belong to `sys_audio`'s `_sys_micin_main` thread, which sleeps on a
+`CELLMIC_DATA` event and only reads when one arrives - so the event matters as
+much as the read.  Here device `0` is QEMU's capture input: `cellMicOpen` opens
+a capture voice on the same `-audiodev` backend the speakers use, and the
+samples the host delivers are handed to the guest the way the library hands
+them over on hardware.
+
+| entry point | what it does here |
+| --- | --- |
+| `cellMicInit` / `cellMicEnd` | one device, the capture voice; attributes reset to the library's defaults (gain `3`, volume `145`, AGC `0`, channel volumes `100`) |
+| `cellMicOpen` / `OpenRaw` / `OpenEx` | open the voice at the guest's rate and channel count, `RAW` and/or `DSP` signal |
+| `cellMicStart` / `StartEx` / `Stop` | let the tick pump fill the ring, or stop |
+| `cellMicRead` / `ReadRaw` / `ReadDsp` | copy the ring to the guest: big-endian `s16` (`RAW`) or big-endian floats in [-1, 1] (`DSP`); `DSPTYPE = 1` makes the DSP stream the raw one |
+| `cellMicGetFormat*` | `{channels, 2 or 4, 16 or 32, dataType 1, rate}` - the rate is the one the voice actually opened at |
+| `cellMicIsOpen` / `IsAttached` / `GetType` | `1`/`1` while open, `CELLMIC_TYPE_USBAUDIO` (3) |
+| `cellMicGetStatus` / `GetSignalState` | the running state, and the level: RMS of the last block on RPCS3's 40..90 dB scale |
+| `cellMicSetNotifyEventQueue{,2}` / `Remove` | the queue the data events go to; an `ATTACH` is sent at once, then `DATA` whenever the ring has a block |
+| `cellMicGetDeviceAttr` / `SetDeviceAttr` | LED, gain, volume, AGC, DSP type and the two channel volumes |
+
+The rate is the interesting part: the audio core only knows a fixed set
+(48000, 44100, 32000, 16000, 8000), so a guest that asks for something else is
+opened at the closest supported rate and `cellMicGetFormat` reports that rate
+back rather than a number it is not being fed at.  A host with no input, or a
+backend that refuses capture, answers `CELL_MICIN_ERROR_DEVICE_NOT_SUPPORT`
+(`0x80140110`) instead of pretending the device exists.
+
+```sh
+Q=build-ps3/qemu-system-ppc64.exe
+$Q -M rs6000-ps3 -display none \
+   -audiodev dsound,id=snd \
+   -global ps3-boot-rom.audio=snd \
+   -global ps3-boot-rom.mic-selftest=on
+```
+
+`mic-selftest` drives the handler the way the library does - init, open, start,
+a ramp through the ring, a raw read checked byte for byte, the format and the
+level, a read after close, end - and then opens the real input for 300 ms and
+reports how many frames the host delivered:
+
+```
+ps3-audio: microphone capture at 48000 Hz, 2 channel(s) on "#default"
+ps3-ppu: microphone selftest ok: init/open/start/read/format/level/close on a 48000 Hz stereo ring
+ps3-ppu: microphone capture test: the host delivered 1114 frame(s) in 300 ms
+```
+
+Zero frames there means the input is silent or absent, which is a fact about
+the host rather than a failure of the model; the selftest still passes.  The
+queue is named by key, so a guest has to have created it with
+`sys_event_queue_create` first - a key that names nothing is
+`CELL_MICIN_ERROR_EVENT_QUEUE` (`0x8014010d`), as on hardware.
+
 ### The gamepad ports
 
 There is no USB stack: `sys_io` describes up to seven ports directly, and
@@ -611,6 +855,8 @@ controller rather than a DualShock 3:
 | `dj` | `12BA:0140` | DJ | `0x7FF` |
 | `dancemat` | `1CCF:1010` | dance mat | `0xFF` |
 | `navigation` | `054C:042F` | navigation | 0 |
+| `move` | `054C:03D5` | move | 0 |
+| `dualsense` | `054C:0CE6` | standard | 0 |
 | `skateboard` | `12BA:0400` | skateboard | 0 (no sticks, no rumble) |
 
 ```sh
@@ -626,8 +872,9 @@ calls are answered from that table.  A pad reports the length a real one does
 (8 bytes, 20 with press mode, 24 with sensor mode), sticks centred at 128, the
 DS3's rest orientation when sensor mode is on, and the neutral value of every
 peripheral control the product has (whammy `0x80`, five-way switch `0x19`, DJ
-platters `0x80`).  Nothing is pressed: there is no input source yet, so the
-buttons word is zero and `cellPadSetActDirect` only records the motors.
+platters `0x80`).  A port with no input reads zero in both digital words and
+both sticks centred; `cellPadSetActDirect` only records the motors, because
+there is nothing to rumble.
 
 The ports are always in the state the properties described, so a port is
 either there with a product or absent, and the services say which.  That is
@@ -635,6 +882,68 @@ what libpadconfig wants: with the sys_io exports answering `-1` the VSH's
 `libpadconfig_stub.cc` assertion (`ret == CELL_OK`) fired and killed the run;
 it now registers service `0x1030` (PADMANAGER), opens a config handle and gets
 past it.
+
+### The keyboard and the host's controller
+
+Port 0 is the one the host can press.  QEMU's console keyboard arrives as key
+events and the arrows, `Enter`, `Escape`, `Backspace`, `Space` and `Tab` map
+onto d-pad up/right/down/left, cross, circle, square, start and select - enough
+to boot and navigate a dialog on a machine with no controller plugged in.
+
+A controller is not a console input device, so it does not go through the
+keyboard's handler list.  `include/ui/input.h` publishes one whole
+`QemuGamepadState` - the sixteen libpad bits and four axes at `-0x7FFF..0x7FFF`
+with up and left negative - and the machine with pad ports keeps the latest
+one.  `ui/sdl2.c` opens the first controller SDL reports and republishes the
+state after every button, axis and trigger event; a DualSense, a DualShock 4 and
+an Xbox pad all arrive through the same `SDL_GameController` mapping, so this
+layer never has to know which one is plugged in.  Hot-plug is part of it: a new
+controller opens, and a removed one publishes a zeroed state so nothing stays
+pressed.
+
+| SDL | libpad word | bit |
+| --- | --- | --- |
+| A / B / X / Y | digital2 | cross `0x0040`, circle `0x0020`, square `0x0080`, triangle `0x0010` |
+| LB / RB | digital2 | L1 `0x0004`, R1 `0x0008` |
+| triggers pulled past a quarter | digital2 | L2 `0x0001`, R2 `0x0002` |
+| Back / Start / Guide | digital1 | select `0x0001`, start `0x0008`, PS `0x0100` |
+| stick clicks | digital1 | L3 `0x0002`, R3 `0x0004` |
+| d-pad | digital1 | up `0x0010`, right `0x0020`, down `0x0040`, left `0x0080` |
+| left / right stick | words 6..7 / 4..5 | `0..255`, `0` up or left, `128` centred |
+
+Press mode reports a pressed button at `255`, and the axes scale with half a
+step of rounding so a centred stick reads `128` rather than `127`.  The
+keyboard's two words are ORed in, so a run with no controller still gets through
+the VSH's dialogs.
+
+`pad-selftest` is the check that the mapping is right without a controller in
+hand.  One state - d-pad left, cross, both sticks hard over - goes through the
+same handler the display feeds, then the guest's `CellPadData` is read back and
+the report length, both digital words, the four axes and the cross pressure are
+checked; then the release (sticks recentre, nothing stays pressed) and the
+detach:
+
+```sh
+$Q -M rs6000-ps3 -display none \
+   -global ps3-boot-rom.pad-selftest=on \
+   -global ps3-boot-rom.pad-types=dualsense
+```
+
+```
+ps3-ppu: gamepad: the host's controller drives port 0 (sticks, d-pad, face and shoulder buttons)
+ps3-ppu: gamepad: the host's controller is gone; port 0 sits at rest
+ps3-ppu: pad selftest ok: port 0 is a dualsense (054C:0CE6) and the controller's d-pad, cross, sticks and pressures land in the guest's CellPadData
+```
+
+A stick on the wrong side or a face button in the wrong word would otherwise
+only look like a broken game.  With `-display sdl` the same channel is live and
+the two lines it adds are the display and the machine agreeing about what is
+plugged in:
+
+```
+sdl: gamepad: "DualSense Wireless Controller" (axes, buttons and triggers drive the guest's pad)
+ps3-ppu: gamepad: the host's controller drives port 0 (sticks, d-pad, face and shoulder buttons)
+```
 
 ### The front LED, on the window title
 
@@ -747,6 +1056,20 @@ ps3-ppu console: LIBBTSETTING: btsetting_initialize() failed! (80010003)
 What is left at the end of the run is therefore not a trapped import: it is
 `/dev_flash2` (only `dev-flash` and `dev-flash3` are mounted) and libbtsetting's
 `sys_btsetting_*` calls.  Those are the next services to model.
+
+With the event queues and the synchronization services above, that same run
+gets further.  The main thread no longer spins on the mutex at `0x5390B8`:
+that loop was the guest's list lock around a handshake the workers never
+finished, because `sys_event_queue_receive` answered `ENOSYS` and each worker
+retried it forever.  With the receive blocking, the pool threads park there,
+the main thread takes the core, and the boot proceeds through module loading,
+`sys_hid_manager_open`, `sys_config_open` and `libpadconfig` (the
+`libpadconfig_stub.cc:34` assertion no longer fires).
+
+The remaining stop is a program interrupt at `0x700`, the vector this model
+leaves empty: an `x3::LocalMdQueryThread` thread (and, on some runs, the main
+thread) reaches it after a failed mutex lock.  That is the next thing to chase -
+the run has not reached `sys_rsx` yet.
 
 The lv2 low page is installed **only for `vsh-run`**.  `0xC00` is inside the
 page lv0 loads its own trampoline into (its entry is `0xC40`), so installing

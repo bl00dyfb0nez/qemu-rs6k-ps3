@@ -107,6 +107,7 @@
 #include "ps3_aes/ps3_aes.h"
 
 #include <zlib.h>
+#include <math.h>
 
 #define TYPE_PS3_MIC "ps3-mic"
 OBJECT_DECLARE_SIMPLE_TYPE(PS3MICState, PS3_MIC)
@@ -466,14 +467,126 @@ typedef struct PS3Lv2Module {
  * each has a saved context, and the blocking calls the VSH makes (sleep, join,
  * exit) hand the core to the next runnable one.  The switch happens from the
  * tick timer, never in the middle of the syscall trampoline.
+ *
+ * lv2 does not only switch when a thread asks it to: a thread owns the core
+ * for a timeslice and is then preempted, whatever it is doing.  That matters
+ * here because the VSH's service workers poll a flag in a loop and never call
+ * lv2 at all - `_sys_micin_main` sits in one at 0x14A8DAC - so a yield-only
+ * scheduler gives them the core once and never takes it back.  The slice is
+ * counted in scheduler ticks (1 ms of virtual time each).
  */
 #define PS3_THREAD_MAX 32
+#define PS3_SCHED_SLICE_TICKS 4
+
+/*
+ * lv2's event queues and ports.
+ *
+ * A queue holds sys_event_t records - { source, data1, data2, data3 } - and a
+ * port is the sending end of one.  This is how the VSH's service workers are
+ * driven: each has a queue, and whoever has work for it sends an event.
+ *
+ * sys_event_queue_receive blocks when the queue is empty, so it is the one
+ * service that can leave a thread waiting *inside* a call.  The trampoline's
+ * exit flag parks such a thread at its halt loop, and the call is finished
+ * later, from the frame and SRR0/SRR1 the park recorded - by a send, or by the
+ * timeout running out in the scheduler tick.
+ */
+#define PS3_EQ_MAX 24
+#define PS3_EQ_DEPTH 8
+#define PS3_EP_MAX 24
+#define PS3_EQ_EVENT_SIZE 32
+
+/*
+ * A wait's timeout, in scheduler ticks (1 ms of virtual time each).  lv2 takes
+ * microseconds and the VSH asks for up to a minute at a time - msmw2.sprx polls
+ * a queue for 100 s while the system comes up, which is why RPCS3 caps the same
+ * wait during a VSH boot.  The model caps it too, so a boot still completes in
+ * a run of a few thousand ticks; the event path itself is unaffected.
+ */
+#define PS3_EQ_TIMEOUT_MAX_TICKS 400
+
+/*
+ * The console's microphone.
+ *
+ * cellMic is a thin library: open, start, read and a handful of attributes.
+ * The samples behind it come from a USB audio class device, and on this
+ * machine that device is QEMU's capture input.  A capture voice is opened when
+ * the guest opens device 0 and closed when it closes it; the scheduler tick
+ * pulls what the host captured into this ring, and hands the guest a
+ * CELLMIC_DATA event whenever there is a block to read - which is how
+ * sys_audio's own mic thread learns there is something waiting.
+ */
+#define PS3_MIC_DEVICES       1
+#define PS3_MIC_RING_FRAMES   8192      /* ~170 ms of stereo at 48 kHz */
+#define PS3_MIC_BLOCK_FRAMES  256       /* 5.3 ms at 48 kHz, as RPCS3's period */
+#define PS3_MIC_CHUNK_FRAMES  1024      /* one read's conversion window */
+#define PS3_MIC_PERIOD_TICKS  5
+#define PS3_MIC_DEFAULT_RATE  48000
+#define PS3_MIC_SELFTEST_EA   0x000F0000  /* scratch the selftest zeroes again */
+
+typedef struct PS3Event {
+    uint64_t source, data1, data2, data3;
+} PS3Event;
+
+typedef struct PS3EventQueue {
+    bool used;
+    uint32_t id;
+    uint64_t key;
+    uint32_t size;
+    uint32_t head;
+    uint32_t count;
+    PS3Event event[PS3_EQ_DEPTH];
+} PS3EventQueue;
+
+typedef struct PS3EventPort {
+    bool used;
+    uint32_t id;
+    int eq;                     /* index into the queue table, -1 if none */
+    uint64_t name;
+} PS3EventPort;
+
+/*
+ * The synchronization the VSH's thread pool is built on.  A thread that has
+ * to wait for a mutex or a condition is parked inside its call exactly like
+ * one waiting on an event queue, so the same completion path wakes it.
+ */
+#define PS3_MUTEX_MAX 64
+#define PS3_COND_MAX 32
+
+typedef struct PS3Mutex {
+    bool used;
+    uint32_t id;
+    uint32_t owner;             /* thread id, 0 = free */
+} PS3Mutex;
+
+typedef struct PS3Cond {
+    bool used;
+    uint32_t id;
+    uint32_t mutex;             /* the mutex a wait releases and retakes */
+} PS3Cond;
+
+#define PS3_SEM_MAX 64
+
+typedef struct PS3Sem {
+    bool used;
+    uint32_t id;
+    int32_t count;
+    int32_t max;
+} PS3Sem;
 
 typedef struct PS3Thread {
     bool used;
     bool dead;
     bool blocked;
     bool main;
+    /* Waiting inside an lv2 call: the call is finished when it is woken. */
+    bool parked;
+    int wait_eq;                /* index of the queue it waits on */
+    uint32_t wait_ea;           /* guest sys_event_t the call writes to */
+    int32_t wait_ticks;         /* -1 = no timeout, else ticks left */
+    uint32_t wait_mutex_id;     /* mutex it must own before it can return */
+    uint32_t wait_cond_id;      /* condition it waits on, 0 = none */
+    uint32_t wait_sem_id;       /* semaphore it waits on, 0 = none */
     uint32_t id;
     uint32_t join_target;
     /* Returning here lands on `li r11,0x29; sc`, i.e. sys_ppu_thread_exit. */
@@ -511,6 +624,8 @@ struct PS3BootROMState {
     uint8_t readout_bytes[32];
     bool has_readout;
     bool selftest;
+    bool mic_selftest;              /* drive the cellMic path once at start */
+    bool pad_selftest;              /* one controller state through the pad */
     bool spu_run;
     bool spu_trace;
     char *ls_dump;
@@ -589,7 +704,42 @@ struct PS3BootROMState {
 
     /* The lv2 layer vsh-run answers the guest's syscalls with. */
     uint32_t lv2_next_id;
+    /* This call blocks its thread: the trampoline parks it when it returns. */
+    bool lv2_park;
+    PS3EventQueue eq[PS3_EQ_MAX];
+    PS3EventPort ep[PS3_EP_MAX];
+    PS3Mutex mtx[PS3_MUTEX_MAX];
+    PS3Cond cond[PS3_COND_MAX];
+    PS3Sem sem[PS3_SEM_MAX];
     uint32_t lv2_container_size;
+    /* Where the next sys_mmapper address is handed out (RSX-backed ranges). */
+    uint32_t lv2_mmap_next;
+    /*
+     * The system controller's EEPROM, as RPCS3's ps3_syscon keeps it: sparse,
+     * unwritten bytes read 0xFF, and offset 0x48C07 is not a stored byte but
+     * the console's recover mode (0x00 in service mode).
+     */
+    struct {
+        uint32_t off;
+        uint8_t val;
+    } syscon_ee[32];
+    int syscon_ee_n;
+    bool syscon_recover;
+
+    /*
+     * The RSX.  Its local memory is real memory the guest can map with
+     * sys_rsx_context_iomap, and the display buffers cellGcmSys points it at
+     * live there, which is what the scanout reads.  The FIFO front end tracks
+     * put/get exactly as RPCS3's sys_rsx does; the command pipeline behind it
+     * is a decoder, not yet a renderer.
+     */
+    MemoryRegion rsx_local;
+    bool rsx_ready;
+    uint32_t rsx_get, rsx_put;
+    uint32_t rsx_context;
+    uint32_t rsx_db_offset[8], rsx_db_pitch[8], rsx_db_w[8], rsx_db_h[8];
+    uint32_t rsx_db_last_queued;
+    unsigned rsx_methods_logged;
     /*
      * The container's bump pointer lives here, not at RAM 0x808.  0x808 is
      * inside lv2's low page and the VSH's initialisation memsets that range;
@@ -605,6 +755,17 @@ struct PS3BootROMState {
     bool lv2_btsetting_reported;    /* sys_btsetting_if's first call */
     bool lv2_av_reported;           /* the guest read the sink's EDID */
     bool lv2_video_reported;        /* cellVideoOut configured a mode */
+
+    /*
+     * The GCM display path: the buffer the guest registers with
+     * cellGcmSetDisplayBuffer and the flip it asks for.  The RSX itself is not
+     * modelled, but this is the same scanout cellVideoOut programs, so a frame
+     * the guest hands over is what the window shows.
+     */
+    struct {
+        uint32_t offset, pitch, width, height;
+        bool set;
+    } gcm_display[8];
     bool lv2_time_reported;         /* sys_time_get_current_time's first call */
     uint8_t lv2_video_res;          /* the mode the guest selected */
     bool lv2_audio_reported;        /* the sound driver started */
@@ -622,10 +783,44 @@ struct PS3BootROMState {
     bool rsxaudio_running;
     QEMUTimer *rsxaudio_timer;
     uint64_t rsxaudio_blocks;
-    /* Host keyboard, as the pad's digital buttons the guest reads. */
-    uint16_t kbd_buttons;
+
+    /*
+     * The microphone's state: what cellMic was told, and the samples the host
+     * captured that the guest has not read yet.  Device 0 is the capture
+     * voice; the rest of cellMic's eight slots are simply absent.
+     */
+    bool mic_init;
+    bool mic_opened;
+    bool mic_started;
+    unsigned mic_channels;          /* 1 or 2, as the guest opened it */
+    uint32_t mic_sig_type;          /* DSP, RAW or AUX from cellMicOpenEx */
+    uint32_t mic_rate;              /* the rate the voice was opened at */
+    uint32_t mic_dsp_rate;
+    uint32_t mic_attr_gain, mic_attr_volume, mic_attr_agc, mic_attr_led;
+    uint32_t mic_attr_dsptype;
+    uint32_t mic_chanvol[2];
+    uint64_t mic_eq_key;            /* the queue cellMicSetNotifyEventQueue named */
+    uint64_t mic_eq_source;
+    int16_t mic_ring[PS3_MIC_RING_FRAMES * 2];
+    unsigned mic_head, mic_used;    /* in frames */
+    float mic_energy_db;            /* the level cellMicGetSignalState reports */
+    uint32_t mic_tick;
+    bool mic_queued;
+    QEMUTimer *mic_capture_timer;   /* the selftest's real-capture check */
+    /*
+     * The pad's two digital words, as libpad numbers them: digital1 carries
+     * select, the stick buttons, start, the d-pad and PS, digital2 the
+     * shoulders, the triggers and the four face buttons.  They are kept apart
+     * because PS (digital1 bit 8) and L2 (digital2 bit 0) would otherwise be
+     * the same bit in one flattened word.
+     */
+    uint16_t kbd_d1, kbd_d2;        /* what the keyboard presses */
     QemuInputHandlerState *kbd;
     bool kbd_reported;
+    /* And the same two words from the host's controller, plus its sticks. */
+    uint32_t host_buttons;          /* QEMU_GAMEPAD_* bits */
+    int host_lx, host_ly, host_rx, host_ry;
+    bool host_pad_connected;        /* as the display last said */
     /* The console's auto-off: one hour without input and it powers down. */
     QEMUTimer *idle_timer;
     uint32_t idle_off_seconds;
@@ -695,6 +890,8 @@ struct PS3BootROMState {
     PS3Thread thr[PS3_THREAD_MAX];
     int thr_cur;
     bool sched_pending;
+    bool sched_queued;              /* a switch is on the vCPU's work list */
+    uint32_t thr_slice;             /* ticks the current thread has had */
     QEMUTimer *sched_timer;
     bool threads_enabled;           /* opt in: run lv2's threads for real */
     uint32_t hid_next_handle;       /* sys_hid_manager_open's handles */
@@ -804,6 +1001,9 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
 #define PS3_LV2_EFAULT  ((int32_t)0x8001000D)
 #define PS3_LV2_EISDIR  ((int32_t)0x80010012)
 #define PS3_LV2_EEXIST  ((int32_t)0x80010014)
+#define PS3_LV2_ENOTCONN ((int32_t)0x80010016)
+#define PS3_LV2_EAGAIN  ((int32_t)0x80010001)
+#define PS3_LV2_ETIMEDOUT ((int32_t)0x8001000B)
 #define PS3_LV2_EACCES  ((int32_t)0x80010029)
 #define PS3_LV2_EIO     ((int32_t)0x8001002B)
 #define PS3_LV2_ENOTDIR ((int32_t)0x8001002E)
@@ -1497,6 +1697,16 @@ static void ps3_rom_reset(DeviceState *dev)
     s->bytes = 0;
     memset(s->key, 0, sizeof(s->key));
 
+    /* Power-on has no capture device open, whatever the guest left behind. */
+    ps3_audio_mic_close(s->audio);
+    s->mic_init = false;
+    s->mic_opened = false;
+    s->mic_started = false;
+    s->mic_eq_key = 0;
+    s->mic_eq_source = 0;
+    s->mic_head = 0;
+    s->mic_used = 0;
+
     /* Power-on: the model runs the ROM once the image it opens is in place. */
     if (s->rom_file) {
         if (s->selftest) {
@@ -2055,6 +2265,7 @@ static bool ps3_lv2_slot_pending(const uint8_t *ram, uint64_t ram_size,
  * answers with.  The run continues and the work list says what was missing.
  */
 static const char *ps3_video_out_name(uint32_t nid);
+static const char *ps3_cellmic_name(uint32_t nid);
 
 static uint32_t ps3_lv2_stub(PS3BootROMState *s, uint8_t *ram,
                              uint64_t ram_size, const char *lib,
@@ -2078,6 +2289,10 @@ static uint32_t ps3_lv2_stub(PS3BootROMState *s, uint8_t *ram,
     if (ps3_video_out_name(nid)) {
         info_report("ps3-ppu: %s imports %s:0x%08X (the AV handler "
                     "answers it)", lib, ps3_video_out_name(nid), nid);
+    }
+    if (ps3_cellmic_name(nid)) {
+        info_report("ps3-ppu: %s imports %s:0x%08X (the microphone handler "
+                    "answers it)", lib, ps3_cellmic_name(nid), nid);
     }
 
     if (s->lv2_stub_records < PS3_LV2_STUB_RECORDS) {
@@ -2923,6 +3138,12 @@ static const PS3PadProduct ps3_pad_products[] = {
     { "navigation", 0x054C, 0x042F, 0x0005, 0x00000000, PS3_PAD_CAP_STANDARD },
     /* The Move motion controller: its own product id and HID class. */
     { "move",       0x054C, 0x03D5, 0x0006, 0x00000000, PS3_PAD_CAP_STANDARD },
+    /*
+     * The DualSense (and the Edge, which shares the id).  It is a PS5 pad, so
+     * libpad has no class for it; its inputs are the standard pad's, which is
+     * what a PS3 game sees when one is plugged in through a USB adapter.
+     */
+    { "dualsense",  0x054C, 0x0CE6, 0x0000, 0x00000000, PS3_PAD_CAP_STANDARD },
     /* A skateboard has no sticks, no pressures and no rumble. */
     { "skateboard", 0x12BA, 0x0400, 0x8001, 0x00000000,
       PS3_PAD_CAP_CONFORMITY | PS3_PAD_CAP_PRESS_MODE |
@@ -3550,6 +3771,7 @@ static void ps3_kbd_event(DeviceState *dev, QemuConsole *src,
                           QemuInputEvent *evt)
 {
     PS3BootROMState *s = PS3_BOOT_ROM(dev);
+    uint16_t *word = NULL;
     uint16_t bit = 0;
 
     ps3_input_kick(s);
@@ -3559,21 +3781,21 @@ static void ps3_kbd_event(DeviceState *dev, QemuConsole *src,
     }
 
     switch (qemu_input_linux_to_qcode(evt->key.key)) {
-    case Q_KEY_CODE_UP:       bit = 0x0010; break;
-    case Q_KEY_CODE_RIGHT:    bit = 0x0020; break;
-    case Q_KEY_CODE_DOWN:     bit = 0x0040; break;
-    case Q_KEY_CODE_LEFT:     bit = 0x0080; break;
-    case Q_KEY_CODE_RET:      bit = 0x4000; break;   /* cross */
-    case Q_KEY_CODE_ESC:      bit = 0x2000; break;   /* circle */
-    case Q_KEY_CODE_BACKSPACE: bit = 0x8000; break;  /* square */
-    case Q_KEY_CODE_SPC:      bit = 0x0008; break;   /* start */
-    case Q_KEY_CODE_TAB:      bit = 0x0001; break;   /* select */
+    case Q_KEY_CODE_UP:       word = &s->kbd_d1; bit = 0x0010; break;
+    case Q_KEY_CODE_RIGHT:    word = &s->kbd_d1; bit = 0x0020; break;
+    case Q_KEY_CODE_DOWN:     word = &s->kbd_d1; bit = 0x0040; break;
+    case Q_KEY_CODE_LEFT:     word = &s->kbd_d1; bit = 0x0080; break;
+    case Q_KEY_CODE_RET:      word = &s->kbd_d2; bit = 0x0040; break;  /* cross */
+    case Q_KEY_CODE_ESC:      word = &s->kbd_d2; bit = 0x0020; break;  /* circle */
+    case Q_KEY_CODE_BACKSPACE: word = &s->kbd_d2; bit = 0x0080; break; /* square */
+    case Q_KEY_CODE_SPC:      word = &s->kbd_d1; bit = 0x0008; break;  /* start */
+    case Q_KEY_CODE_TAB:      word = &s->kbd_d1; bit = 0x0001; break;  /* select */
     default:
         return;
     }
 
     if (evt->key.down) {
-        s->kbd_buttons |= bit;
+        *word |= bit;
         if (!s->kbd_reported) {
             s->kbd_reported = true;
             info_report("ps3-ppu: keyboard: host keys drive the pad "
@@ -3581,8 +3803,82 @@ static void ps3_kbd_event(DeviceState *dev, QemuConsole *src,
                         "square, Space start, Tab select)");
         }
     } else {
-        s->kbd_buttons &= ~bit;
+        *word &= ~bit;
     }
+}
+
+/*
+ * The host's controller, as SDL publishes it: the whole state after every
+ * change, so this replaces what it had and a controller that is unplugged
+ * leaves both sticks centred.  Whatever the pad's product, the controller's
+ * inputs land in the same two digital words the keyboard uses.
+ */
+static void ps3_gamepad_event(void *opaque, const QemuGamepadState *state)
+{
+    PS3BootROMState *s = opaque;
+
+    bool connected = qemu_gamepad_connected();
+
+    s->host_buttons = state->buttons;
+    s->host_lx = state->lx;
+    s->host_ly = state->ly;
+    s->host_rx = state->rx;
+    s->host_ry = state->ry;
+    ps3_input_kick(s);
+
+    /*
+     * The display also publishes a state when it loses the controller (zeroed,
+     * so the guest sees the release), which is how the detach is seen at all.
+     */
+    if (connected != s->host_pad_connected) {
+        s->host_pad_connected = connected;
+        if (connected) {
+            info_report("ps3-ppu: gamepad: the host's controller drives port 0 "
+                        "(sticks, d-pad, face and shoulder buttons)");
+        } else {
+            info_report("ps3-ppu: gamepad: the host's controller is gone; "
+                        "port 0 sits at rest");
+        }
+    }
+}
+
+/*
+ * SDL's -32768..32767 axis to libpad's 0..255, where 0 is up or left.  The
+ * half step of rounding matters: without it a centred stick reads 127 and a
+ * game takes that for a small push.
+ */
+static uint16_t ps3_pad_axis(int v)
+{
+    return (uint16_t)CLAMP(((v + 0x8000) * 255 + 0x7FFF) / 0xFFFF, 0, 255);
+}
+
+/* What the guest sees: the keyboard's word, with the controller's ORed in. */
+static void ps3_pad_host_words(const PS3BootROMState *s, uint16_t *d1,
+                               uint16_t *d2)
+{
+    const uint32_t b = s->host_buttons;
+
+    *d1 = s->kbd_d1;
+    *d2 = s->kbd_d2;
+
+    if (b & QEMU_GAMEPAD_SELECT)     *d1 |= 0x0001;
+    if (b & QEMU_GAMEPAD_THUMBL)     *d1 |= 0x0002;
+    if (b & QEMU_GAMEPAD_THUMBR)     *d1 |= 0x0004;
+    if (b & QEMU_GAMEPAD_START)      *d1 |= 0x0008;
+    if (b & QEMU_GAMEPAD_DPAD_UP)    *d1 |= 0x0010;
+    if (b & QEMU_GAMEPAD_DPAD_RIGHT) *d1 |= 0x0020;
+    if (b & QEMU_GAMEPAD_DPAD_DOWN)  *d1 |= 0x0040;
+    if (b & QEMU_GAMEPAD_DPAD_LEFT)  *d1 |= 0x0080;
+    if (b & QEMU_GAMEPAD_MODE)       *d1 |= 0x0100;
+
+    if (b & QEMU_GAMEPAD_TL2)        *d2 |= 0x0001;
+    if (b & QEMU_GAMEPAD_TR2)        *d2 |= 0x0002;
+    if (b & QEMU_GAMEPAD_TL)         *d2 |= 0x0004;
+    if (b & QEMU_GAMEPAD_TR)         *d2 |= 0x0008;
+    if (b & QEMU_GAMEPAD_NORTH)      *d2 |= 0x0010;
+    if (b & QEMU_GAMEPAD_EAST)       *d2 |= 0x0020;
+    if (b & QEMU_GAMEPAD_SOUTH)      *d2 |= 0x0040;
+    if (b & QEMU_GAMEPAD_WEST)       *d2 |= 0x0080;
 }
 
 static const QemuInputHandler ps3_kbd_handler = {
@@ -3598,9 +3894,10 @@ static void ps3_pad_put_word(uint8_t *p, unsigned word, uint16_t v)
 }
 
 /*
- * One port's CellPadData.  Nothing is pressed: both sticks sit in the middle,
- * a sensor-mode pad reports the DS3's rest orientation, and a peripheral
- * reports the neutral value of the controls its profile has.  The length says
+ * One port's CellPadData.  Port 0 carries what the host presses; every other
+ * port has nothing pressed, its sticks in the middle.  A sensor-mode pad
+ * reports the DS3's rest orientation, and a peripheral reports the neutral
+ * value of the controls its profile has.  The length says
  * how much of it is valid - 8 bytes, 20 with pressures, 24 with sensors - the
  * way a real pad does, and `len' 0 is never returned because this model has no
  * input to lose.
@@ -3610,6 +3907,7 @@ static void ps3_pad_data(const PS3BootROMState *s, unsigned port, uint8_t *d,
 {
     const PS3PadProduct *p = ps3_pad_product(s, port);
     uint32_t setting = s->pad_setting[port];
+    uint16_t d1, d2;
     unsigned len = 8;
 
     if (setting & PS3_PAD_SETTING_SENSOR_ON) {
@@ -3623,13 +3921,47 @@ static void ps3_pad_data(const PS3BootROMState *s, unsigned port, uint8_t *d,
     ps3_put_be32(d, len);
     /* Word 0 is reserved; word 1 holds the length in halfwords. */
     ps3_pad_put_word(d, 1, (0x7 << 4) | MIN(len / 2, 15));
-    /* The host keyboard, if the window has focus, presses these. */
-    ps3_pad_put_word(d, PS3_PAD_W_DIGITAL1, s->kbd_buttons & 0xFF);
-    ps3_pad_put_word(d, PS3_PAD_W_DIGITAL2, s->kbd_buttons >> 8);
-    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RX, 128);
-    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RY, 128);
-    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_LX, 128);
-    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_LY, 128);
+
+    /* The host keyboard and controller press these, port 0 only. */
+    ps3_pad_host_words(s, &d1, &d2);
+    if (port != 0) {
+        d1 = d2 = 0;
+    }
+    ps3_pad_put_word(d, PS3_PAD_W_DIGITAL1, d1);
+    ps3_pad_put_word(d, PS3_PAD_W_DIGITAL2, d2);
+
+    /*
+     * The sticks read from the controller, or sit centred when there is none:
+     * SDL's axes are 0 at rest, so a missing pad and a pad at rest agree.
+     */
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RX,
+                     port == 0 ? ps3_pad_axis(s->host_rx) : 128);
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RY,
+                     port == 0 ? ps3_pad_axis(s->host_ry) : 128);
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_LX,
+                     port == 0 ? ps3_pad_axis(s->host_lx) : 128);
+    ps3_pad_put_word(d, PS3_PAD_W_ANALOG_LY,
+                     port == 0 ? ps3_pad_axis(s->host_ly) : 128);
+
+    /*
+     * Press mode: a pressed button reports full travel.  The two triggers are
+     * digital here too - SDL gives their axes, and the UI turns a pull past a
+     * quarter into the L2/R2 bit.
+     */
+    if (len >= 20) {
+        ps3_pad_put_word(d, 8,  (d1 & 0x0020) ? 255 : 0);  /* right */
+        ps3_pad_put_word(d, 9,  (d1 & 0x0080) ? 255 : 0);  /* left */
+        ps3_pad_put_word(d, 10, (d1 & 0x0010) ? 255 : 0);  /* up */
+        ps3_pad_put_word(d, 11, (d1 & 0x0040) ? 255 : 0);  /* down */
+        ps3_pad_put_word(d, 12, (d2 & 0x0010) ? 255 : 0);  /* triangle */
+        ps3_pad_put_word(d, 13, (d2 & 0x0020) ? 255 : 0);  /* circle */
+        ps3_pad_put_word(d, 14, (d2 & 0x0040) ? 255 : 0);  /* cross */
+        ps3_pad_put_word(d, 15, (d2 & 0x0080) ? 255 : 0);  /* square */
+        ps3_pad_put_word(d, 16, (d2 & 0x0004) ? 255 : 0);  /* L1 */
+        ps3_pad_put_word(d, 17, (d2 & 0x0008) ? 255 : 0);  /* R1 */
+        ps3_pad_put_word(d, 18, (d2 & 0x0001) ? 255 : 0);  /* L2 */
+        ps3_pad_put_word(d, 19, (d2 & 0x0002) ? 255 : 0);  /* R2 */
+    }
 
     if (len == 24) {
         ps3_pad_put_word(d, PS3_PAD_W_SENSOR_X, 512);
@@ -3654,6 +3986,117 @@ static void ps3_pad_data(const PS3BootROMState *s, unsigned port, uint8_t *d,
     default:
         break;
     }
+}
+
+static void ps3_pad_info(const PS3BootROMState *s, uint8_t *info);
+
+/*
+ * The pad selftest: one controller state through the same handler the display
+ * feeds, then the guest's CellPadData read back and checked.  It is what says
+ * the mapping is right without a controller in hand - a stick on the wrong
+ * side or a face button in the wrong word would only look like a broken game.
+ * The product the port describes is checked with it, so `pad-types=dualsense'
+ * is known to reach `cellPadGetInfo' as the ids it stands for.
+ */
+static bool ps3_pad_selftest(PS3BootROMState *s, char *why, size_t why_len)
+{
+    const PS3PadProduct *p = ps3_pad_product(s, 0);
+    QemuGamepadState gp;
+    uint8_t info[PS3_PAD_INFO_SIZE];
+    uint8_t d[PS3_PAD_DATA_SIZE];
+    unsigned max_connect;
+    uint32_t setting = s->pad_setting[0];
+    uint16_t d1, d2, lx, ly, rx, ry, press_cross;
+
+    /* The display owns the connected flag; here the selftest stands in for it. */
+    qemu_gamepad_set_connected(true);
+
+    memset(&gp, 0, sizeof(gp));
+    gp.buttons = QEMU_GAMEPAD_SOUTH | QEMU_GAMEPAD_DPAD_LEFT;
+    gp.lx = -0x8000;                    /* hard left */
+    gp.ly = -0x8000;                    /* hard up */
+    gp.rx = 0x7FFF;                     /* hard right */
+    gp.ry = 0x7FFF;                     /* hard down */
+
+    ps3_gamepad_event(s, &gp);
+    s->pad_setting[0] = PS3_PAD_SETTING_PRESS_ON;
+    ps3_pad_data(s, 0, d, false);
+
+    d1 = (d[4 + 2 * 2] << 8) | d[5 + 2 * 2];
+    d2 = (d[4 + 2 * 3] << 8) | d[5 + 2 * 3];
+    rx = (d[4 + 2 * 4] << 8) | d[5 + 2 * 4];
+    ry = (d[4 + 2 * 5] << 8) | d[5 + 2 * 5];
+    lx = (d[4 + 2 * 6] << 8) | d[5 + 2 * 6];
+    ly = (d[4 + 2 * 7] << 8) | d[5 + 2 * 7];
+    press_cross = (d[4 + 2 * 14] << 8) | d[5 + 2 * 14];
+
+    s->pad_setting[0] = setting;
+
+    if (ps3_be32(d) != 20) {
+        snprintf(why, why_len, "press mode gave a %u-byte report, not 20",
+                 ps3_be32(d));
+        return false;
+    }
+    if (d1 != 0x0080) {
+        snprintf(why, why_len, "the d-pad left is 0x%04X in digital1, not "
+                 "0x0080", d1);
+        return false;
+    }
+    if (d2 != 0x0040) {
+        snprintf(why, why_len, "cross is 0x%04X in digital2, not 0x0040", d2);
+        return false;
+    }
+    if (lx != 0 || ly != 0 || rx != 255 || ry != 255) {
+        snprintf(why, why_len, "the sticks read L %u,%u R %u,%u, not L 0,0 "
+                 "R 255,255", lx, ly, rx, ry);
+        return false;
+    }
+    if (press_cross != 255) {
+        snprintf(why, why_len, "cross pressure is %u, not 255", press_cross);
+        return false;
+    }
+
+    /*
+     * And released: the sticks recentre and nothing stays pressed, which is
+     * what an unplugged controller has to look like.
+     */
+    memset(&gp, 0, sizeof(gp));
+    qemu_gamepad_set_connected(false);
+    ps3_gamepad_event(s, &gp);
+    ps3_pad_data(s, 0, d, false);
+
+    lx = (d[4 + 2 * 6] << 8) | d[5 + 2 * 6];
+    ly = (d[4 + 2 * 7] << 8) | d[5 + 2 * 7];
+    d1 = (d[4 + 2 * 2] << 8) | d[5 + 2 * 2];
+    d2 = (d[4 + 2 * 3] << 8) | d[5 + 2 * 3];
+    if (ps3_be32(d) != 8 || lx != 128 || ly != 128 || d1 || d2) {
+        snprintf(why, why_len, "released reads %u bytes, L %u,%u, digital "
+                 "0x%04X 0x%04X", ps3_be32(d), lx, ly, d1, d2);
+        return false;
+    }
+
+    /*
+     * The guest's cellPadInit is what makes the ports connected; the selftest
+     * stands in for that call, then puts the machine back as it found it.
+     */
+    max_connect = s->pad_max_connect;
+    s->pad_max_connect = PS3_PAD_PORT_MAX;
+    ps3_pad_info(s, info);
+    s->pad_max_connect = max_connect;
+
+    if (info[12] != (p->vendor >> 8) || info[13] != (uint8_t)p->vendor ||
+        info[12 + 2 * 127] != (p->product >> 8) ||
+        info[12 + 2 * 127 + 1] != (uint8_t)p->product) {
+        snprintf(why, why_len, "cellPadGetInfo does not describe port 0 as "
+                 "%04X:%04X", p->vendor, p->product);
+        return false;
+    }
+
+    info_report("ps3-ppu: pad selftest ok: port 0 is a %s (%04X:%04X) and "
+                "the controller's d-pad, cross, sticks and pressures land in "
+                "the guest's CellPadData", p->name, p->vendor, p->product);
+
+    return true;
 }
 
 static void ps3_pad_info(const PS3BootROMState *s, uint8_t *info)
@@ -3743,8 +4186,480 @@ static void ps3_thread_restore(const PS3Thread *t, CPUPPCState *env)
      * the call has returned (ps3_sched_tick), so they are stale by then.
      */
     memcpy(env->crf, t->crf, sizeof(t->crf));
-    env->msr = t->msr;
+    /*
+     * Through ppc_store_msr, not a plain assignment: the core caches the MSR
+     * in env->hflags and every translation block is keyed by that cache, so a
+     * raw write leaves the next block running with the previous thread's FP,
+     * PR and relocation bits - a restored thread then took an FP-unavailable
+     * exception on its first floating-point instruction.
+     */
+    ppc_store_msr(env, t->msr);
     env->nip = t->nip;
+}
+
+/*
+ * The lv2 event service.  Queues are keyed by the handle lv2 handed out, so a
+ * send can find the queue a port is wired to and the scheduler can find the
+ * thread waiting on one.
+ */
+static int ps3_eq_index(PS3BootROMState *s, uint32_t id)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_EQ_MAX; i++) {
+        if (s->eq[i].used && s->eq[i].id == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* cellMic names a queue by the key it was created with, not by its handle. */
+static int ps3_eq_index_key(const PS3BootROMState *s, uint64_t key)
+{
+    unsigned i;
+
+    if (!key) {
+        return -1;
+    }
+    for (i = 0; i < PS3_EQ_MAX; i++) {
+        if (s->eq[i].used && s->eq[i].key == key) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void ps3_eq_push(PS3EventQueue *q, const PS3Event *ev)
+{
+    if (q->count == PS3_EQ_DEPTH) {
+        return;                         /* full: the oldest stays queued */
+    }
+    q->event[(q->head + q->count) % PS3_EQ_DEPTH] = *ev;
+    q->count++;
+}
+
+static bool ps3_eq_pop(PS3EventQueue *q, PS3Event *ev)
+{
+    if (!q->count) {
+        return false;
+    }
+    *ev = q->event[q->head];
+    q->head = (q->head + 1) % PS3_EQ_DEPTH;
+    q->count--;
+    return true;
+}
+
+static void ps3_event_store(uint8_t *ram, uint64_t ram_size, uint32_t ea,
+                            const PS3Event *ev)
+{
+    if (!ea || (uint64_t)ea + PS3_EQ_EVENT_SIZE > ram_size) {
+        return;
+    }
+    ps3_put_be64(ram + ea, ev->source);
+    ps3_put_be64(ram + ea + 8, ev->data1);
+    ps3_put_be64(ram + ea + 16, ev->data2);
+    ps3_put_be64(ram + ea + 24, ev->data3);
+}
+
+/*
+ * Finish a call a parked thread was left inside.
+ *
+ * A receive that had to wait did not return through the trampoline: its exit
+ * flag parked the thread at the halt loop.  The caller's context is still in
+ * the trampoline's frame - r0, CR and r12 - and in SRR0/SRR1 as they were at
+ * the `sc`, which is exactly what ps3_sched_apply reconstructs for a call it
+ * completes in place; this is the same epilogue on a saved context.
+ */
+static void ps3_thread_finish_call(PS3Thread *t, uint8_t *ram,
+                                   uint64_t ram_size, uint32_t ret)
+{
+    uint32_t sp = (uint32_t)t->gpr[1];
+    unsigned i;
+
+    t->gpr[3] = ret;
+    if ((uint64_t)sp + 0x20 <= ram_size) {
+        uint32_t cr = ps3_be32(ram + sp + 0x0C);
+
+        t->gpr[12] = ps3_be32(ram + sp + 0x10);
+        for (i = 0; i < 8; i++) {
+            t->crf[i] = (cr >> (28 - 4 * i)) & 0xF;
+        }
+        t->gpr[0] = ps3_be32(ram + sp + 0x08);
+        t->gpr[1] = sp + 0x20;
+    }
+    if (t->srr0) {
+        t->nip = t->srr0;
+    }
+    /* Through the cached MSR, as a switch does: the next block is keyed on it. */
+    t->msr = t->srr1;
+    t->blocked = false;
+    t->parked = false;
+    t->wait_eq = -1;
+    t->wait_ticks = -1;
+    t->wait_mutex_id = 0;
+    t->wait_cond_id = 0;
+    t->wait_sem_id = 0;
+}
+
+/*
+ * Hand an event to the first thread waiting on that queue.  Called on the
+ * thread that owns the CPU, so the parked context can be written directly.
+ */
+static bool ps3_eq_wake(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
+                        int idx)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        PS3Thread *t = &s->thr[i];
+        PS3Event ev;
+
+        if (!t->used || !t->parked || t->wait_eq != idx) {
+            continue;
+        }
+        if (!ps3_eq_pop(&s->eq[idx], &ev)) {
+            return false;
+        }
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: sched: event 0x%" PRIX64 " wakes thread "
+                        "0x%X on queue 0x%X", ev.source, t->id,
+                        s->eq[idx].id);
+        }
+        ps3_event_store(ram, ram_size, t->wait_ea, &ev);
+        /* lv2 returns the same four words in r4..r7 as in the struct. */
+        t->gpr[4] = ev.source;
+        t->gpr[5] = ev.data1;
+        t->gpr[6] = ev.data2;
+        t->gpr[7] = ev.data3;
+        ps3_thread_finish_call(t, ram, ram_size, 0);
+        return true;
+    }
+    return false;
+}
+
+/*
+ * The microphone's sample ring.  One frame is two samples whatever the device
+ * was opened with, because the DSP stream the VSH reads is stereo: a mono
+ * capture is duplicated rather than handed out with a shifting frame size.
+ */
+static void ps3_mic_push(PS3BootROMState *s, const int16_t *pcm,
+                         unsigned frames, unsigned channels)
+{
+    unsigned i, ch;
+
+    for (i = 0; i < frames; i++) {
+        unsigned slot;
+
+        if (s->mic_used == PS3_MIC_RING_FRAMES) {
+            s->mic_head = (s->mic_head + 1) % PS3_MIC_RING_FRAMES;
+            s->mic_used--;
+        }
+        slot = (s->mic_head + s->mic_used) % PS3_MIC_RING_FRAMES;
+        for (ch = 0; ch < 2; ch++) {
+            s->mic_ring[slot * 2 + ch] =
+                pcm[i * channels + (channels == 1 ? 0 : ch)];
+        }
+        s->mic_used++;
+    }
+}
+
+static unsigned ps3_mic_take(PS3BootROMState *s, int16_t *dst,
+                             unsigned max_frames)
+{
+    unsigned n = MIN(max_frames, s->mic_used), i;
+
+    for (i = 0; i < n; i++) {
+        unsigned slot = (s->mic_head + i) % PS3_MIC_RING_FRAMES;
+
+        dst[i * 2] = s->mic_ring[slot * 2];
+        dst[i * 2 + 1] = s->mic_ring[slot * 2 + 1];
+    }
+    s->mic_head = (s->mic_head + n) % PS3_MIC_RING_FRAMES;
+    s->mic_used -= n;
+
+    return n;
+}
+
+/* The level cellMicGetSignalState reports, on RPCS3's cellMic scale. */
+static void ps3_mic_measure(PS3BootROMState *s, const int16_t *pcm,
+                            unsigned frames)
+{
+    const unsigned n = frames * 2;
+    double sum = 0.0;
+    float rms, db;
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        double v = pcm[i] / 32767.0;
+
+        sum += v * v;
+    }
+    rms = n ? sqrt(sum / n) : 0.0;
+    db = 90.0f + 20.0f * log10f(MAX(rms, 0.00001f)) * 0.5f;
+    s->mic_energy_db = CLAMP(db, 40.0f, 90.0f);
+}
+
+/* Pull what the host captured into the ring; a short read is normal. */
+static void ps3_mic_pump(PS3BootROMState *s)
+{
+    int16_t pcm[PS3_MIC_BLOCK_FRAMES * 2];
+    size_t bytes, frame_bytes;
+
+    if (!s->mic_opened || !s->mic_started || !ps3_audio_mic_active(s->audio)) {
+        return;
+    }
+
+    frame_bytes = sizeof(int16_t) * s->mic_channels;
+    bytes = ps3_audio_mic_read(s->audio, pcm,
+                               frame_bytes * PS3_MIC_BLOCK_FRAMES);
+    if (bytes < frame_bytes) {
+        return;                     /* the input has no full frame yet */
+    }
+
+    ps3_mic_push(s, pcm, bytes / frame_bytes, s->mic_channels);
+}
+
+/*
+ * The notify half of the microphone, on the vCPU thread: the guest waits in
+ * sys_event_queue_receive for CELLMIC_DATA, so the samples have to arrive as
+ * an event before it ever calls cellMicRead.
+ */
+static void ps3_mic_apply(CPUState *cs, run_on_cpu_data data)
+{
+    PS3BootROMState *s = data.host_ptr;
+    uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+    uint64_t ram_size = memory_region_size(s->ram);
+    int q;
+
+    s->mic_queued = false;
+    ps3_mic_pump(s);
+
+    if (!s->mic_used || !s->mic_eq_key) {
+        return;
+    }
+    q = ps3_eq_index_key(s, s->mic_eq_key);
+    if (q < 0) {
+        return;
+    }
+
+    {
+        PS3Event ev = {
+            .source = s->mic_eq_source,
+            .data1 = 5,             /* CELLMIC_DATA */
+            .data2 = 0,             /* device 0 */
+            .data3 = 0,
+        };
+
+        ps3_eq_push(&s->eq[q], &ev);
+        ps3_eq_wake(s, ram, ram_size, q);
+    }
+}
+
+static int ps3_ep_index(PS3BootROMState *s, uint32_t id)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_EP_MAX; i++) {
+        if (s->ep[i].used && s->ep[i].id == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * A receive with nothing queued: lv2 blocks the caller.  The trampoline's
+ * exit flag parks it at its halt loop, and the call is finished from the
+ * saved frame - by a send, or by the timeout running out.
+ */
+static void ps3_eq_park(PS3BootROMState *s, int idx, uint32_t event_ea,
+                        uint64_t timeout_us)
+{
+    PS3Thread *t;
+    int64_t ticks;
+
+    if (s->thr_cur < 0 || !s->thr[s->thr_cur].used) {
+        return;
+    }
+    t = &s->thr[s->thr_cur];
+    /* A sleep always ends; a receive with a zero timeout never does. */
+    ticks = (idx < 0 || timeout_us) ? (int64_t)(timeout_us / 1000) : -1;
+    if (ticks > PS3_EQ_TIMEOUT_MAX_TICKS) {
+        ticks = PS3_EQ_TIMEOUT_MAX_TICKS;
+    }
+    t->parked = true;
+    t->blocked = true;
+    t->wait_eq = idx;
+    t->wait_ea = event_ea;
+    t->wait_ticks = (int32_t)ticks;
+    s->lv2_park = true;
+    s->sched_pending = true;
+}
+
+static int ps3_mutex_index(PS3BootROMState *s, uint32_t id)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_MUTEX_MAX; i++) {
+        if (s->mtx[i].used && s->mtx[i].id == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int ps3_sem_index(PS3BootROMState *s, uint32_t id)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_SEM_MAX; i++) {
+        if (s->sem[i].used && s->sem[i].id == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int ps3_cond_index(PS3BootROMState *s, uint32_t id)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_COND_MAX; i++) {
+        if (s->cond[i].used && s->cond[i].id == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Park the current thread in a blocking synchronization call. */
+static void ps3_sync_park(PS3BootROMState *s, uint64_t timeout_us)
+{
+    PS3Thread *t;
+    int64_t ticks;
+
+    if (s->thr_cur < 0 || !s->thr[s->thr_cur].used) {
+        return;
+    }
+    t = &s->thr[s->thr_cur];
+    ticks = timeout_us ? (int64_t)(timeout_us / 1000) : -1;
+    if (ticks > PS3_EQ_TIMEOUT_MAX_TICKS) {
+        ticks = PS3_EQ_TIMEOUT_MAX_TICKS;
+    }
+    t->parked = true;
+    t->blocked = true;
+    t->wait_eq = -2;                /* a lock wait, not a queue */
+    t->wait_ea = 0;
+    t->wait_ticks = (int32_t)ticks;
+    s->lv2_park = true;
+    s->sched_pending = true;
+}
+
+/* Give a posted semaphore to the first thread waiting for it. */
+static void ps3_sem_handoff(PS3BootROMState *s, uint8_t *ram,
+                            uint64_t ram_size, int m)
+{
+    unsigned i;
+
+    if (s->sem[m].count <= 0) {
+        return;
+    }
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        PS3Thread *t = &s->thr[i];
+
+        if (!t->used || !t->parked || t->wait_sem_id != s->sem[m].id) {
+            continue;
+        }
+        s->sem[m].count--;
+        t->wait_sem_id = 0;
+        ps3_thread_finish_call(t, ram, ram_size, 0);
+        return;
+    }
+}
+
+/* Give the mutex to the first thread waiting for it, when it is free. */
+static void ps3_mutex_handoff(PS3BootROMState *s, uint8_t *ram,
+                              uint64_t ram_size, int m)
+{
+    unsigned i;
+
+    if (s->mtx[m].owner) {
+        return;
+    }
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        PS3Thread *t = &s->thr[i];
+
+        if (!t->used || !t->parked ||
+            t->wait_mutex_id != s->mtx[m].id) {
+            continue;
+        }
+        s->mtx[m].owner = t->id;
+        t->wait_mutex_id = 0;
+        ps3_thread_finish_call(t, ram, ram_size, 0);
+        return;
+    }
+}
+
+/*
+ * Wake the waiters of a condition.  lv2's cond_wait releases the mutex it is
+ * given and takes it again before it returns, so a thread only completes when
+ * the mutex is free; otherwise it stays parked and queues for the lock.
+ */
+static void ps3_cond_wake(PS3BootROMState *s, uint8_t *ram,
+                          uint64_t ram_size, int c, bool all)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        PS3Thread *t = &s->thr[i];
+        int m;
+
+        if (!t->used || !t->parked ||
+            t->wait_cond_id != s->cond[c].id) {
+            continue;
+        }
+        t->wait_cond_id = 0;
+        m = ps3_mutex_index(s, s->cond[c].mutex);
+        if (m >= 0 && !s->mtx[m].owner) {
+            s->mtx[m].owner = t->id;
+            ps3_thread_finish_call(t, ram, ram_size, 0);
+        } else if (m >= 0) {
+            t->wait_mutex_id = s->mtx[m].id;
+        }
+        if (!all) {
+            return;
+        }
+    }
+}
+
+/*
+ * The parked calls whose time is up.  Runs right after the outgoing thread
+ * has been saved, so every context it touches is a saved one.
+ */
+static void ps3_eq_expire(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        PS3Thread *t = &s->thr[i];
+
+        if (!t->used || !t->parked || t->wait_ticks < 0) {
+            continue;
+        }
+        if (t->wait_ticks > 0) {
+            t->wait_ticks--;
+            continue;
+        }
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: sched: thread 0x%X timed out%s", t->id,
+                        t->wait_eq >= 0 ? " on its queue" : " sleeping");
+        }
+        t->gpr[4] = t->gpr[5] = t->gpr[6] = t->gpr[7] = 0;
+        /* A sleep ends normally; every other wait reports the timeout. */
+        ps3_thread_finish_call(t, ram, ram_size,
+                               t->wait_eq == -1 ? 0 : PS3_LV2_ETIMEDOUT);
+    }
 }
 
 static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
@@ -3761,6 +4676,10 @@ static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
                         s->thr[start].nip, s->thr[start].lr);
         }
     }
+
+    /* Every context is saved by now, so an expired wait is safe to finish. */
+    ps3_eq_expire(s, memory_region_get_ram_ptr(s->ram),
+                  memory_region_size(s->ram));
 
     for (i = 1; i <= PS3_THREAD_MAX; i++) {
         int idx = (start + i + PS3_THREAD_MAX) % PS3_THREAD_MAX;
@@ -3780,12 +4699,86 @@ static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
     }
 
     s->thr_cur = next;
+    s->thr_slice = 0;
     ps3_thread_restore(&s->thr[next], env);
     if (s->ppu_trace) {
         info_report("ps3-ppu: sched: -> thread 0x%X at 0x%" PRIX64
                     " (msr=0x%" PRIX64 ")", s->thr[next].id,
                     s->thr[next].nip, s->thr[next].msr);
     }
+}
+
+/*
+ * The switch, on the thread that owns the CPU.
+ *
+ * A thread between its `sc` and the trampoline's `rfid` cannot be resumed at
+ * that point, so the trampoline is finished here instead: its frame holds the
+ * caller's r12, CR and r0, and SRR0/SRR1 are what the `rfid` would return to.
+ * That is the same epilogue the guest's own code runs at 0xC40..0xC54, so the
+ * saved context is an ordinary one.  This matters for a worker that calls lv2
+ * in a loop - the tick almost always lands inside the trampoline for it, and
+ * deferring the switch would starve every other thread.
+ */
+static void ps3_sched_apply(CPUState *cs, run_on_cpu_data data)
+{
+    PS3BootROMState *s = data.host_ptr;
+    CPUPPCState *env = &POWERPC_CPU(cs)->env;
+
+    s->sched_queued = false;
+    if (!s->sched_pending || s->thr_cur < 0) {
+        return;
+    }
+
+    if (env->nip >= 0xC00 && env->nip < 0xC60) {
+        uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+        uint64_t ram_size = memory_region_size(s->ram);
+        uint32_t sp = env->gpr[1];
+        uint32_t cr;
+        unsigned i;
+
+        if (env->nip < 0xC28 || (uint64_t)sp + 0x14 > ram_size) {
+            return;                     /* the call is still in flight */
+        }
+
+        /*
+         * 0xC28..0xC3C are the trampoline's own collection of the result:
+         * r3 comes from the scratch block and the exit flag from the word
+         * after it.  Skipping them left the caller's r3 (a pointer) as the
+         * call's return value, which read as an error - the stdio lock
+         * initialiser called abort() over a sys_lwmutex_create that had in
+         * fact succeeded.
+         */
+        env->gpr[3] = ps3_be32(ram + PS3_LV2_SCRATCH);
+        if (ps3_be32(ram + PS3_LV2_SCRATCH + 4)) {
+            env->nip = 0xC58;           /* the trampoline's halt loop */
+            /*
+             * A blocking call: the thread is parked here until the service
+             * completes it.  Its frame and SRR0/SRR1 are exactly what the
+             * completion needs, and the switch saves them, so this is a
+             * safe point to let another thread run - which is what makes a
+             * worker waiting on its queue stop occupying the core.
+             */
+            if (s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
+                s->thr[s->thr_cur].parked) {
+                s->sched_pending = false;
+                ps3_sched_switch(s, env);
+            }
+            return;
+        }
+        env->gpr[12] = ps3_be32(ram + sp + 0x10);
+        cr = ps3_be32(ram + sp + 0x0C);
+        for (i = 0; i < 8; i++) {
+            env->crf[i] = (cr >> (28 - 4 * i)) & 0xF;
+        }
+        env->gpr[0] = ps3_be32(ram + sp + 0x08);
+        env->gpr[1] = sp + 0x20;
+        env->nip = env->spr[SPR_SRR0];
+        /* The MSR the trampoline's rfid would load, through the same path. */
+        ppc_store_msr(env, env->spr[SPR_SRR1]);
+    }
+
+    s->sched_pending = false;
+    ps3_sched_switch(s, env);
 }
 
 static void ps3_sched_tick(void *opaque)
@@ -3805,47 +4798,45 @@ static void ps3_sched_tick(void *opaque)
     }
 
     /*
-     * A thread caught between its `sc` and the trampoline's `rfid` is not at
-     * a safe point: the trampoline's return state is not a thread context the
-     * guest can resume at will.  Leave the yield pending and take it at the
-     * next tick, once the call has returned.
+     * Timeslice preemption.  A worker polling a flag spends its whole slice in
+     * guest code and never reaches lv2, so nothing else would ever run: the
+     * VSH's main thread blocks on what those workers publish.  When the slice
+     * is up, ask for the switch the same way a blocking call does.
      */
-    if (cs && s->sched_pending) {
-        CPUPPCState *env = &POWERPC_CPU(cs)->env;
-        uint64_t nip = env->nip;
-
-        if (nip >= 0xC00 && nip < 0xC60) {
-            uint8_t *ram = memory_region_get_ram_ptr(s->ram);
-            uint64_t ram_size = memory_region_size(s->ram);
-            uint32_t sp = env->gpr[1];
-            uint32_t cr;
-            unsigned i;
-
-            /*
-             * The tick can land after the trampoline published its call and
-             * before it returned - that is where a yield usually happens,
-             * because a sleep or an exit asks for the switch from inside the
-             * call.  A thread cannot be resumed mid-trampoline, so finish the
-             * epilogue here (0xC40..0xC54: r12, CR, r0 and the frame, then
-             * rfid's MSR/NIP restore) and the context is an ordinary one.
-             */
-            if (nip < 0xC28 || (uint64_t)sp + 0x14 > ram_size) {
-                return;                 /* the call is still in flight */
-            }
-
-            env->gpr[12] = ps3_be32(ram + sp + 0x10);
-            cr = ps3_be32(ram + sp + 0x0C);
-            for (i = 0; i < 8; i++) {
-                env->crf[i] = (cr >> (28 - 4 * i)) & 0xF;
-            }
-            env->gpr[0] = ps3_be32(ram + sp + 0x08);
-            env->gpr[1] = sp + 0x20;
-            env->nip = env->spr[SPR_SRR0];
-            env->msr = env->spr[SPR_SRR1];
+    if (cs && s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
+        !s->sched_pending && ++s->thr_slice >= PS3_SCHED_SLICE_TICKS) {
+        s->sched_pending = true;
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: sched: thread 0x%X slice up at 0x%" PRIX64,
+                        s->thr[s->thr_cur].id, s->thr[s->thr_cur].nip);
         }
+    }
 
-        s->sched_pending = false;
-        ps3_sched_switch(s, &POWERPC_CPU(cs)->env);
+    /*
+     * The microphone.  Its samples arrive from the host between ticks, and the
+     * guest has to be told from the vCPU thread - the event path finishes a
+     * parked receive and writes the guest's memory - so the pump is queued
+     * like a thread switch, on the same timer.
+     */
+    if (s->mic_started && ++s->mic_tick >= PS3_MIC_PERIOD_TICKS) {
+        s->mic_tick = 0;
+        if (cs && !s->mic_queued) {
+            s->mic_queued = true;
+            run_on_cpu(cs, ps3_mic_apply, RUN_ON_CPU_HOST_PTR(s));
+        }
+    }
+
+    /*
+     * The switch itself runs on the vCPU thread (ps3_sched_apply): this timer
+     * fires on the I/O thread while the guest is executing without the BQL, so
+     * writing the CPU state from here would race the translation block that is
+     * running.  QEMU restores the guest PC from that block when it stops
+     * (`synchronize_from_tb`), which overwrote the restored context and left
+     * every thread frozen at the instruction it was switched out on.
+     */
+    if (cs && s->sched_pending && !s->sched_queued) {
+        s->sched_queued = true;
+        run_on_cpu(cs, ps3_sched_apply, RUN_ON_CPU_HOST_PTR(s));
     }
 
     if (s->sched_timer) {
@@ -3963,13 +4954,17 @@ static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
     t->lr = stub;
     t->nip = code;
     /*
-     * The creator runs this call inside lv2, so its MSR has PR clear.  A user
-     * thread must run with PR set, or its sc goes to the hypervisor vector
-     * 0x700 instead of the lv2 trampoline at 0xC00.  lv2 also enables FP and
-     * VR for user processes.
+     * The thread runs in the same state as the process's main one: PR clear,
+     * so the 970's real-mode mapping stays in force and every fetch of the
+     * process image resolves the way the main thread's does.  With PR set the
+     * core takes the user-process path instead, where a fetch has to find an
+     * SLB entry - and this model has none, so the first instruction after a
+     * worker's `sc` would take an instruction segment exception (0x480) and
+     * every thread would park on the 0x700 vector.  A `sc` with PR clear still
+     * enters the lv2 trampoline at 0xC00, which is also where the `rfid` that
+     * returns from it needs supervisor state.  lv2 enables FP and VR too.
      */
-    t->msr = env->msr | (1ULL << MSR_PR) | (1ULL << MSR_FP) |
-             (1ULL << MSR_VR);
+    t->msr = env->msr | (1ULL << MSR_FP) | (1ULL << MSR_VR);
 
     if (s->thr_cur < 0) {
         /* Register the thread that is running now as the process's main one. */
@@ -4053,6 +5048,1115 @@ static bool ps3_video_out_resolution(uint8_t id, uint32_t *w, uint32_t *h)
     case 0x05: *w = 720;  *h = 576;  return true;
     default:   return false;
     }
+}
+
+/* cellGcmSys: the display half of the RSX library (NIDs from vsh_exports). */
+#define PS3_NID_GCM_INIT             0xB477F06Au
+#define PS3_NID_GCM_GET_CONFIG       0xE315A0B2u
+#define PS3_NID_GCM_SET_DISPLAY_BUF  0xA53D12AEu
+#define PS3_NID_GCM_SET_FLIP         0xDC09357Eu
+#define PS3_NID_AIM_GET_DEVICE_TYPE  0x8F71C2DFu
+
+static bool ps3_lv2_gcm(PS3BootROMState *s, CPUPPCState *env,
+                        uint8_t *ram, uint64_t ram_size,
+                        uint32_t nid, int32_t *ret)
+{
+    uint32_t a0 = env->gpr[3];
+    uint32_t a1 = env->gpr[4];
+    uint32_t a2 = env->gpr[5];
+    uint32_t a3 = env->gpr[6];
+    uint32_t a4 = env->gpr[7];
+
+    switch (nid) {
+    case PS3_NID_GCM_INIT: {        /* context*, cmdSize, ioAddress */
+        if (!a0 || (uint64_t)a0 + 16 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            break;
+        }
+        /* CellGcmContextData: begin, end, current, callback. */
+        ps3_put_be32(ram + a0 + 0x0, a2);
+        ps3_put_be32(ram + a0 + 0x4, a2 + a1);
+        ps3_put_be32(ram + a0 + 0x8, a2);
+        ps3_put_be32(ram + a0 + 0xC, 0);
+        info_report("ps3-ppu: cellGcmInit: context 0x%X, 0x%X-byte command "
+                    "buffer at 0x%X", a0, a1, a2);
+        ps3_vga_printf("GCM: COMMAND BUFFER 0x%X BYTES", a1);
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_GCM_GET_CONFIG: {  /* CellGcmConfig* */
+        if (!a0 || (uint64_t)a0 + 24 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            break;
+        }
+        /*
+         * The console's RSX has 256 MiB of local memory and the XDR is 256
+         * MiB; the library asks for both before it sizes its command buffer,
+         * and a zero answer is what made emer_init print "Gcm Init Memory
+         * Shortage".  The reserved part is not given out, as on hardware.
+         */
+        ps3_put_be32(ram + a0 + 0x00, 0x00000000);   /* localAddress */
+        ps3_put_be32(ram + a0 + 0x04, 0x00000000);   /* ioAddress */
+        ps3_put_be32(ram + a0 + 0x08, 0x0F000000);   /* localSize 240 MiB */
+        ps3_put_be32(ram + a0 + 0x0C, 0x0F000000);   /* ioSize 240 MiB */
+        ps3_put_be32(ram + a0 + 0x10, 0x26BE3680);   /* memory frequency */
+        ps3_put_be32(ram + a0 + 0x14, 0x1F78A400);   /* core frequency */
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_GCM_SET_DISPLAY_BUF: { /* id, offset, pitch, width, height */
+        if (a0 < ARRAY_SIZE(s->gcm_display)) {
+            s->gcm_display[a0].offset = a1;
+            s->gcm_display[a0].pitch = a2;
+            s->gcm_display[a0].width = a3;
+            s->gcm_display[a0].height = a4;
+            s->gcm_display[a0].set = true;
+            info_report("ps3-ppu: cellGcmSetDisplayBuffer(%u): 0x%X, pitch "
+                        "0x%X, %ux%u", a0, a1, a2, a3, a4);
+        }
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_GCM_SET_FLIP: {    /* context, id */
+        uint32_t id = a1;
+
+        if (id >= ARRAY_SIZE(s->gcm_display) || !s->gcm_display[id].set) {
+            *ret = 0;
+            break;
+        }
+
+        s->gcm_display[id].set = false;
+        ps3_vga_guest_scanout(s->gcm_display[id].offset,
+                              s->gcm_display[id].width,
+                              s->gcm_display[id].height,
+                              s->gcm_display[id].pitch);
+        info_report("ps3-ppu: cellGcmSetFlip(%u): scanout 0x%X, %ux%u, "
+                    "pitch 0x%X", id, s->gcm_display[id].offset,
+                    s->gcm_display[id].width, s->gcm_display[id].height,
+                    s->gcm_display[id].pitch);
+        ps3_vga_printf("GCM: FLIP %u AT 0x%X", id,
+                       s->gcm_display[id].offset);
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_AIM_GET_DEVICE_TYPE: { /* u32 *type */
+        /*
+         * cellSsAimGetDeviceType: the AIM block reports what the AV port is
+         * wired to.  This machine is a TV on HDMI, which is what the
+         * cellVideoOut EDID already says.
+         */
+        if (a0 && (uint64_t)a0 + 4 <= ram_size) {
+            ps3_put_be32(ram + a0, 1);      /* CELL_SS_AIM_DEVICE_TYPE_TV */
+        }
+        info_report("ps3-ppu: cellSsAimGetDeviceType: TV (HDMI)");
+        *ret = 0;
+        break;
+    }
+    default:
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * cellMic: the console's microphone.
+ *
+ * The library is a front end over a USB audio class device: open it, start it,
+ * read its samples.  Under LLE the samples belong to sys_audio's mic thread,
+ * which is why the notify queue matters as much as the reads - the thread
+ * sleeps on CELLMIC_DATA and only calls cellMicRead when one arrives.  Here the
+ * device is QEMU's capture input and the samples are the host's microphone.
+ *
+ * NIDs are lv2's name hashes, the same generator that names cellVideoOut's
+ * imports, so a guest's cellMic stubs land here rather than on a placeholder.
+ */
+#define PS3_NID_MIC_INIT                0x8325E02Du
+#define PS3_NID_MIC_END                 0xC6328CAAu
+#define PS3_NID_MIC_OPEN                0xDD1B59F0u
+#define PS3_NID_MIC_OPEN_EX             0x05709BBFu
+#define PS3_NID_MIC_OPEN_RAW            0xA42AC07Au
+#define PS3_NID_MIC_CLOSE               0x8D229F8Eu
+#define PS3_NID_MIC_START               0xDD724314u
+#define PS3_NID_MIC_START_EX            0xDDD19A89u
+#define PS3_NID_MIC_STOP                0xFCFAF246u
+#define PS3_NID_MIC_READ                0x07E1B12Cu
+#define PS3_NID_MIC_READ_RAW            0x72165A7Fu
+#define PS3_NID_MIC_READ_DSP            0xC414FAA5u
+#define PS3_NID_MIC_READ_AUX            0x3ACC118Eu
+#define PS3_NID_MIC_GET_FORMAT          0x48108A23u
+#define PS3_NID_MIC_GET_FORMAT_EX       0xAD049ECFu
+#define PS3_NID_MIC_GET_FORMAT_RAW      0x4E0B69EEu
+#define PS3_NID_MIC_GET_FORMAT_AUX      0xFDA12276u
+#define PS3_NID_MIC_GET_FORMAT_DSP      0x87A08D29u
+#define PS3_NID_MIC_IS_OPEN             0x186CB1FBu
+#define PS3_NID_MIC_IS_ATTACHED         0x1B42101Bu
+#define PS3_NID_MIC_GET_TYPE            0xA52D2AE4u
+#define PS3_NID_MIC_GET_STATUS          0x25C5723Fu
+#define PS3_NID_MIC_GET_SIGNAL_STATE    0xB30780EBu
+#define PS3_NID_MIC_SET_SIGNAL_ATTR     0x323DEB41u
+#define PS3_NID_MIC_GET_SIGNAL_ATTR     0xAC5BA03Au
+#define PS3_NID_MIC_SET_DEVICE_ATTR     0xB2C16321u
+#define PS3_NID_MIC_GET_DEVICE_ATTR     0x6A024AA0u
+#define PS3_NID_MIC_SET_EQ              0x7903400Eu
+#define PS3_NID_MIC_SET_EQ2             0x6CC7AE00u
+#define PS3_NID_MIC_REMOVE_EQ           0x65336418u
+#define PS3_NID_MIC_RESET               0x6BC46AABu
+#define PS3_NID_MIC_GET_GUID            0x017024A8u
+#define PS3_NID_MIC_GET_IDENTIFIER      0xFDBBE469u
+#define PS3_NID_MIC_STOP_EX             0xE839380Fu
+#define PS3_NID_MIC_SYS_SHARE_INIT      0xD127CD3Eu
+#define PS3_NID_MIC_SYS_SHARE_END       0xF82BBF7Cu
+#define PS3_NID_MIC_SYS_SHARE_OPEN      0xC3610DBDu
+#define PS3_NID_MIC_SYS_SHARE_CLOSE     0x3ACE58F3u
+#define PS3_NID_MIC_SYS_SHARE_START     0xCAC7E7D7u
+#define PS3_NID_MIC_SYS_SHARE_STOP      0xBDFD51E2u
+#define PS3_NID_MIC_COMMAND             0xC461563Cu
+#define PS3_NID_MIC_SET_MULTI_EQ        0x891C6291u
+
+/* cellMic's own error codes, not lv2's. */
+#define CELL_MICIN_ERROR_ALREADY_INIT        ((int32_t)0x80140101)
+#define CELL_MICIN_ERROR_NOT_INIT            ((int32_t)0x80140103)
+#define CELL_MICIN_ERROR_PARAM               ((int32_t)0x80140104)
+#define CELL_MICIN_ERROR_ALREADY_OPEN        ((int32_t)0x80140106)
+#define CELL_MICIN_ERROR_NOT_OPEN            ((int32_t)0x80140107)
+#define CELL_MICIN_ERROR_EVENT_QUEUE         ((int32_t)0x8014010D)
+#define CELL_MICIN_ERROR_DEVICE_NOT_FOUND    ((int32_t)0x8014010E)
+#define CELL_MICIN_ERROR_DEVICE_NOT_SUPPORT  ((int32_t)0x80140110)
+
+/* Device attributes and signal states, as cellMic.h numbers them. */
+#define CELLMIC_DEVATTR_LED       9
+#define CELLMIC_DEVATTR_GAIN      10
+#define CELLMIC_DEVATTR_VOLUME    201
+#define CELLMIC_DEVATTR_AGC       202
+#define CELLMIC_DEVATTR_CHANVOL   301
+#define CELLMIC_DEVATTR_DSPTYPE   302
+
+#define CELLMIC_SIGSTATE_LOCTALK  0
+#define CELLMIC_SIGSTATE_FARTALK  1
+#define CELLMIC_SIGSTATE_NSR      3
+#define CELLMIC_SIGSTATE_AGC      4
+#define CELLMIC_SIGSTATE_MICENG   5
+#define CELLMIC_SIGSTATE_SPKENG   6
+
+#define CELLMIC_SIGTYPE_DSP       0x01
+#define CELLMIC_SIGTYPE_AUX       0x02
+#define CELLMIC_SIGTYPE_RAW       0x04
+
+#define CELLMIC_TYPE_USBAUDIO     3
+#define CELLMIC_CMD_ATTACH        2
+
+static const char *ps3_cellmic_name(uint32_t nid)
+{
+    switch (nid) {
+    case PS3_NID_MIC_INIT:              return "cellMicInit";
+    case PS3_NID_MIC_END:               return "cellMicEnd";
+    case PS3_NID_MIC_OPEN:              return "cellMicOpen";
+    case PS3_NID_MIC_OPEN_EX:           return "cellMicOpenEx";
+    case PS3_NID_MIC_OPEN_RAW:          return "cellMicOpenRaw";
+    case PS3_NID_MIC_CLOSE:             return "cellMicClose";
+    case PS3_NID_MIC_START:             return "cellMicStart";
+    case PS3_NID_MIC_START_EX:          return "cellMicStartEx";
+    case PS3_NID_MIC_STOP:              return "cellMicStop";
+    case PS3_NID_MIC_READ:              return "cellMicRead";
+    case PS3_NID_MIC_READ_RAW:          return "cellMicReadRaw";
+    case PS3_NID_MIC_READ_DSP:          return "cellMicReadDsp";
+    case PS3_NID_MIC_READ_AUX:          return "cellMicReadAux";
+    case PS3_NID_MIC_GET_FORMAT:        return "cellMicGetFormat";
+    case PS3_NID_MIC_GET_FORMAT_EX:     return "cellMicGetFormatEx";
+    case PS3_NID_MIC_GET_FORMAT_RAW:    return "cellMicGetFormatRaw";
+    case PS3_NID_MIC_GET_FORMAT_AUX:    return "cellMicGetFormatAux";
+    case PS3_NID_MIC_GET_FORMAT_DSP:    return "cellMicGetFormatDsp";
+    case PS3_NID_MIC_IS_OPEN:           return "cellMicIsOpen";
+    case PS3_NID_MIC_IS_ATTACHED:       return "cellMicIsAttached";
+    case PS3_NID_MIC_GET_TYPE:          return "cellMicGetType";
+    case PS3_NID_MIC_GET_STATUS:        return "cellMicGetStatus";
+    case PS3_NID_MIC_GET_SIGNAL_STATE:  return "cellMicGetSignalState";
+    case PS3_NID_MIC_SET_SIGNAL_ATTR:   return "cellMicSetSignalAttr";
+    case PS3_NID_MIC_GET_SIGNAL_ATTR:   return "cellMicGetSignalAttr";
+    case PS3_NID_MIC_SET_DEVICE_ATTR:   return "cellMicSetDeviceAttr";
+    case PS3_NID_MIC_GET_DEVICE_ATTR:   return "cellMicGetDeviceAttr";
+    case PS3_NID_MIC_SET_EQ:            return "cellMicSetNotifyEventQueue";
+    case PS3_NID_MIC_SET_EQ2:           return "cellMicSetNotifyEventQueue2";
+    case PS3_NID_MIC_REMOVE_EQ:         return "cellMicRemoveNotifyEventQueue";
+    case PS3_NID_MIC_RESET:             return "cellMicReset";
+    case PS3_NID_MIC_GET_GUID:          return "cellMicGetDeviceGUID";
+    case PS3_NID_MIC_GET_IDENTIFIER:    return "cellMicGetDeviceIdentifier";
+    case PS3_NID_MIC_STOP_EX:           return "cellMicStopEx";
+    case PS3_NID_MIC_SYS_SHARE_INIT:    return "cellMicSysShareInit";
+    case PS3_NID_MIC_SYS_SHARE_END:     return "cellMicSysShareEnd";
+    case PS3_NID_MIC_SYS_SHARE_OPEN:    return "cellMicSysShareOpen";
+    case PS3_NID_MIC_SYS_SHARE_CLOSE:   return "cellMicSysShareClose";
+    case PS3_NID_MIC_SYS_SHARE_START:   return "cellMicSysShareStart";
+    case PS3_NID_MIC_SYS_SHARE_STOP:    return "cellMicSysShareStop";
+    case PS3_NID_MIC_COMMAND:           return "cellMicCommand";
+    case PS3_NID_MIC_SET_MULTI_EQ:      return "cellMicSetMultiMicNotifyEventQueue";
+    default:                            return NULL;
+    }
+}
+
+static void ps3_put_be_f32(uint8_t *p, float f)
+{
+    union {
+        float f;
+        uint32_t u;
+    } v;
+
+    v.f = f;
+    ps3_put_be32(p, v.u);
+}
+
+/*
+ * Open device 0.  The rate the voice accepts is what the guest is then told it
+ * has, so a backend that cannot run at the requested rate still gives the
+ * guest a stream whose timing is right.
+ */
+static int32_t ps3_cellmic_open(PS3BootROMState *s, uint32_t dev, uint32_t raw_rate,
+                            uint32_t channels, uint32_t dsp_rate,
+                            uint32_t sig_type)
+{
+    Error *err = NULL;
+
+    if (!s->mic_init) {
+        return CELL_MICIN_ERROR_NOT_INIT;
+    }
+    if (dev >= PS3_MIC_DEVICES) {
+        return CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+    }
+    if (s->mic_opened) {
+        return CELL_MICIN_ERROR_ALREADY_OPEN;
+    }
+    if (!sig_type || (sig_type & ~(CELLMIC_SIGTYPE_DSP | CELLMIC_SIGTYPE_AUX |
+                                   CELLMIC_SIGTYPE_RAW))) {
+        return CELL_MICIN_ERROR_PARAM;
+    }
+
+    if (!channels) {
+        channels = 1;
+    }
+    if (channels > 2) {
+        channels = 2;               /* the ring and the DSP stream are stereo */
+    }
+    if (!raw_rate) {
+        raw_rate = PS3_MIC_DEFAULT_RATE;
+    }
+
+    if (!ps3_audio_mic_open(s->audio, raw_rate, channels, &err)) {
+        info_report("ps3-ppu: cellMicOpenEx: %s", error_get_pretty(err));
+        error_free(err);
+        return CELL_MICIN_ERROR_DEVICE_NOT_SUPPORT;
+    }
+
+    s->mic_opened = true;
+    s->mic_started = false;
+    s->mic_channels = channels;
+    s->mic_sig_type = sig_type;
+    s->mic_rate = ps3_audio_mic_rate(s->audio);
+    s->mic_dsp_rate = dsp_rate ? dsp_rate : s->mic_rate;
+    s->mic_head = 0;
+    s->mic_used = 0;
+    s->mic_tick = 0;
+
+    info_report("ps3-ppu: cellMicOpenEx(dev %u): %u Hz, %u channel(s), "
+                "signal 0x%X", dev, s->mic_rate, channels, sig_type);
+
+    return 0;
+}
+
+/*
+ * Copy the ring out in the format the caller asked for.  RAW is big-endian
+ * signed 16-bit; DSP is the same samples as big-endian floats in [-1, 1],
+ * unless the guest set DSPTYPE to 1, which makes the DSP stream the raw one
+ * (the library does the same on hardware).  A null buffer is not an error: the
+ * caller is asking how much is waiting.
+ */
+static int32_t ps3_cellmic_read(PS3BootROMState *s, uint8_t *ram,
+                            uint64_t ram_size, uint32_t dev, uint32_t ea,
+                            uint32_t max_bytes, uint32_t type)
+{
+    int16_t pcm[PS3_MIC_CHUNK_FRAMES * 2];
+    unsigned frame_bytes, frames, done = 0, n, i, ch;
+    bool dsp;
+
+    if (!s->mic_init) {
+        return CELL_MICIN_ERROR_NOT_INIT;
+    }
+    if (dev >= PS3_MIC_DEVICES) {
+        return CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+    }
+    if (!s->mic_opened || !(s->mic_sig_type & type)) {
+        return CELL_MICIN_ERROR_NOT_OPEN;
+    }
+    if (type == CELLMIC_SIGTYPE_AUX) {
+        return 0;                   /* no auxiliary stream on this device */
+    }
+    if (!ea) {
+        return 0;
+    }
+    if (!type || (uint64_t)ea + max_bytes > ram_size) {
+        return CELL_MICIN_ERROR_PARAM;
+    }
+
+    dsp = type == CELLMIC_SIGTYPE_DSP && s->mic_attr_dsptype != 1;
+    frame_bytes = (dsp ? 4 : 2) * s->mic_channels;
+    frames = MIN(s->mic_used, max_bytes / frame_bytes);
+
+    while (frames) {
+        unsigned block = MIN(frames, PS3_MIC_CHUNK_FRAMES);
+        uint8_t *dst = ram + ea + done * frame_bytes;
+
+        n = ps3_mic_take(s, pcm, block);
+        if (!n) {
+            break;
+        }
+        ps3_mic_measure(s, pcm, n);
+
+        for (i = 0; i < n; i++) {
+            for (ch = 0; ch < s->mic_channels; ch++) {
+                int16_t v = pcm[i * s->mic_channels + ch];
+
+                if (dsp) {
+                    ps3_put_be_f32(dst, v / 32767.0f);
+                    dst += 4;
+                } else {
+                    *dst++ = (uint8_t)(v >> 8);
+                    *dst++ = (uint8_t)v;
+                }
+            }
+        }
+        done += n;
+        frames -= n;
+    }
+
+    return done * frame_bytes;
+}
+
+static bool ps3_lv2_mic(PS3BootROMState *s, CPUPPCState *env,
+                        uint8_t *ram, uint64_t ram_size,
+                        uint32_t nid, int32_t *ret)
+{
+    uint32_t a0 = env->gpr[3];
+    uint32_t a1 = env->gpr[4];
+    uint32_t a2 = env->gpr[5];
+    uint32_t a3 = env->gpr[6];
+
+    switch (nid) {
+    case PS3_NID_MIC_INIT:
+        if (s->mic_init) {
+            *ret = CELL_MICIN_ERROR_ALREADY_INIT;
+            break;
+        }
+        s->mic_init = true;
+        s->mic_opened = false;
+        s->mic_started = false;
+        s->mic_channels = 2;
+        s->mic_sig_type = 0;
+        s->mic_rate = PS3_MIC_DEFAULT_RATE;
+        s->mic_dsp_rate = PS3_MIC_DEFAULT_RATE;
+        s->mic_attr_gain = 3;
+        s->mic_attr_volume = 145;
+        s->mic_attr_agc = 0;
+        s->mic_attr_led = 0;
+        s->mic_attr_dsptype = 0;
+        s->mic_chanvol[0] = 100;
+        s->mic_chanvol[1] = 100;
+        s->mic_eq_key = 0;
+        s->mic_eq_source = 0;
+        s->mic_head = 0;
+        s->mic_used = 0;
+        s->mic_tick = 0;
+        s->mic_energy_db = 40.0f;
+        info_report("ps3-ppu: cellMicInit: device 0 is the host's capture "
+                    "input");
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_END:
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        ps3_audio_mic_close(s->audio);
+        s->mic_init = false;
+        s->mic_opened = false;
+        s->mic_started = false;
+        s->mic_eq_key = 0;
+        s->mic_eq_source = 0;
+        s->mic_used = 0;
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_OPEN:          /* dev, sampleRate */
+        *ret = ps3_cellmic_open(s, a0, a1, 1, a1, CELLMIC_SIGTYPE_DSP);
+        break;
+    case PS3_NID_MIC_OPEN_RAW:      /* dev, sampleRate, maxChannels */
+        *ret = ps3_cellmic_open(s, a0, a1, a2, a1, CELLMIC_SIGTYPE_RAW);
+        break;
+    case PS3_NID_MIC_OPEN_EX:       /* dev, rawRate, rawChannels, dspRate,
+                                     * bufferMs, signalType */
+        *ret = ps3_cellmic_open(s, a0, a1, a2, a3, env->gpr[8]);
+        break;
+    case PS3_NID_MIC_CLOSE:
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+        if (!s->mic_opened) {
+            *ret = CELL_MICIN_ERROR_NOT_OPEN;
+            break;
+        }
+        ps3_audio_mic_close(s->audio);
+        s->mic_opened = false;
+        s->mic_started = false;
+        s->mic_used = 0;
+        info_report("ps3-ppu: cellMicClose(dev %u)", a0);
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_START:
+    case PS3_NID_MIC_START_EX: {
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (nid == PS3_NID_MIC_START_EX && (a1 & ~0x3u)) {
+            *ret = CELL_MICIN_ERROR_PARAM;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+        if (!s->mic_opened) {
+            *ret = CELL_MICIN_ERROR_NOT_OPEN;
+            break;
+        }
+        if (!s->mic_started) {
+            s->mic_started = true;
+            s->mic_tick = 0;
+            ps3_audio_mic_start(s->audio, true);
+            info_report("ps3-ppu: cellMicStart: capturing %u Hz, %u "
+                        "channel(s)%s", s->mic_rate, s->mic_channels,
+                        ps3_audio_mic_active(s->audio) ? "" :
+                        " (no capture voice)");
+        }
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_STOP:
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+        if (!s->mic_opened) {
+            *ret = CELL_MICIN_ERROR_NOT_OPEN;
+            break;
+        }
+        s->mic_started = false;
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_READ:
+    case PS3_NID_MIC_READ_DSP:
+        *ret = ps3_cellmic_read(s, ram, ram_size, a0, a1, a2,
+                            CELLMIC_SIGTYPE_DSP);
+        break;
+    case PS3_NID_MIC_READ_RAW:
+        *ret = ps3_cellmic_read(s, ram, ram_size, a0, a1, a2,
+                            CELLMIC_SIGTYPE_RAW);
+        break;
+    case PS3_NID_MIC_READ_AUX:
+        *ret = ps3_cellmic_read(s, ram, ram_size, a0, a1, a2,
+                            CELLMIC_SIGTYPE_AUX);
+        break;
+    case PS3_NID_MIC_GET_FORMAT:
+    case PS3_NID_MIC_GET_FORMAT_EX:
+    case PS3_NID_MIC_GET_FORMAT_RAW:
+    case PS3_NID_MIC_GET_FORMAT_AUX:
+    case PS3_NID_MIC_GET_FORMAT_DSP: {
+        uint32_t type = nid == PS3_NID_MIC_GET_FORMAT_EX ? a2 :
+                        nid == PS3_NID_MIC_GET_FORMAT_RAW ? CELLMIC_SIGTYPE_RAW :
+                        CELLMIC_SIGTYPE_DSP;
+        bool dsp;
+        uint8_t *p;
+
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 8 > ram_size) {
+            *ret = CELL_MICIN_ERROR_PARAM;
+            break;
+        }
+        if (!s->mic_opened) {
+            *ret = CELL_MICIN_ERROR_NOT_OPEN;
+            break;
+        }
+
+        dsp = type == CELLMIC_SIGTYPE_DSP && s->mic_attr_dsptype != 1;
+        p = ram + a1;
+        p[0] = (uint8_t)s->mic_channels;    /* channelNum */
+        p[1] = dsp ? 4 : 2;                 /* subframeSize */
+        p[2] = dsp ? 32 : 16;               /* bitResolution */
+        p[3] = 1;                           /* dataType: big-endian */
+        ps3_put_be32(p + 4, s->mic_rate);
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_IS_OPEN:
+        *ret = s->mic_init && a0 < PS3_MIC_DEVICES && s->mic_opened ? 1 : 0;
+        break;
+    case PS3_NID_MIC_IS_ATTACHED:
+        *ret = 1;
+        break;
+    case PS3_NID_MIC_GET_TYPE: {    /* dev, s32 *type */
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 4 > ram_size) {
+            *ret = CELL_MICIN_ERROR_PARAM;
+            break;
+        }
+        ps3_put_be32(ram + a1, a0 < PS3_MIC_DEVICES ? CELLMIC_TYPE_USBAUDIO
+                                                    : (uint32_t)-1);
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_GET_STATUS: {  /* dev, CellMicStatus *status */
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 0x24 > ram_size) {
+            *ret = CELL_MICIN_ERROR_PARAM;
+            break;
+        }
+
+        ps3_put_be32(ram + a1 + 0x00, s->mic_rate);
+        ps3_put_be32(ram + a1 + 0x04, s->mic_dsp_rate);
+        ps3_put_be32(ram + a1 + 0x08, 5);            /* dsp_volume, 0..5 */
+        ps3_put_be32(ram + a1 + 0x0C, s->mic_started);
+        ps3_put_be32(ram + a1 + 0x10, s->mic_opened);
+        ps3_put_be32(ram + a1 + 0x14, 10);           /* local voice, 0..10 */
+        ps3_put_be32(ram + a1 + 0x18, 0);            /* remote voice */
+        ps3_put_be_f32(ram + a1 + 0x1C, s->mic_energy_db);
+        ps3_put_be_f32(ram + a1 + 0x20, 60.0f);      /* speaker level, dB */
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_GET_SIGNAL_STATE: {    /* dev, state, void *value */
+        uint8_t *p;
+
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (!a2 || (uint64_t)a2 + 4 > ram_size) {
+            *ret = CELL_MICIN_ERROR_PARAM;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+        if (!s->mic_opened) {
+            *ret = CELL_MICIN_ERROR_NOT_OPEN;
+            break;
+        }
+
+        p = ram + a2;
+        switch (a1) {
+        case CELLMIC_SIGSTATE_LOCTALK:
+            ps3_put_be32(p, 9);     /* someone is probably talking */
+            break;
+        case CELLMIC_SIGSTATE_FARTALK:
+            ps3_put_be32(p, 1);
+            break;
+        case CELLMIC_SIGSTATE_NSR:
+            ps3_put_be_f32(p, 0.0f);    /* no noise reduction */
+            break;
+        case CELLMIC_SIGSTATE_AGC:
+            ps3_put_be_f32(p, 1.0f);    /* no gain applied */
+            break;
+        case CELLMIC_SIGSTATE_MICENG:
+            ps3_put_be_f32(p, s->mic_energy_db);
+            break;
+        case CELLMIC_SIGSTATE_SPKENG:
+            ps3_put_be_f32(p, 10.0f);
+            break;
+        default:
+            *ret = CELL_MICIN_ERROR_PARAM;
+            return true;
+        }
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_SET_DEVICE_ATTR: {     /* dev, attr, arg1, arg2 */
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+
+        switch (a1) {
+        case CELLMIC_DEVATTR_CHANVOL:
+            if (a2 > 2) {
+                *ret = CELL_MICIN_ERROR_PARAM;
+                return true;
+            }
+            if (a2 == 0) {
+                s->mic_chanvol[0] = a3;
+                s->mic_chanvol[1] = a3;
+            } else {
+                s->mic_chanvol[a2 - 1] = a3;
+            }
+            break;
+        case CELLMIC_DEVATTR_LED:     s->mic_attr_led = a2;      break;
+        case CELLMIC_DEVATTR_GAIN:    s->mic_attr_gain = a2;     break;
+        case CELLMIC_DEVATTR_VOLUME:  s->mic_attr_volume = a2;   break;
+        case CELLMIC_DEVATTR_AGC:     s->mic_attr_agc = a2;      break;
+        case CELLMIC_DEVATTR_DSPTYPE: s->mic_attr_dsptype = a2;  break;
+        default:
+            *ret = CELL_MICIN_ERROR_PARAM;
+            return true;
+        }
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_GET_DEVICE_ATTR: {     /* dev, attr, s32 *arg1, s32 *arg2 */
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+
+        switch (a1) {
+        case CELLMIC_DEVATTR_CHANVOL:
+            if (!a2 || (uint64_t)a2 + 4 > ram_size) {
+                *ret = CELL_MICIN_ERROR_PARAM;
+                break;
+            }
+            if (!a3 || (uint64_t)a3 + 4 > ram_size) {
+                *ret = CELL_MICIN_ERROR_PARAM;
+                break;
+            }
+            {
+                uint32_t ch = ps3_be32(ram + a2);
+
+                if (ch > 2) {
+                    *ret = CELL_MICIN_ERROR_PARAM;
+                    break;
+                }
+                ps3_put_be32(ram + a3, ch == 0 ?
+                             (s->mic_chanvol[0] + s->mic_chanvol[1]) / 2 :
+                             s->mic_chanvol[ch - 1]);
+            }
+            break;
+        case CELLMIC_DEVATTR_LED:
+        case CELLMIC_DEVATTR_GAIN:
+        case CELLMIC_DEVATTR_VOLUME:
+        case CELLMIC_DEVATTR_AGC:
+        case CELLMIC_DEVATTR_DSPTYPE: {
+            uint32_t v = a1 == CELLMIC_DEVATTR_LED ? s->mic_attr_led :
+                         a1 == CELLMIC_DEVATTR_GAIN ? s->mic_attr_gain :
+                         a1 == CELLMIC_DEVATTR_VOLUME ? s->mic_attr_volume :
+                         a1 == CELLMIC_DEVATTR_AGC ? s->mic_attr_agc :
+                         s->mic_attr_dsptype;
+
+            if (!a2 || (uint64_t)a2 + 4 > ram_size) {
+                *ret = CELL_MICIN_ERROR_PARAM;
+                break;
+            }
+            ps3_put_be32(ram + a2, v);
+            break;
+        }
+        default:
+            *ret = CELL_MICIN_ERROR_PARAM;
+            return true;
+        }
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_SET_SIGNAL_ATTR:       /* dev, attr, void *value */
+    case PS3_NID_MIC_GET_SIGNAL_ATTR:
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+        if (!a2) {
+            *ret = CELL_MICIN_ERROR_PARAM;
+            break;
+        }
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_SET_EQ:        /* u64 key */
+    case PS3_NID_MIC_SET_EQ2: {     /* u64 key, u64 source, u64 flag */
+        uint64_t key = env->gpr[3];
+        int q;
+
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        q = ps3_eq_index_key(s, key);
+        if (q < 0) {
+            *ret = CELL_MICIN_ERROR_EVENT_QUEUE;
+            break;
+        }
+
+        s->mic_eq_key = key;
+        s->mic_eq_source = nid == PS3_NID_MIC_SET_EQ2 ? env->gpr[4] : 0;
+
+        /* The device is there, which is what the library announces first. */
+        {
+            PS3Event ev = {
+                .source = s->mic_eq_source,
+                .data1 = CELLMIC_CMD_ATTACH,
+                .data2 = 0,
+                .data3 = 0,
+            };
+
+            ps3_eq_push(&s->eq[q], &ev);
+            ps3_eq_wake(s, ram, ram_size, q);
+        }
+        info_report("ps3-ppu: cellMicSetNotifyEventQueue: key 0x%" PRIX64
+                    " (source 0x%" PRIX64 ")", key, s->mic_eq_source);
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_MIC_REMOVE_EQ:
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        s->mic_eq_key = 0;
+        s->mic_eq_source = 0;
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_GET_GUID:      /* dev, u32 *guid */
+    case PS3_NID_MIC_GET_IDENTIFIER:        /* dev, u32 *id */
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 4 > ram_size) {
+            *ret = CELL_MICIN_ERROR_PARAM;
+            break;
+        }
+        ps3_put_be32(ram + a1, nid == PS3_NID_MIC_GET_GUID ?
+                     0xFFFFFFFFu : 0);
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_RESET:
+        if (!s->mic_init) {
+            *ret = CELL_MICIN_ERROR_NOT_INIT;
+            break;
+        }
+        if (a0 >= PS3_MIC_DEVICES) {
+            *ret = CELL_MICIN_ERROR_DEVICE_NOT_FOUND;
+            break;
+        }
+        if (!s->mic_opened) {
+            *ret = CELL_MICIN_ERROR_NOT_OPEN;
+            break;
+        }
+        s->mic_head = 0;
+        s->mic_used = 0;
+        *ret = 0;
+        break;
+    case PS3_NID_MIC_STOP_EX:
+    case PS3_NID_MIC_SYS_SHARE_INIT:
+    case PS3_NID_MIC_SYS_SHARE_END:
+    case PS3_NID_MIC_SYS_SHARE_OPEN:
+    case PS3_NID_MIC_SYS_SHARE_CLOSE:
+    case PS3_NID_MIC_SYS_SHARE_START:
+    case PS3_NID_MIC_SYS_SHARE_STOP:
+    case PS3_NID_MIC_COMMAND:
+    case PS3_NID_MIC_SET_MULTI_EQ:
+        /*
+         * The system-side sharing entry points.  The VSH never calls them on
+         * its own microphone; a guest that does gets the library's success
+         * answer rather than -1, which its caller would treat as a pointer.
+         */
+        *ret = 0;
+        break;
+    default:
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * The microphone's selftest, in the spirit of the AES one.
+ *
+ * The guest's cellMic calls are answered from a capture voice and a ring, and
+ * a byte-order or ring mistake would only show up as noise the guest cannot
+ * explain.  This drives the handler the way the library does - init, open,
+ * start, read, format, level, close - and names what failed.  With no host
+ * input the open must be refused the library's way, which is itself the check.
+ */
+/*
+ * What the host actually captured during the selftest's wait.  A voice the
+ * backend accepts but never fills would pass every other check, so the count
+ * is reported: zero frames means the input is silent or absent, which is a
+ * fact about the host, not a failure of the model.
+ */
+static void ps3_mic_capture_done(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+    unsigned before, i;
+    int peak = 0;
+
+    s->mic_capture_timer = NULL;
+    for (i = 0; i < 16; i++) {
+        before = s->mic_used;
+        ps3_mic_pump(s);
+        if (s->mic_used == before) {
+            break;
+        }
+    }
+
+    /* The peak says whether a device is really there or only a silent one. */
+    for (i = 0; i < s->mic_used * 2; i++) {
+        peak = MAX(peak, abs((int)s->mic_ring[i]));
+    }
+
+    info_report("ps3-ppu: microphone capture test: the host delivered %u "
+                "frame(s) in 300 ms, peak %d/32767%s", s->mic_used, peak,
+                s->mic_used ? "" : " (silence, or no input device)");
+
+    s->mic_used = 0;
+    if (!s->mic_init) {
+        /* A guest that started using the device in the meantime keeps it. */
+        s->mic_started = false;
+        s->mic_opened = false;
+        ps3_audio_mic_close(s->audio);
+    }
+}
+
+/*
+ * The capture voice has to be opened while the VM is running: a backend only
+ * starts its input when it is told to, and before the run state reaches
+ * running the audio core leaves the hardware off.  So the selftest's real
+ * capture starts one timer after the machine does.
+ */
+static void ps3_mic_capture_open(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+    Error *err = NULL;
+
+    if (!ps3_audio_mic_open(s->audio, PS3_MIC_DEFAULT_RATE, 2, &err)) {
+        info_report("ps3-ppu: microphone selftest: %s",
+                    error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+
+    s->mic_opened = true;
+    s->mic_started = true;
+    s->mic_channels = 2;
+    s->mic_rate = ps3_audio_mic_rate(s->audio);
+    s->mic_used = 0;
+
+    s->mic_capture_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       ps3_mic_capture_done, s);
+    timer_mod(s->mic_capture_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 300000000);
+}
+
+static bool ps3_mic_selftest(PS3BootROMState *s, char *why, size_t why_len)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+    uint64_t ram_size = memory_region_size(s->ram);
+    const uint32_t ea = PS3_MIC_SELFTEST_EA;
+    CPUPPCState env;
+    int16_t block[64];
+    int32_t ret;
+    unsigned i;
+    union {
+        uint32_t u;
+        float f;
+    } level;
+
+    if (!ram || ea + 0x100 > ram_size) {
+        snprintf(why, why_len, "no scratch RAM for the selftest");
+        return false;
+    }
+
+    memset(&env, 0, sizeof(env));
+    memset(ram + ea, 0, 0x100);
+    s->mic_init = false;
+    s->mic_opened = false;
+    s->mic_started = false;
+
+    env.gpr[3] = 0;
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_INIT, &ret) || ret) {
+        snprintf(why, why_len, "cellMicInit answered 0x%X", (uint32_t)ret);
+        return false;
+    }
+
+    /* The second init is the library's ALREADY_INIT, not a silent success. */
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_INIT, &ret) ||
+        ret != CELL_MICIN_ERROR_ALREADY_INIT) {
+        snprintf(why, why_len, "a second cellMicInit answered 0x%X, not "
+                 "ALREADY_INIT", (uint32_t)ret);
+        return false;
+    }
+
+    env.gpr[3] = 0;                     /* dev 0 */
+    env.gpr[4] = 48000;                 /* raw rate */
+    env.gpr[5] = 2;                     /* channels */
+    env.gpr[6] = 48000;                 /* DSP rate */
+    env.gpr[7] = 0x80;                  /* bufferSizeMS */
+    env.gpr[8] = CELLMIC_SIGTYPE_DSP | CELLMIC_SIGTYPE_RAW;
+    ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_OPEN_EX, &ret);
+
+    if (ret == CELL_MICIN_ERROR_DEVICE_NOT_SUPPORT) {
+        /* No input on this host: the open has to be refused, not faked. */
+        info_report("ps3-ppu: microphone selftest: no host capture device, "
+                    "cellMicOpenEx answered DEVICE_NOT_SUPPORT");
+        s->mic_init = false;
+        return true;
+    }
+    if (ret) {
+        snprintf(why, why_len, "cellMicOpenEx answered 0x%X", (uint32_t)ret);
+        return false;
+    }
+
+    env.gpr[3] = 0;
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_START, &ret) || ret) {
+        snprintf(why, why_len, "cellMicStart answered 0x%X", (uint32_t)ret);
+        return false;
+    }
+
+    /*
+     * A ramp of 32 stereo frames, pushed the way the capture tick pushes
+     * them, so both the channel order and the big-endian conversion are
+     * visible in what the guest reads back.
+     */
+    for (i = 0; i < 64; i++) {
+        block[i] = (int16_t)(i * 512 - 16384);
+    }
+    ps3_mic_push(s, block, 32, 2);
+
+    env.gpr[3] = 0;
+    env.gpr[4] = ea;
+    env.gpr[5] = 0x100;
+    ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_READ_RAW, &ret);
+    if (ret != 32 * 4) {
+        snprintf(why, why_len, "cellMicReadRaw answered 0x%X, not %u",
+                 (uint32_t)ret, 32 * 4);
+        return false;
+    }
+    if (ram[ea] != (uint8_t)(block[0] >> 8) ||
+        ram[ea + 1] != (uint8_t)block[0] ||
+        ram[ea + 2] != (uint8_t)(block[1] >> 8) ||
+        ram[ea + 3] != (uint8_t)block[1]) {
+        snprintf(why, why_len, "the raw read gave %02X %02X %02X %02X, not "
+                 "the big-endian ramp", ram[ea], ram[ea + 1], ram[ea + 2],
+                 ram[ea + 3]);
+        return false;
+    }
+
+    /* The ring is drained: a second read has nothing to give. */
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_READ_RAW, &ret) ||
+        ret != 0) {
+        snprintf(why, why_len, "an empty ring answered 0x%X", (uint32_t)ret);
+        return false;
+    }
+
+    env.gpr[3] = 0;
+    env.gpr[4] = ea + 0x40;
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_GET_FORMAT_RAW,
+                     &ret) || ret) {
+        snprintf(why, why_len, "cellMicGetFormatRaw answered 0x%X",
+                 (uint32_t)ret);
+        return false;
+    }
+    if (ram[ea + 0x40] != 2 || ram[ea + 0x41] != 2 || ram[ea + 0x42] != 16 ||
+        ram[ea + 0x43] != 1 || ps3_be32(ram + ea + 0x44) != s->mic_rate) {
+        snprintf(why, why_len, "the raw format is %u ch/%u B/%u bit/%u BE/%u "
+                 "Hz, not 2/2/16/1/%u", ram[ea + 0x40], ram[ea + 0x41],
+                 ram[ea + 0x42], ram[ea + 0x43], ps3_be32(ram + ea + 0x44),
+                 s->mic_rate);
+        return false;
+    }
+
+    env.gpr[3] = 0;
+    env.gpr[4] = CELLMIC_SIGSTATE_MICENG;
+    env.gpr[5] = ea + 0x60;
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_GET_SIGNAL_STATE,
+                     &ret) || ret) {
+        snprintf(why, why_len, "cellMicGetSignalState answered 0x%X",
+                 (uint32_t)ret);
+        return false;
+    }
+    level.u = ps3_be32(ram + ea + 0x60);
+    if (!(level.f >= 40.0f && level.f <= 90.0f)) {
+        snprintf(why, why_len, "the microphone level is %f dB, outside "
+                 "40..90", level.f);
+        return false;
+    }
+
+    /* A read after the close is the library's NOT_OPEN. */
+    env.gpr[3] = 0;
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_CLOSE, &ret) || ret) {
+        snprintf(why, why_len, "cellMicClose answered 0x%X", (uint32_t)ret);
+        return false;
+    }
+    env.gpr[4] = ea;
+    env.gpr[5] = 0x40;
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_READ_RAW, &ret) ||
+        ret != CELL_MICIN_ERROR_NOT_OPEN) {
+        snprintf(why, why_len, "a read after close answered 0x%X, not "
+                 "NOT_OPEN", (uint32_t)ret);
+        return false;
+    }
+
+    env.gpr[3] = 0;
+    if (!ps3_lv2_mic(s, &env, ram, ram_size, PS3_NID_MIC_END, &ret) || ret) {
+        snprintf(why, why_len, "cellMicEnd answered 0x%X", (uint32_t)ret);
+        return false;
+    }
+
+    memset(ram + ea, 0, 0x100);
+    s->mic_init = false;
+    s->mic_used = 0;
+
+    info_report("ps3-ppu: microphone selftest ok: init/open/start/read/format/"
+                "level/close on a %u Hz stereo ring", s->mic_rate);
+
+    /*
+     * And once with the real input, so "the voice opened" is not mistaken for
+     * "samples arrive".  It opens once the machine is running, then the tick
+     * pulls from it for 300 ms and the callback reports the count.
+     */
+    s->mic_capture_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       ps3_mic_capture_open, s);
+    timer_mod(s->mic_capture_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000000);
+
+    return true;
 }
 
 static bool ps3_lv2_video_out(PS3BootROMState *s, CPUPPCState *env,
@@ -4756,6 +6860,271 @@ static void ps3_rsxaudio_tick(void *opaque)
     }
 }
 
+/*
+ * The syscon EEPROM.  RPCS3's ps3_syscon is the reference for the layout: only
+ * the recover byte has meaning, everything else reads 0xFF until the guest
+ * writes it, and 0x48C07 is the state of the machine rather than a stored byte.
+ * emer_init reads it through sys_ss_update_manager(0x600B).
+ */
+#define PS3_SYSCON_RECOVER_OFFSET   0x48C07u
+
+static uint8_t ps3_syscon_read(PS3BootROMState *s, uint32_t off)
+{
+    int i;
+
+    if (off == PS3_SYSCON_RECOVER_OFFSET) {
+        return s->syscon_recover ? 0x00 : 0xFF;
+    }
+    for (i = 0; i < s->syscon_ee_n; i++) {
+        if (s->syscon_ee[i].off == off) {
+            return s->syscon_ee[i].val;
+        }
+    }
+    return 0xFF;
+}
+
+static void ps3_syscon_write(PS3BootROMState *s, uint32_t off, uint8_t val)
+{
+    int i;
+
+    if (off == PS3_SYSCON_RECOVER_OFFSET) {
+        s->syscon_recover = val != 0xFF;
+        return;
+    }
+    for (i = 0; i < s->syscon_ee_n; i++) {
+        if (s->syscon_ee[i].off == off) {
+            s->syscon_ee[i].val = val;
+            return;
+        }
+    }
+    if (s->syscon_ee_n < ARRAY_SIZE(s->syscon_ee)) {
+        s->syscon_ee[s->syscon_ee_n].off = off;
+        s->syscon_ee[s->syscon_ee_n].val = val;
+        s->syscon_ee_n++;
+    }
+}
+
+/*
+ * The RSX front end.
+ *
+ * The console's graphics library (cellGcmSys.sprx) is real code: it does not
+ * call a modelled cellGcmInit, it asks lv2 for the device through sys_rsx and
+ * then writes methods into a FIFO in RSX local memory.  So the lv2 side is
+ * where the RSX has to exist.  The syscall semantics and the display-buffer
+ * attribute numbers here follow RPCS3's sys_rsx, which is the only public
+ * description of them:
+ *
+ *   0x001 FIFO get/put      0x102 flip        0x103 queued buffer id
+ *   0x104 display buffer    0x600 fb setup    0x601 fb blit
+ *
+ * Local memory is a real 256 MiB RAM region at PS3_RSX_LOCAL_BASE, so the
+ * display buffers cellGcmSetDisplayBuffer names are readable by the scanout.
+ * The FIFO path decodes packets and advances get; the method handlers behind
+ * it (surfaces, clear, blit, draws) are the part of RPCS3's RSX that is still
+ * missing - there is no shader pipeline or DCP here.
+ */
+#define PS3_RSX_LOCAL_BASE  0x40000000u
+#define PS3_RSX_LOCAL_SIZE  0x10000000u
+#define PS3_RSX_CONTEXT_ID  0x55555555u
+
+static void ps3_rsx_fifo(PS3BootROMState *s)
+{
+    uint8_t *local;
+    uint32_t get = s->rsx_get;
+    unsigned steps = 0;
+
+    if (!s->rsx_ready || s->rsx_put == get) {
+        return;
+    }
+    local = memory_region_get_ram_ptr(&s->rsx_local);
+
+    while (get != s->rsx_put && steps++ < 8192) {
+        uint32_t w = ps3_be32(local + (get & (PS3_RSX_LOCAL_SIZE - 1)));
+        unsigned count, method;
+
+        if ((w & 3) == 1) {                 /* jump packet */
+            get = w & ~3u;
+            continue;
+        }
+        count = (w >> 18) & 0x7FF;
+        method = (w >> 2) & 0x1FFF;
+        if (s->ppu_trace && s->rsx_methods_logged < 24) {
+            info_report("ps3-rsx: method 0x%X x%u at 0x%X", method, count,
+                        get);
+            s->rsx_methods_logged++;
+        }
+        get += 4 + count * 4;
+    }
+
+    /* The consumer runs behind the producer; a stalled FIFO would wedge GCM. */
+    s->rsx_get = s->rsx_put;
+}
+
+static void ps3_rsx_flip(PS3BootROMState *s, unsigned id)
+{
+    if (id >= ARRAY_SIZE(s->rsx_db_w) || !s->rsx_db_w[id]) {
+        return;
+    }
+
+    info_report("ps3-rsx: flip buffer %u: 0x%X, %ux%u, pitch 0x%X", id,
+                s->rsx_db_offset[id], s->rsx_db_w[id], s->rsx_db_h[id],
+                s->rsx_db_pitch[id]);
+    ps3_vga_guest_scanout(PS3_RSX_LOCAL_BASE + s->rsx_db_offset[id],
+                          s->rsx_db_w[id], s->rsx_db_h[id],
+                          s->rsx_db_pitch[id]);
+}
+
+/*
+ * sys_rsx_context_attribute's package ids.  Anything not modelled is accepted
+ * with success: the library treats a failure here as a broken RSX, not as an
+ * optional feature.
+ */
+static bool ps3_lv2_rsx(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
+                        uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
+                        uint32_t a3, uint32_t a4, uint32_t a5, int32_t *ret)
+{
+    switch (nr) {
+    case 0x29A:                 /* sys_rsx_device_open */
+    case 0x29B:                 /* sys_rsx_device_close */
+    case 0x29D:                 /* sys_rsx_memory_free(handle) */
+    case 0x29F:                 /* sys_rsx_context_free(context) */
+    case 0x2A1:                 /* sys_rsx_context_iounmap(...) */
+    case 0x2A4:                 /* sys_rsx_device_unmap(dev) */
+    case 0x2A5:                 /* sys_rsx_attribute(...) */
+        *ret = 0;
+        return true;
+    case 0x29C: {               /* memory_allocate(handle*, addr*, size, ..) */
+        if ((uint64_t)a0 + 4 > ram_size || (uint64_t)a1 + 4 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        /* One region, the whole 256 MiB of local memory, at the console's
+         * local base.  cellGcmInit's io address is handed out by the library
+         * from this. */
+        ps3_put_be32(ram + a0, 1);              /* mem handle */
+        ps3_put_be32(ram + a1, PS3_RSX_LOCAL_BASE);
+        info_report("ps3-rsx: local memory 0x%X bytes at 0x%X (handle 1)",
+                    0x0F000000, PS3_RSX_LOCAL_BASE);
+        *ret = 0;
+        return true;
+    }
+    case 0x29E: {               /* context_allocate(ctx*, dma*, drv*,
+                                 * reports*, mem_handle, system_mode) */
+        uint32_t base;
+
+        if ((uint64_t)a0 + 4 > ram_size || (uint64_t)a1 + 4 > ram_size ||
+            (uint64_t)a2 + 4 > ram_size || (uint64_t)a3 + 4 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        /*
+         * lv2 hands the library three areas it keeps for the lifetime of the
+         * context: the DMA control block, the driver info (put/get live here)
+         * and the report area.  They come out of the same heap as everything
+         * else lv2 allocates, 4 KiB apart, rather than being fixed addresses
+         * the guest might already be using.
+         */
+        base = (s->lv2_heap + 0xFFFu) & ~0xFFFu;
+        if ((uint64_t)base + 0x4000 > ram_size) {
+            *ret = PS3_LV2_ENOMEM;
+            return true;
+        }
+        s->lv2_heap = base + 0x3000;
+        ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
+        ps3_put_be32(ram + a0, PS3_RSX_CONTEXT_ID);
+        s->rsx_context = PS3_RSX_CONTEXT_ID;
+        ps3_put_be32(ram + a1, base);
+        ps3_put_be32(ram + a2, base + 0x1000);
+        ps3_put_be32(ram + a3, base + 0x2000);
+        info_report("ps3-rsx: context 0x%X: dma 0x%X, driver info 0x%X, "
+                    "reports 0x%X", PS3_RSX_CONTEXT_ID, base, base + 0x1000,
+                    base + 0x2000);
+        *ret = 0;
+        return true;
+    }
+    case 0x2A0:                 /* context_iomap(ctx, io, ea, size, flags) */
+        info_report("ps3-rsx: iomap ctx 0x%X: io 0x%X <- ea 0x%X, 0x%X bytes",
+                    a0, a1, a2, a3);
+        *ret = 0;
+        return true;
+    case 0x2A2: {               /* context_attribute(ctx, package, a3..a6) */
+        if (a0 != PS3_RSX_CONTEXT_ID) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+        switch (a1) {
+        case 0x001:             /* FIFO: get, put */
+            s->rsx_get = a2;
+            s->rsx_put = a3;
+            ps3_rsx_fifo(s);
+            break;
+        case 0x102: {           /* flip: head, buffer */
+            unsigned id;
+
+            if (a3 & 0x80000000u) {
+                id = a3 & 0xFu;
+                if (id > 7) {
+                    id = s->rsx_db_last_queued;
+                }
+            } else {
+                unsigned i;
+
+                id = s->rsx_db_last_queued;
+                for (i = 0; i < ARRAY_SIZE(s->rsx_db_offset); i++) {
+                    if (s->rsx_db_offset[i] == a3) {
+                        id = i;
+                    }
+                }
+            }
+            if (s->ppu_trace) {
+                info_report("ps3-rsx: flip head %u buffer 0x%X -> %u",
+                            a2, a3, id);
+            }
+            ps3_rsx_flip(s, id);
+            break;
+        }
+        case 0x103:             /* display queue */
+            s->rsx_db_last_queued = a3;
+            break;
+        case 0x104: {           /* display buffer: id, h<<32|w, p<<32|off */
+            unsigned id = a2 & 0xFFu;
+
+            if (id < ARRAY_SIZE(s->rsx_db_w)) {
+                s->rsx_db_w[id] = (a3 >> 32) & 0xFFFFFFFFu;
+                s->rsx_db_h[id] = a3 & 0xFFFFFFFFu;
+                s->rsx_db_pitch[id] = (a4 >> 32) & 0xFFFFFFFFu;
+                s->rsx_db_offset[id] = a4 & 0xFFFFFFFFu;
+                info_report("ps3-rsx: display buffer %u: %ux%u, pitch 0x%X, "
+                            "offset 0x%X", id, s->rsx_db_w[id],
+                            s->rsx_db_h[id], s->rsx_db_pitch[id],
+                            s->rsx_db_offset[id]);
+            }
+            break;
+        }
+        default:
+            if (s->ppu_trace) {
+                info_report("ps3-rsx: attribute ctx 0x%X package 0x%X "
+                            "(0x%X, 0x%X, 0x%X)", a0, a1, a2, a3, a4);
+            }
+            break;
+        }
+        *ret = 0;
+        return true;
+    }
+    case 0x2A3:                 /* device_map(dev_addr*, unused*, dev_id) */
+        if ((uint64_t)a0 + 4 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        /* The RSX register window: the same local base the library maps. */
+        ps3_put_be32(ram + a0, PS3_RSX_LOCAL_BASE);
+        *ret = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void ps3_lv2_service(PS3BootROMState *s)
 {
     CPUState *cs = qemu_get_cpu(0);
@@ -4787,10 +7156,16 @@ static void ps3_lv2_service(PS3BootROMState *s)
         goto publish;
     }
 
+    /* The RSX: device, local memory, context, FIFO and display. */
+    if (ps3_lv2_rsx(s, ram, ram_size, nr, a0, a1, a2, a3, a4, a5, &ret)) {
+        goto publish;
+    }
+
     if (s->ppu_trace) {
         info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64
-                    ", pc=0x%" PRIX64 ")", nr, (uint64_t)cpu->env.lr,
-                    (uint64_t)cpu->env.nip);
+                    ", pc=0x%" PRIX64 ", thr=%d)", nr,
+                    (uint64_t)cpu->env.lr, (uint64_t)cpu->env.nip,
+                    s->thr_cur);
     }
 
     switch (nr) {
@@ -4823,13 +7198,497 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ps3_put_be32(ram + a0 + 0x0C, 0x00000014);
         ret = 0;
         break;
+    /*
+     * The event service, for real.  This is the handshake between the VSH's
+     * main thread and its service workers: each worker owns a queue, blocks
+     * in sys_event_queue_receive on it, and the main thread hands it work
+     * through that queue's port.  Answering the receive with ENOSYS instead
+     * put the workers in a permanent error spin and left the main thread
+     * spinning on the mutex around the very list they were meant to fill.
+     */
+    case 0x080: {               /* sys_event_queue_create(id*, attr*, key,
+                                 * size) */
+        unsigned j;
+        int idx = -1;
+
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (j = 0; j < PS3_EQ_MAX; j++) {
+            if (!s->eq[j].used) {
+                idx = j;
+                break;
+            }
+        }
+        if (idx < 0) {
+            ret = PS3_LV2_EAGAIN;
+            break;
+        }
+        memset(&s->eq[idx], 0, sizeof(s->eq[idx]));
+        s->eq[idx].used = true;
+        s->eq[idx].id = ++s->lv2_next_id;
+        s->eq[idx].key = a2;
+        s->eq[idx].size = a3;
+        ps3_put_be32(ram + a0, s->eq[idx].id);
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: event queue 0x%X created (key 0x%X, "
+                        "%u bytes)", s->eq[idx].id, (uint32_t)a2, a3);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x081: {               /* sys_event_queue_destroy(eq, mode) */
+        int q = ps3_eq_index(s, a0);
+        unsigned j;
+
+        if (q < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        for (j = 0; j < PS3_THREAD_MAX; j++) {
+            if (s->thr[j].used && s->thr[j].parked &&
+                s->thr[j].wait_eq == q) {
+                ps3_thread_finish_call(&s->thr[j], ram, ram_size,
+                                       PS3_LV2_ESRCH);
+            }
+        }
+        for (j = 0; j < PS3_EP_MAX; j++) {
+            if (s->ep[j].used && s->ep[j].eq == q) {
+                s->ep[j].eq = -1;
+            }
+        }
+        memset(&s->eq[q], 0, sizeof(s->eq[q]));
+        ret = 0;
+        break;
+    }
+    case 0x082: {               /* sys_event_queue_receive(eq, event*,
+                                 * timeout_us) */
+        int q = ps3_eq_index(s, a0);
+        PS3Event ev;
+
+        if (q < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (ps3_eq_pop(&s->eq[q], &ev)) {
+            ps3_event_store(ram, ram_size, a1, &ev);
+            cpu->env.gpr[4] = ev.source;
+            cpu->env.gpr[5] = ev.data1;
+            cpu->env.gpr[6] = ev.data2;
+            cpu->env.gpr[7] = ev.data3;
+            ret = 0;
+            break;
+        }
+        ps3_eq_park(s, q, a1, a2);
+        ret = 0;
+        break;
+    }
+    case 0x083: {               /* sys_event_queue_tryreceive(eq, event*,
+                                 * count, number*) */
+        int q = ps3_eq_index(s, a0);
+        PS3Event ev;
+        uint32_t n = 0;
+
+        if (q < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (ps3_eq_pop(&s->eq[q], &ev)) {
+            ps3_event_store(ram, ram_size, a1, &ev);
+            n = 1;
+        }
+        if (a3 && (uint64_t)a3 + 4 <= ram_size) {
+            ps3_put_be32(ram + a3, n);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x085: {               /* sys_event_queue_drain(eq) */
+        int q = ps3_eq_index(s, a0);
+
+        if (q < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        s->eq[q].head = 0;
+        s->eq[q].count = 0;
+        ret = 0;
+        break;
+    }
+    case 0x086: {               /* sys_event_port_create(id*, type, name) */
+        unsigned j;
+        int idx = -1;
+
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (j = 0; j < PS3_EP_MAX; j++) {
+            if (!s->ep[j].used) {
+                idx = j;
+                break;
+            }
+        }
+        if (idx < 0) {
+            ret = PS3_LV2_EAGAIN;
+            break;
+        }
+        memset(&s->ep[idx], 0, sizeof(s->ep[idx]));
+        s->ep[idx].used = true;
+        s->ep[idx].id = ++s->lv2_next_id;
+        s->ep[idx].eq = -1;
+        s->ep[idx].name = a2;
+        ps3_put_be32(ram + a0, s->ep[idx].id);
+        ret = 0;
+        break;
+    }
+    case 0x087: {               /* sys_event_port_destroy(port) */
+        int p = ps3_ep_index(s, a0);
+
+        if (p < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        memset(&s->ep[p], 0, sizeof(s->ep[p]));
+        ret = 0;
+        break;
+    }
+    case 0x088: {               /* sys_event_port_connect_local(port, eq) */
+        int p = ps3_ep_index(s, a0);
+        int q = ps3_eq_index(s, a1);
+
+        if (p < 0 || q < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        s->ep[p].eq = q;
+        ret = 0;
+        break;
+    }
+    case 0x08C: {               /* sys_event_port_connect_ipc(port, key) */
+        int p = ps3_ep_index(s, a0);
+        unsigned j;
+
+        if (p < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        /* A queue of that name is the sending end; otherwise the peer is in
+         * another process, which this model does not have. */
+        for (j = 0; j < PS3_EQ_MAX; j++) {
+            if (s->eq[j].used && s->eq[j].key == a1) {
+                s->ep[p].eq = j;
+                break;
+            }
+        }
+        ret = 0;
+        break;
+    }
+    case 0x089: {               /* sys_event_port_disconnect(port) */
+        int p = ps3_ep_index(s, a0);
+
+        if (p < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        s->ep[p].eq = -1;
+        ret = 0;
+        break;
+    }
+    case 0x08A: {               /* sys_event_port_send(port, d1, d2, d3) */
+        int p = ps3_ep_index(s, a0);
+        PS3Event ev;
+        int q;
+
+        if (p < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        q = s->ep[p].eq;
+        if (q < 0) {
+            ret = PS3_LV2_ENOTCONN;
+            break;
+        }
+        ev.source = s->ep[p].name;
+        ev.data1 = a1;
+        ev.data2 = a2;
+        ev.data3 = a3;
+        ps3_eq_push(&s->eq[q], &ev);
+        if (!ps3_eq_wake(s, ram, ram_size, q) && s->ppu_trace) {
+            info_report("ps3-ppu: lv2: event queued on 0x%X (no taker yet)",
+                        s->eq[q].id);
+        }
+        ret = 0;
+        break;
+    }
+    /*
+     * Mutexes and conditions, with real blocking.  The VSH's thread pool is
+     * built on them: its workers park in sys_cond_wait and the thread that
+     * has work signals them.  Answering every wait with 0 turned the pool
+     * into a spin - thousands of calls a second, and nothing ever ran.
+     */
+    case 0x064: {               /* sys_mutex_create(id*, attr*) */
+        unsigned j;
+        int m = -1;
+
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (j = 0; j < PS3_MUTEX_MAX; j++) {
+            if (!s->mtx[j].used) {
+                m = j;
+                break;
+            }
+        }
+        if (m < 0) {
+            ret = PS3_LV2_EAGAIN;
+            break;
+        }
+        s->mtx[m].used = true;
+        s->mtx[m].id = ++s->lv2_next_id;
+        s->mtx[m].owner = 0;
+        ps3_put_be32(ram + a0, s->mtx[m].id);
+        ret = 0;
+        break;
+    }
+    case 0x065: {               /* sys_mutex_destroy(id) */
+        int m = ps3_mutex_index(s, a0);
+        unsigned j;
+
+        if (m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        for (j = 0; j < PS3_THREAD_MAX; j++) {
+            if (s->thr[j].used && s->thr[j].parked &&
+                s->thr[j].wait_mutex_id == a0) {
+                ps3_thread_finish_call(&s->thr[j], ram, ram_size,
+                                       PS3_LV2_ESRCH);
+            }
+        }
+        memset(&s->mtx[m], 0, sizeof(s->mtx[m]));
+        ret = 0;
+        break;
+    }
+    case 0x066:                 /* sys_mutex_lock(id, timeout) */
+    case 0x067: {               /* sys_mutex_trylock(id) */
+        int m = ps3_mutex_index(s, a0);
+        uint32_t tid = s->thr_cur >= 0 ? s->thr[s->thr_cur].id : 1;
+
+        if (m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!s->mtx[m].owner || s->mtx[m].owner == tid) {
+            s->mtx[m].owner = tid;
+            ret = 0;
+            break;
+        }
+        if (nr == 0x067) {
+            ret = PS3_LV2_EAGAIN;
+            break;
+        }
+        if (s->thr_cur >= 0) {
+            s->thr[s->thr_cur].wait_mutex_id = s->mtx[m].id;
+            ps3_sync_park(s, a1);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x068: {               /* sys_mutex_unlock(id) */
+        int m = ps3_mutex_index(s, a0);
+
+        if (m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        s->mtx[m].owner = 0;
+        ps3_mutex_handoff(s, ram, ram_size, m);
+        ret = 0;
+        break;
+    }
+    case 0x069: {               /* sys_cond_create(id*, mutex_id, attr*) */
+        unsigned j;
+        int c = -1;
+
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (j = 0; j < PS3_COND_MAX; j++) {
+            if (!s->cond[j].used) {
+                c = j;
+                break;
+            }
+        }
+        if (c < 0) {
+            ret = PS3_LV2_EAGAIN;
+            break;
+        }
+        s->cond[c].used = true;
+        s->cond[c].id = ++s->lv2_next_id;
+        s->cond[c].mutex = a1;
+        ps3_put_be32(ram + a0, s->cond[c].id);
+        ret = 0;
+        break;
+    }
+    case 0x06A: {               /* sys_cond_destroy(id) */
+        int c = ps3_cond_index(s, a0);
+
+        if (c < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ps3_cond_wake(s, ram, ram_size, c, true);
+        memset(&s->cond[c], 0, sizeof(s->cond[c]));
+        ret = 0;
+        break;
+    }
+    case 0x06B: {               /* sys_cond_wait(cond, mutex, timeout) */
+        int c = ps3_cond_index(s, a0);
+        int m = ps3_mutex_index(s, a1);
+
+        if (c < 0 || m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        /* lv2 releases the mutex as part of the wait. */
+        s->mtx[m].owner = 0;
+        ps3_mutex_handoff(s, ram, ram_size, m);
+        if (s->thr_cur >= 0) {
+            s->thr[s->thr_cur].wait_cond_id = s->cond[c].id;
+            ps3_sync_park(s, a2);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x06C:                 /* sys_cond_signal(cond) */
+    case 0x06D:                 /* sys_cond_signal_all(cond) */
+    case 0x06E: {               /* sys_cond_signal_to(cond, thread) */
+        int c = ps3_cond_index(s, a0);
+
+        if (c < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ps3_cond_wake(s, ram, ram_size, c, nr != 0x06C);
+        ret = 0;
+        break;
+    }
+    /*
+     * Semaphores: the VSH's shutdown worker sleeps on one with a zero count,
+     * so a wait that never blocks is a thread spinning for the whole run.
+     */
+    case 0x05A: {               /* sys_semaphore_create(id*, attr*,
+                                 * count, max) */
+        unsigned j;
+        int m = -1;
+
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (j = 0; j < PS3_SEM_MAX; j++) {
+            if (!s->sem[j].used) {
+                m = j;
+                break;
+            }
+        }
+        if (m < 0) {
+            ret = PS3_LV2_EAGAIN;
+            break;
+        }
+        s->sem[m].used = true;
+        s->sem[m].id = ++s->lv2_next_id;
+        s->sem[m].count = (int32_t)a2;
+        s->sem[m].max = a3 ? (int32_t)a3 : 0x7FFFFFFF;
+        ps3_put_be32(ram + a0, s->sem[m].id);
+        ret = 0;
+        break;
+    }
+    case 0x05B: {               /* sys_semaphore_destroy(id) */
+        int m = ps3_sem_index(s, a0);
+        unsigned j;
+
+        if (m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        for (j = 0; j < PS3_THREAD_MAX; j++) {
+            if (s->thr[j].used && s->thr[j].parked &&
+                s->thr[j].wait_sem_id == a0) {
+                ps3_thread_finish_call(&s->thr[j], ram, ram_size,
+                                       PS3_LV2_ESRCH);
+            }
+        }
+        memset(&s->sem[m], 0, sizeof(s->sem[m]));
+        ret = 0;
+        break;
+    }
+    case 0x05C: {               /* sys_semaphore_wait(id, timeout) */
+        int m = ps3_sem_index(s, a0);
+
+        if (m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (s->sem[m].count > 0) {
+            s->sem[m].count--;
+            ret = 0;
+            break;
+        }
+        if (s->thr_cur >= 0) {
+            s->thr[s->thr_cur].wait_sem_id = s->sem[m].id;
+            ps3_sync_park(s, a1);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x05D: {               /* sys_semaphore_post(id, count) */
+        int m = ps3_sem_index(s, a0);
+        int32_t n = a1 ? (int32_t)a1 : 1;
+
+        if (m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        s->sem[m].count = MIN(s->sem[m].count + n, s->sem[m].max);
+        while (s->sem[m].count > 0 && s->sem[m].id) {
+            unsigned before = 0;
+            unsigned j;
+
+            for (j = 0; j < PS3_THREAD_MAX; j++) {
+                if (s->thr[j].used && s->thr[j].parked &&
+                    s->thr[j].wait_sem_id == s->sem[m].id) {
+                    ps3_sem_handoff(s, ram, ram_size, m);
+                    before = 1;
+                    break;
+                }
+            }
+            if (!before) {
+                break;
+            }
+        }
+        ret = 0;
+        break;
+    }
+    case 0x05E: {               /* sys_semaphore_get_value(id, value*) */
+        int m = ps3_sem_index(s, a0);
+
+        if (m < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, (uint32_t)s->sem[m].count);
+        }
+        ret = 0;
+        break;
+    }
     case 0x078:                 /* sys_rwlock_create(id*, attr*) */
-    case 0x080:                 /* sys_event_queue_create(id*, attr*, key, size) */
-    case 0x05A:                 /* sys_semaphore_create(id*, attr*, ...) */
     case 0x05F:                 /* _sys_lwmutex_create(id*, ...) */
-    case 0x064:                 /* sys_mutex_create(id*, attr*) */
-    case 0x069:                 /* sys_cond_create(id*, mutex_id, attr*) */
-    case 0x086:                 /* sys_event_port_create(id*, type, name) */
         if ((uint64_t)a0 + 4 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
@@ -4838,17 +7697,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     case 0x060: case 0x061: case 0x062: case 0x063:     /* lwmutex */
-    case 0x065: case 0x066: case 0x067: case 0x068:     /* mutex */
-    case 0x06A: case 0x06B: case 0x06C: case 0x06D: case 0x06E: /* cond */
-    case 0x05B: case 0x05C: case 0x05D: case 0x05E:     /* semaphore */
     case 0x079:                 /* sys_rwlock_destroy */
-    case 0x081:                 /* sys_event_queue_destroy */
-    case 0x085:                 /* sys_event_queue_drain */
-    case 0x087:                 /* sys_event_port_destroy */
-    case 0x088:                 /* sys_event_port_connect_local */
-    case 0x089:                 /* sys_event_port_disconnect */
-    case 0x08A:                 /* sys_event_port_send */
-    case 0x08C:                 /* sys_event_port_connect_ipc */
         ret = 0;
         break;
     case 0x144:                 /* sys_memory_container_create(id*, size) */
@@ -4888,6 +7737,75 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
+    /*
+     * The mapper: the RSX memory the VSH maps in is the same flat RAM here,
+     * so an address only has to be handed out, 1 MiB aligned as lv2 requires,
+     * and the map/unmap calls simply succeed.  This is the range the library
+     * keeps its mapped surfaces in, so it starts above the guest's own heap.
+     */
+#define PS3_LV2_MMAP_BASE   0x10000000u
+#define PS3_LV2_MMAP_ALIGN  0x00001000u
+    case 0x146:                 /* sys_mmapper_allocate_fixed_address */
+    case 0x147:                 /* sys_mmapper_enable_page_fault_notification */
+    case 0x149:                 /* sys_mmapper_free_shared_memory(id) */
+    case 0x14D:                 /* sys_mmapper_set_shared_memory_flag */
+    case 0x14E:                 /* sys_mmapper_map_shared_memory(addr,id,f) */
+    case 0x14F:                 /* sys_mmapper_unmap_shared_memory(addr) */
+    case 0x150:                 /* sys_mmapper_change_address_access_right */
+    case 0x17E:                 /* sys_sm_initialize */
+        ret = 0;
+        break;
+    case 0x14A:                 /* sys_mmapper_allocate_address(size, flags,
+                                 * alignment, u32 *addr) */
+    case 0x151: {               /* sys_mmapper_search_and_map(size, flags,
+                                 * alignment, u32 *addr) */
+        uint64_t size = ((uint64_t)a0 + PS3_LV2_MMAP_ALIGN - 1) &
+                        ~(uint64_t)(PS3_LV2_MMAP_ALIGN - 1);
+        uint32_t addr;
+
+        if (!size || size > ram_size) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if ((uint64_t)a3 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (!s->lv2_mmap_next) {
+            s->lv2_mmap_next = PS3_LV2_MMAP_BASE;
+        }
+        if ((uint64_t)s->lv2_mmap_next + size > ram_size) {
+            s->lv2_mmap_next = PS3_LV2_MMAP_BASE;
+        }
+        addr = s->lv2_mmap_next;
+        s->lv2_mmap_next = (addr + size + PS3_LV2_MMAP_ALIGN - 1) &
+                           ~(PS3_LV2_MMAP_ALIGN - 1);
+        ps3_put_be32(ram + a3, addr);
+        info_report("ps3-ppu: lv2: mmapper %s: 0x%" PRIX64 " at 0x%X",
+                    nr == 0x14A ? "address" : "search_and_map", size, addr);
+        ret = 0;
+        break;
+    }
+    case 0x14B:                 /* sys_mmapper_free_address(addr) */
+        ret = 0;
+        break;
+    case 0x14C:                 /* sys_mmapper_allocate_shared_memory(key, size,
+                                 * flags, u32 *mem_id) */
+    case 0x153: {               /* sys_mmapper_allocate_shared_memory_ext */
+        if ((uint64_t)a3 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a3, ++s->lv2_next_id);
+        ret = 0;
+        break;
+    }
+    case 0x369:                 /* sys_ss_get_cache_of_product_mode(u8*) */
+        if (a0 && (uint64_t)a0 + 1 <= ram_size) {
+            ram[a0] = 0;        /* 0 = CEX, the retail product mode */
+        }
+        ret = 0;
+        break;
     case PS3_LV2_MISSING_CALL: {  /* an import with no provider */
         /*
          * The trap returns into the stub, so lr is the word after its sc and
@@ -4903,6 +7821,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         }
         /* The AV layer: this is how the VSH reads the sink and picks a mode. */
         if (ps3_lv2_video_out(s, &cpu->env, ram, ram_size, nid, &ret)) {
+            break;
+        }
+        /* The GCM display path: buffers and flips land on the same scanout. */
+        if (ps3_lv2_gcm(s, &cpu->env, ram, ram_size, nid, &ret)) {
+            break;
+        }
+        /* The microphone: cellMic over the host's capture input. */
+        if (ps3_lv2_mic(s, &cpu->env, ram, ram_size, nid, &ret)) {
             break;
         }
 
@@ -4979,12 +7905,104 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = -1;
         break;
     }
+    case 0x077:                 /* sys_time_get_rtc(u64 *rtc) */
+        if ((uint64_t)a0 + 8 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        /* Host wall clock, in the microseconds lv2's RTC counts. */
+        ps3_put_be64(ram + a0,
+                     (uint64_t)g_get_real_time() / 1000ULL + 0x20000ULL);
+        ret = 0;
+        break;
+    case 0x08F:                 /* sys_time_set_timezone(id) */
+        ret = 0;
+        break;
+    case 0x15F: {               /* sys_memory_get_page_attribute(addr, attr*) */
+        if (!a1 || (uint64_t)a1 + 0x40 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        /* ScePageInfo: 64 KiB pages, read/write/execute, no flag set. */
+        memset(ram + a1, 0, 0x40);
+        ps3_put_be32(ram + a1, 0x00010000);
+        ps3_put_be32(ram + a1 + 0x04, 0x00000007);
+        ret = 0;
+        break;
+    }
+    case 0x050:                 /* sys_interrupt_tag_create */
+    case 0x051:                 /* sys_interrupt_tag_destroy */
+    case 0x053:                 /* sys_event_flag_destroy(id) */
+    case 0x058:                 /* sys_interrupt_thread_eoi */
+    case 0x059:                 /* _sys_interrupt_thread_disestablish */
+    case 0x16F:                 /* sys_uart_initialize */
+        ret = 0;
+        break;
+    case 0x052:                 /* sys_event_flag_create(id*, attr*, init) */
+    case 0x054:                 /* _sys_interrupt_thread_establish(tid*, tag,
+                                 * handler, arg) */
+        if ((uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a0, ++s->lv2_next_id);
+        ret = 0;
+        break;
+    case 0x055:                 /* sys_event_flag_wait(id, bit, mode, res*,
+                                 * timeout) */
+    case 0x056:                 /* sys_event_flag_trywait */
+        /*
+         * There is no other thread to wait for a flag in this model, and a
+         * blocking wait cannot be modelled without one: the bits the caller
+         * asks for are reported set, which is what a service that publishes
+         * them would have done.
+         */
+        if (a3 && (uint64_t)a3 + 8 <= ram_size) {
+            ps3_put_be64(ram + a3, a1);
+        }
+        ret = 0;
+        break;
+    case 0x057:                 /* sys_event_flag_set(id, bit) */
+    case 0x170:                 /* sys_uart_receive(buf, size, mode) */
+        ret = 0;
+        break;
+    case 0x171: {               /* sys_uart_send(buf, size) */
+        uint32_t n;
+
+        if ((uint64_t)a0 + a1 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (n = 0; n < a1; n++) {
+            ps3_uart_putc(s, ram[a0 + n]);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x172:                 /* sys_uart_get_params(out) */
+        if (a0 && (uint64_t)a0 + 64 <= ram_size) {
+            memset(ram + a0, 0, 64);
+        }
+        ret = 0;
+        break;
     case 0x072:                 /* sys_semaphore_get_value(id, val*) */
         if ((uint64_t)a1 + 4 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
         }
         ps3_put_be32(ram + a1, 1);
+        ret = 0;
+        break;
+    case 0x17B:                 /* sys_sm_shutdown(action, ...) */
+        /*
+         * emer_init ends by asking the system manager to power the console
+         * down (0) or restart it (0x100) after writing the recover byte into
+         * the EEPROM.  The request is accepted and recorded; the model does
+         * not reset itself mid-run.
+         */
+        info_report("ps3-ppu: lv2: sys_sm_shutdown(0x%X) - the recovery "
+                    "program asks for a %s", a0,
+                    a0 ? "restart in recovery mode" : "power off");
         ret = 0;
         break;
     case 0x17C:                 /* sys_sm_get_params(a, b, c, d) */
@@ -5297,6 +8315,90 @@ static void ps3_lv2_service(PS3BootROMState *s)
                                  * size, flags, addr*) */
         ret = ps3_lv2_alloc(s, ram, ram_size, a1, a3);
         break;
+    case 0x18E: {               /* sys_console_write(buf) */
+        uint32_t at = a0;
+
+        if (at >= ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (; at < ram_size && ram[at]; at++) {
+            ps3_uart_putc(s, ram[at]);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x3DC:                 /* debug exception handler: nothing to install */
+        ret = 0;
+        break;
+    case 0x35F: {               /* sys_ss_update_manager(op, arg, size) */
+        /*
+         * 0x600B/0x600C are the system controller's EEPROM, not a buffer: the
+         * offset is the first argument and the value is the second.  Treating
+         * them as a buffer wrote zeroes at the offset and left the caller's
+         * byte untouched, so emer_init read a stale 0xFF as its recover flag,
+         * saw a console that was not in recovery and exited before drawing.
+         */
+        switch (a0) {
+        case 0x600B: {          /* read eeprom: offset, u8 *value */
+            uint32_t ptr = a2;
+
+            if (!ptr || (uint64_t)ptr + 1 > ram_size) {
+                ret = PS3_LV2_EFAULT;
+                break;
+            }
+            ram[ptr] = ps3_syscon_read(s, a1);
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: syscon: eeprom[0x%X] -> 0x%02X",
+                            a1, ram[ptr]);
+            }
+            ret = 0;
+            break;
+        }
+        case 0x600C:            /* write eeprom: offset, value */
+            ps3_syscon_write(s, a1, (uint8_t)a2);
+            ret = 0;
+            break;
+        case 0x6003:            /* get installed package info */
+        case 0x6011:            /* get applicable version */
+            if (a2 && (uint64_t)a2 + 8 <= ram_size) {
+                /* Firmware 3.01, in the 0xVVVRRRPP form RPCS3 writes. */
+                ps3_put_be64(ram + a2, 0x3001000000000000ULL);
+            }
+            ret = 0;
+            break;
+        default:
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: update_manager op 0x%X (0x%X, 0x%X)",
+                            a0, a1, a2);
+            }
+            ret = 0;
+            break;
+        }
+        break;
+    }
+    case 0x363: {               /* sys_ss_appliance_info_manager(op, arg, size) */
+        if (a1 && a2 && (uint64_t)a1 + a2 <= ram_size) {
+            memset(ram + a1, 0, a2);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x36A: {               /* sys_ss_get_cache_of_flash_ext_flag(u8 *flag) */
+        /*
+         * One byte, not a word: the caller's local is a byte, and a wider
+         * store overruns it.  0xFE with the LSB clear is a NOR machine, which
+         * is what this flash image is; emer_init reads the same byte back as
+         * its recover mode.
+         */
+        if (a0 >= ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ram[a0] = 0xFE;
+        ret = 0;
+        break;
+    }
     case 0x193: {               /* sys_tty_write(channel, buf, len, written) */
         uint32_t n;
 
@@ -5384,14 +8486,31 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EFAULT;
             break;
         }
-        entry = ps3_be64(ram + a1);
-        tls = ps3_be32(ram + a1 + 8);
+        /* sys_ppu_thread_param_t: the entry is a 32-bit OPD address and the
+         * TLS word sits right behind it.  Reading the pair as one 64-bit
+         * value put the TLS where the entry belongs, so the thread started on
+         * whatever the TLS page happened to contain. */
+        entry = ps3_be32(ram + a1);
+        tls = ps3_be32(ram + a1 + 4);
         {
             uint32_t tid = ps3_lv2_thread_created(s, ram, ram_size,
                                                   &cpu->env, entry, tls, a2,
                                                   a5, name);
 
             if (!tid) {
+                if (s->ppu_trace) {
+                    info_report("ps3-ppu: lv2: thread creation failed (entry "
+                                "descriptor 0x%X, stack 0x%X, heap 0x%X, "
+                                "param %08X %08X %08X %08X, opd %08X %08X)",
+                                entry, a5, s->lv2_heap,
+                                ps3_be32(ram + a1), ps3_be32(ram + a1 + 4),
+                                ps3_be32(ram + a1 + 8),
+                                ps3_be32(ram + a1 + 12),
+                                (uint32_t)entry + 8 <= ram_size ?
+                                    ps3_be32(ram + (uint32_t)entry) : 0,
+                                (uint32_t)entry + 8 <= ram_size ?
+                                    ps3_be32(ram + (uint32_t)entry + 4) : 0);
+                }
                 ret = -EAGAIN;
                 break;
             }
@@ -6055,7 +9174,17 @@ static void ps3_lv2_service(PS3BootROMState *s)
     }
 
 publish:
+    if (s->ppu_trace && ret) {
+        info_report("ps3-ppu: lv2 syscall 0x%X returned 0x%X (lr=0x%" PRIX64
+                    ")", nr, (uint32_t)ret, (uint64_t)cpu->env.lr);
+    }
     ps3_put_be32(ram + PS3_LV2_SCRATCH, (uint32_t)ret);
+    /*
+     * The exit flag belongs to this call alone: a stale one would park the
+     * next call the guest makes, whatever it is.
+     */
+    ps3_put_be32(ram + PS3_LV2_SCRATCH + 4, s->lv2_park ? 1 : 0);
+    s->lv2_park = false;
 }
 
 static void rs6000_ps3_lv2_page(MemoryRegion *sysmem, MemoryRegion *ram);
@@ -6577,6 +9706,19 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     PS3BootROMState *kbd_s = PS3_BOOT_ROM(dev);
     unsigned net_i;
 
+    /*
+     * The RSX's local memory: 256 MiB of real RAM at the console's local
+     * base, which is where cellGcmSetDisplayBuffer's offsets point and what
+     * the scanout reads when the guest flips.  It must be mapped before the
+     * guest runs, and nothing else may sit there.
+     */
+    memory_region_init_ram(&kbd_s->rsx_local, OBJECT(kbd_s), "ps3.rsx.local",
+                           PS3_RSX_LOCAL_SIZE, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), PS3_RSX_LOCAL_BASE,
+                                &kbd_s->rsx_local);
+    kbd_s->rsx_ready = true;
+    kbd_s->rsx_context = 0;
+
     /* No guest thread has been created yet; the first switch registers one. */
     kbd_s->thr_cur = -1;
 
@@ -6635,12 +9777,38 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     }
 
     /*
+     * The microphone path, once, when asked: the same reason the AES selftest
+     * exists - a ring or byte-order mistake here sounds like a guest bug.
+     */
+    if (s->mic_selftest) {
+        char why[160];
+
+        if (!ps3_mic_selftest(s, why, sizeof(why))) {
+            error_setg(errp, "ps3-boot-rom: microphone selftest failed: %s",
+                       why);
+            return;
+        }
+    }
+
+    /*
      * Describe the gamepad ports first: lv2 hands them to the VSH during its
      * startup, and the front LED starts out as the pretend "console is on"
      * green rather than dark.
      */
     if (!ps3_pad_defaults(s, errp)) {
         return;
+    }
+
+    /* The host's controller, whenever the display has one open. */
+    qemu_gamepad_set_handler(ps3_gamepad_event, s);
+
+    if (s->pad_selftest) {
+        char why[160];
+
+        if (!ps3_pad_selftest(s, why, sizeof(why))) {
+            error_setg(errp, "ps3-boot-rom: pad selftest failed: %s", why);
+            return;
+        }
     }
     if (!ps3_hdd_setup(s, errp)) {
         return;
@@ -6941,6 +10109,7 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
             g_free(s->vsh_self);
             s->vsh_self = g_strdup(s->emer_self);
             s->recovery = true;
+            s->syscon_recover = true;
             ps3_vga_printf("RECOVERY: %s",
                            chain_ok ? "NO VSH.SELF" : why);
         }
@@ -7293,11 +10462,28 @@ static void ps3_ppu_reset_entry(void *opaque)
          * enters it; the VSH uses both, and without MSR[FP] its first float
          * operation would take the 0x800 vector instead of running.
          */
+        uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+        uint64_t ram_size = memory_region_size(s->ram);
+        uint32_t argv = (uint32_t)ram_size - 0x400;
+        uint32_t str = (uint32_t)ram_size - 0x380;
+        const char *path = s->vsh_self ?: "";
+        size_t len = strlen(path);
+
         cpu->env.msr |= (1ULL << MSR_FP) | (1ULL << MSR_VR);
         cpu->env.gpr[2] = s->vsh_toc;
-        cpu->env.gpr[1] = memory_region_size(s->ram) - 0x100;
-        cpu->env.gpr[3] = 0;
-        cpu->env.gpr[4] = 0;
+        cpu->env.gpr[1] = ram_size - 0x100;
+
+        /* The process's argv block, which the reset path must not lose. */
+        if (len && (uint64_t)str + len + 1 <= ram_size) {
+            memcpy(ram + str, path, len + 1);
+            ps3_put_be32(ram + argv, str);
+            ps3_put_be32(ram + argv + 4, 0);
+            cpu->env.gpr[3] = 1;
+            cpu->env.gpr[4] = argv;
+        } else {
+            cpu->env.gpr[3] = 0;
+            cpu->env.gpr[4] = 0;
+        }
     }
 }
 
@@ -7347,21 +10533,39 @@ static void ps3_ppu_tick(void *opaque)
             info_report("ps3-ppu: %s at pc 0x%" PRIx64 " (srr0=0x%" PRIx64
                         ", srr1=0x%" PRIx64 ", lr=0x%" PRIx64
                         ", ctr=0x%" PRIx64 ", r3=0x%" PRIx64
-                        ", r4=0x%" PRIx64 ", r31=0x%" PRIx64 ")",
+                        ", r4=0x%" PRIx64 ", r31=0x%" PRIx64
+                        ", msr=0x%" PRIx64 ")",
                         vector, s->ppu_last_pc,
                         (uint64_t)cpu->env.spr[SPR_SRR0],
                         (uint64_t)cpu->env.spr[SPR_SRR1],
                         (uint64_t)cpu->env.lr, (uint64_t)cpu->env.ctr,
                         (uint64_t)cpu->env.gpr[3], (uint64_t)cpu->env.gpr[4],
-                        (uint64_t)cpu->env.gpr[31]);
+                        (uint64_t)cpu->env.gpr[31],
+                        (uint64_t)cpu->env.msr);
+            if (s->ppu_last_pc == 0x700 && s->ppu_trace) {
+                unsigned n;
+
+                for (n = 0; n < PS3_THREAD_MAX; n++) {
+                    if (s->thr[n].used) {
+                        info_report("ps3-ppu:   thread[%u] id 0x%X nip 0x%"
+                                    PRIx64 " lr 0x%" PRIx64 " msr 0x%"
+                                    PRIx64 "%s%s", n, s->thr[n].id,
+                                    s->thr[n].nip, s->thr[n].lr,
+                                    s->thr[n].msr,
+                                    s->thr[n].parked ? " parked" : "",
+                                    s->thr[n].blocked ? " blocked" : "");
+                    }
+                }
+            }
         }
     }
 
     if (s->ppu_trace) {
         info_report("ps3-ppu: tick %" PRIu64 " pc=0x%" PRIx64
-                    " lr=0x%" PRIx64 " msr=0x%" PRIx64,
+                    " lr=0x%" PRIx64 " msr=0x%" PRIx64 " thr=%d",
                     s->ppu_tick_count, (uint64_t)cpu->env.nip,
-                    (uint64_t)cpu->env.lr, (uint64_t)cpu->env.msr);
+                    (uint64_t)cpu->env.lr, (uint64_t)cpu->env.msr,
+                    s->thr_cur);
     }
 
     if (s->ppu_ticks && s->ppu_tick_count >= s->ppu_ticks) {
@@ -7836,8 +11040,31 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         cpu->env.nip = code;
         cpu->env.gpr[2] = rtoc;
         cpu->env.gpr[1] = ram_size - 0x100;
-        cpu->env.gpr[3] = 0;
-        cpu->env.gpr[4] = 0;
+
+        /*
+         * A process starts with argc/argv, and the recovery program reads
+         * them: emer_init prints its argument vector and exits before drawing
+         * anything when argc is 0.  lv2 builds the block inside the new
+         * process's stack; here it sits just below the initial stack pointer
+         * with the image path as argv[0].
+         */
+        {
+            uint32_t argv = (uint32_t)ram_size - 0x400;
+            uint32_t str = (uint32_t)ram_size - 0x380;
+            const char *path = s->vsh_self ?: "";
+            size_t len = strlen(path);
+
+            if (len && (uint64_t)str + len + 1 <= ram_size) {
+                memcpy(ram + str, path, len + 1);
+                ps3_put_be32(ram + argv, str);
+                ps3_put_be32(ram + argv + 4, 0);
+                cpu->env.gpr[3] = 1;
+                cpu->env.gpr[4] = argv;
+            } else {
+                cpu->env.gpr[3] = 0;
+                cpu->env.gpr[4] = 0;
+            }
+        }
         cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME) |
                         (1ULL << MSR_FP) | (1ULL << MSR_VR);
         cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
@@ -7932,6 +11159,8 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_STRING("readout", PS3BootROMState, readout),
     DEFINE_PROP_STRING("readout-file", PS3BootROMState, readout_file),
     DEFINE_PROP_BOOL("selftest", PS3BootROMState, selftest, true),
+    DEFINE_PROP_BOOL("mic-selftest", PS3BootROMState, mic_selftest, false),
+    DEFINE_PROP_BOOL("pad-selftest", PS3BootROMState, pad_selftest, false),
     DEFINE_PROP_BOOL("spu", PS3BootROMState, spu_run, true),
     DEFINE_PROP_BOOL("spu-trace", PS3BootROMState, spu_trace, false),
     DEFINE_PROP_STRING("ls-dump", PS3BootROMState, ls_dump),

@@ -32,4 +32,29 @@ bool ps3_audio_active(const PS3Audio *a);
  */
 void ps3_audio_play_f32be(PS3Audio *a, const uint8_t *block);
 
+/*
+ * Capture: the console's microphone.
+ *
+ * cellMic sees a USB audio class device; on this machine the samples are the
+ * host's capture input.  The voice is opened at the rate the guest asked for
+ * when the backend accepts it and at the closest rate it does accept
+ * otherwise - ps3_audio_mic_rate() is what cellMicGetFormat then reports, so
+ * the guest is never told a rate it is not being fed.
+ */
+bool ps3_audio_mic_open(PS3Audio *a, unsigned rate, unsigned channels,
+                        Error **errp);
+void ps3_audio_mic_close(PS3Audio *a);
+void ps3_audio_mic_start(PS3Audio *a, bool on);
+bool ps3_audio_mic_active(const PS3Audio *a);
+unsigned ps3_audio_mic_rate(const PS3Audio *a);
+unsigned ps3_audio_mic_channels(const PS3Audio *a);
+
+/*
+ * Pull what the host captured since the last call: interleaved signed 16-bit
+ * samples in host byte order, ps3_audio_mic_channels() of them per frame.  A
+ * short read - 0 included - only means the input has not produced a full
+ * block yet; the caller asks again on the next tick.
+ */
+size_t ps3_audio_mic_read(PS3Audio *a, void *buf, size_t max_bytes);
+
 #endif /* HW_PPC_PS3_AUDIO_H */

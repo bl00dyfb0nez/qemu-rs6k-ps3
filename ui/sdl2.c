@@ -33,6 +33,7 @@
 #include "system/runstate-action.h"
 #include "system/system.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu-main.h"
 
 #ifdef CONFIG_X11
@@ -662,6 +663,145 @@ static void handle_windowevent(SDL_Event *ev)
     }
 }
 
+/*
+ * Controllers.
+ *
+ * SDL is the only part of QEMU that can open one, so it lives here: one pad,
+ * whichever is plugged in first, published as a whole state after every event.
+ * A DualSense, a DualShock 4 and an Xbox pad all arrive through the same
+ * SDL_GameController mapping, which is why the guest's pad ports do not have
+ * to know which one it is.
+ */
+static SDL_GameController *sdl2_gamepad;
+static QemuGamepadState sdl2_gamepad_state;
+
+static void sdl2_gamepad_publish(void)
+{
+    qemu_gamepad_update(&sdl2_gamepad_state);
+}
+
+static void sdl2_gamepad_close(void)
+{
+    if (!sdl2_gamepad) {
+        return;
+    }
+
+    SDL_GameControllerClose(sdl2_gamepad);
+    sdl2_gamepad = NULL;
+    memset(&sdl2_gamepad_state, 0, sizeof(sdl2_gamepad_state));
+    /* Before publishing, so the machine sees the detach with the release. */
+    qemu_gamepad_set_connected(false);
+    sdl2_gamepad_publish();
+}
+
+static void sdl2_gamepad_open(int index)
+{
+    const char *name;
+
+    if (sdl2_gamepad || index < 0 || !SDL_IsGameController(index)) {
+        return;
+    }
+
+    sdl2_gamepad = SDL_GameControllerOpen(index);
+    if (!sdl2_gamepad) {
+        return;
+    }
+
+    name = SDL_GameControllerName(sdl2_gamepad);
+    memset(&sdl2_gamepad_state, 0, sizeof(sdl2_gamepad_state));
+    info_report("sdl: gamepad: \"%s\" (axes, buttons and triggers drive the "
+                "guest's pad)", name ? name : "controller");
+    /* Before publishing, so the machine sees the attach with the first state. */
+    qemu_gamepad_set_connected(true);
+    sdl2_gamepad_publish();
+}
+
+static uint32_t sdl2_gamepad_button(Uint8 button)
+{
+    switch (button) {
+    case SDL_CONTROLLER_BUTTON_A:               return QEMU_GAMEPAD_SOUTH;
+    case SDL_CONTROLLER_BUTTON_B:               return QEMU_GAMEPAD_EAST;
+    case SDL_CONTROLLER_BUTTON_X:               return QEMU_GAMEPAD_WEST;
+    case SDL_CONTROLLER_BUTTON_Y:               return QEMU_GAMEPAD_NORTH;
+    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:    return QEMU_GAMEPAD_TL;
+    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:   return QEMU_GAMEPAD_TR;
+    case SDL_CONTROLLER_BUTTON_BACK:            return QEMU_GAMEPAD_SELECT;
+    case SDL_CONTROLLER_BUTTON_START:           return QEMU_GAMEPAD_START;
+    case SDL_CONTROLLER_BUTTON_GUIDE:           return QEMU_GAMEPAD_MODE;
+    case SDL_CONTROLLER_BUTTON_LEFTSTICK:       return QEMU_GAMEPAD_THUMBL;
+    case SDL_CONTROLLER_BUTTON_RIGHTSTICK:      return QEMU_GAMEPAD_THUMBR;
+    case SDL_CONTROLLER_BUTTON_DPAD_UP:         return QEMU_GAMEPAD_DPAD_UP;
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:       return QEMU_GAMEPAD_DPAD_DOWN;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:       return QEMU_GAMEPAD_DPAD_LEFT;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:      return QEMU_GAMEPAD_DPAD_RIGHT;
+    default:                                    return 0;
+    }
+}
+
+static void handle_controllerbutton(SDL_Event *ev)
+{
+    uint32_t bit = sdl2_gamepad_button(ev->cbutton.button);
+
+    if (!bit) {
+        return;
+    }
+
+    if (ev->type == SDL_CONTROLLERBUTTONDOWN) {
+        sdl2_gamepad_state.buttons |= bit;
+    } else {
+        sdl2_gamepad_state.buttons &= ~bit;
+    }
+    sdl2_gamepad_publish();
+}
+
+static void handle_controlleraxis(SDL_Event *ev)
+{
+    int value = ev->caxis.value;
+
+    switch (ev->caxis.axis) {
+    case SDL_CONTROLLER_AXIS_LEFTX:     sdl2_gamepad_state.lx = value;  break;
+    case SDL_CONTROLLER_AXIS_LEFTY:     sdl2_gamepad_state.ly = value;  break;
+    case SDL_CONTROLLER_AXIS_RIGHTX:    sdl2_gamepad_state.rx = value;  break;
+    case SDL_CONTROLLER_AXIS_RIGHTY:    sdl2_gamepad_state.ry = value;  break;
+    /*
+     * The triggers are axes on SDL and buttons in libpad, so a pull past a
+     * quarter of the travel counts as pressed and nothing else does.
+     */
+    case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+        if (value > 8192) {
+            sdl2_gamepad_state.buttons |= QEMU_GAMEPAD_TL2;
+        } else {
+            sdl2_gamepad_state.buttons &= ~QEMU_GAMEPAD_TL2;
+        }
+        break;
+    case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
+        if (value > 8192) {
+            sdl2_gamepad_state.buttons |= QEMU_GAMEPAD_TR2;
+        } else {
+            sdl2_gamepad_state.buttons &= ~QEMU_GAMEPAD_TR2;
+        }
+        break;
+    default:
+        return;
+    }
+
+    sdl2_gamepad_publish();
+}
+
+static void handle_controllerdevice(SDL_Event *ev)
+{
+    if (ev->type == SDL_CONTROLLERDEVICEADDED) {
+        sdl2_gamepad_open(ev->cdevice.which);   /* a joystick index */
+        return;
+    }
+
+    if (sdl2_gamepad &&
+        ev->cdevice.which ==
+        SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(sdl2_gamepad))) {
+        sdl2_gamepad_close();
+    }
+}
+
 void sdl2_poll_events(struct sdl2_console *scon)
 {
     SDL_Event ev1, *ev = &ev1;
@@ -711,6 +851,19 @@ void sdl2_poll_events(struct sdl2_console *scon)
             break;
         case SDL_WINDOWEVENT:
             handle_windowevent(ev);
+            break;
+        case SDL_CONTROLLERBUTTONDOWN:
+        case SDL_CONTROLLERBUTTONUP:
+            idle = 0;
+            handle_controllerbutton(ev);
+            break;
+        case SDL_CONTROLLERAXISMOTION:
+            idle = 0;
+            handle_controlleraxis(ev);
+            break;
+        case SDL_CONTROLLERDEVICEADDED:
+        case SDL_CONTROLLERDEVICEREMOVED:
+            handle_controllerdevice(ev);
             break;
         default:
             break;
@@ -912,7 +1065,7 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
         SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
     }
 
-    if (SDL_Init(SDL_INIT_VIDEO)) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
         fprintf(stderr, "Could not initialize SDL(%s) - exiting\n",
                 SDL_GetError());
         exit(1);
@@ -1012,6 +1165,14 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 
     if (gui_fullscreen) {
         sdl_grab_start(&sdl2_console[0]);
+    }
+
+    /* The controller that is already plugged in; hot-plug arrives as events. */
+    for (i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            sdl2_gamepad_open(i);
+            break;
+        }
     }
 
     /* SDL's event polling (in dpy_refresh) must happen on the main thread. */
