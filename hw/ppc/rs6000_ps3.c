@@ -489,6 +489,22 @@ enum {
     PS3_BOOT_BAD_ROM,
 };
 
+/*
+ * A PRX module the lv2 layer loaded for the VSH.  The image stays where it was
+ * mapped; the entry records the ELF's entry if it names one, and later lv2
+ * calls use the base to answer "which module owns this address".
+ */
+#define PS3_LV2_MODULE_MAX  16
+#define PS3_LV2_MODULE_PATH 96
+
+typedef struct PS3Lv2Module {
+    uint32_t id;
+    uint32_t base;
+    uint32_t size;
+    uint32_t entry;
+    char path[PS3_LV2_MODULE_PATH];
+} PS3Lv2Module;
+
 struct PS3BootROMState {
     SysBusDevice parent_obj;
 
@@ -575,6 +591,8 @@ struct PS3BootROMState {
     uint32_t lv2_container_size;
     bool lv2_exited;
     int32_t lv2_exit_status;
+    PS3Lv2Module lv2_mod[PS3_LV2_MODULE_MAX];
+    unsigned lv2_mod_count;
 
     uint8_t rom[PS3_ROM_SIZE];
     size_t rom_len;
@@ -653,6 +671,8 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
 #define PS3_LV2_EINVAL  ((int32_t)0x80010002)
 #define PS3_LV2_ENOSYS  ((int32_t)0x80010003)
 #define PS3_LV2_ENOMEM  ((int32_t)0x80010004)
+#define PS3_LV2_ESRCH   ((int32_t)0x80010005)
+#define PS3_LV2_ENOENT  ((int32_t)0x80010006)
 #define PS3_LV2_EFAULT  ((int32_t)0x8001000D)
 
 /*
@@ -1522,6 +1542,449 @@ static int32_t ps3_lv2_alloc(uint8_t *ram, uint64_t ram_size, uint32_t size,
     return 0;
 }
 
+static uint16_t ps3_be16(const uint8_t *p)
+{
+    return ((uint16_t)p[0] << 8) | p[1];
+}
+
+static uint64_t ps3_be64(const uint8_t *p)
+{
+    return ((uint64_t)ps3_be32(p) << 32) | ps3_be32(p + 4);
+}
+
+static bool ps3_lv2_guest_string(uint8_t *ram, uint64_t ram_size,
+                                 uint32_t addr, char *out, size_t cap)
+{
+    size_t i;
+
+    for (i = 0; i + 1 < cap; i++) {
+        if ((uint64_t)addr + i >= ram_size) {
+            return false;
+        }
+        out[i] = ram[addr + i];
+        if (!out[i]) {
+            return true;
+        }
+    }
+
+    out[cap - 1] = 0;
+    return false;
+}
+
+/*
+ * Map a guest path onto the firmware tree the machine was given.  lv2 and the
+ * VSH name modules as /dev_flash/... or /dev_flash3/...; the roots are the
+ * directories the machine maps those devices to.
+ */
+static gchar *ps3_lv2_host_path(PS3BootROMState *s, const char *guest)
+{
+    const char *root;
+    const char *rest;
+
+    if (!strncmp(guest, "/dev_flash/", 11)) {
+        root = s->dev_flash;
+        rest = guest + 11;
+    } else if (!strncmp(guest, "/dev_flash3/", 12)) {
+        root = s->dev_flash3;
+        rest = guest + 12;
+    } else {
+        root = s->dev_flash;
+        rest = guest[0] == '/' ? guest + 1 : guest;
+    }
+
+    if (!root) {
+        return NULL;
+    }
+
+    return g_build_filename(root, rest, NULL);
+}
+
+/*
+ * A SELF keeps each program segment in a metadata section that says where the
+ * stored bytes are and how they are packed; the ELF's p_offset describes the
+ * expanded image instead, so a loader that follows it reads the wrong block.
+ */
+static bool ps3_lv2_self_section(const uint8_t *img, gsize len,
+                                 unsigned index, const uint8_t **data,
+                                 uint64_t *stored, uint32_t *compression)
+{
+    uint64_t meta = ps3_be32(img + 0x0C);
+    uint64_t header = ps3_be64(img + 0x10);
+    uint32_t count;
+    unsigned i;
+
+    if (meta + 0xA0 > header || header > len) {
+        return false;
+    }
+
+    count = ps3_be32(img + meta + 0x60 + 0x0C);
+    if (count > 0x40) {
+        return false;
+    }
+
+    for (i = 0; i < count; i++) {
+        const uint8_t *e = img + meta + 0x80 + 0x30 * (size_t)i;
+        uint64_t offset = ps3_be64(e);
+
+        if (ps3_be32(e + 0x10) != 2 || ps3_be32(e + 0x14) != index) {
+            continue;
+        }
+
+        *stored = ps3_be64(e + 8);
+        if (offset > len || *stored > len - offset) {
+            return false;
+        }
+        *data = img + offset;
+        *compression = ps3_be32(e + 0x2C);
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * Apply one PRX relocation record.  lv2's record is not an Elf64_Rela: it
+ * names two segments by index, the target inside the first and the value
+ * inside the second, so the addend is an address in the module's own image.
+ */
+static bool ps3_lv2_reloc_one(uint8_t *ram, uint64_t ram_size, uint64_t target,
+                              uint64_t value, uint32_t type)
+{
+    uint32_t insn;
+
+    if (target + 8 > ram_size) {
+        return false;
+    }
+
+    switch (type) {
+    case 1:                     /* R_PPC64_ADDR32 */
+        ps3_put_be32(ram + target, (uint32_t)value);
+        break;
+    case 4:                     /* R_PPC64_ADDR16_LO */
+        ram[target] = value >> 8;
+        ram[target + 1] = value;
+        break;
+    case 5:                     /* R_PPC64_ADDR16_HI */
+        ram[target] = value >> 24;
+        ram[target + 1] = value >> 16;
+        break;
+    case 6:                     /* R_PPC64_ADDR16_HA */
+        value = (value >> 16) + ((value & 0x8000) ? 1 : 0);
+        ram[target] = value >> 8;
+        ram[target + 1] = value;
+        break;
+    case 10:                    /* R_PPC64_REL24 */
+        insn = ps3_be32(ram + target);
+        insn = (insn & 0xFC000003) |
+               (((uint32_t)(value - target) >> 2) & 0x03FFFFFC);
+        ps3_put_be32(ram + target, insn);
+        break;
+    case 11:                    /* R_PPC64_REL14 */
+        insn = ps3_be32(ram + target);
+        insn = (insn & 0xFFFF0003) |
+               (((uint32_t)(value - target) >> 2) & 0x0000FFFC);
+        ps3_put_be32(ram + target, insn);
+        break;
+    case 38:                    /* R_PPC64_ADDR64 */
+        ps3_put_be32(ram + target, (uint32_t)(value >> 32));
+        ps3_put_be32(ram + target + 4, (uint32_t)value);
+        break;
+    case 44:                    /* R_PPC64_REL64 */
+        value -= target;
+        ps3_put_be32(ram + target, (uint32_t)(value >> 32));
+        ps3_put_be32(ram + target + 4, (uint32_t)value);
+        break;
+    case 57:                    /* R_PPC64_ADDR16_LO_DS */
+        ram[target] = value >> 10;
+        ram[target + 1] = value >> 2;
+        break;
+    default:
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * lv2's module loader, as far as the VSH needs it: open the SELF with the
+ * application keyset, expand the stored sections, place the PT_LOAD segments
+ * in a module region and run the PRX relocation table against that region.
+ *
+ * Imports are not linked here - that is the part of lv2 that resolves one
+ * module's export table against another's import table - so a module that
+ * depends on another module's exports is mapped but not linked.  The load
+ * itself is the contract the caller sees: a mapped image and a module id.
+ */
+static int32_t ps3_lv2_prx_load(PS3BootROMState *s, uint8_t *ram,
+                                uint64_t ram_size, uint32_t path_addr)
+{
+    char guest[PS3_LV2_MODULE_PATH];
+    g_autofree gchar *host = NULL;
+    g_autofree gchar *img = NULL;
+    gsize len = 0;
+    GError *err = NULL;
+    const uint8_t *elf;
+    uint64_t elf_off = 0;
+    bool is_self;
+    uint64_t phoff, span = 0, base, mod_size, heap;
+    unsigned phentsize, phnum, loads = 0, i;
+    uint32_t load_vaddr[8], load_memsz[8];
+    uint32_t entry = 0, relocations = 0;
+    char why[160];
+
+    if (!ps3_lv2_guest_string(ram, ram_size, path_addr, guest,
+                              sizeof(guest))) {
+        return PS3_LV2_EFAULT;
+    }
+
+    host = ps3_lv2_host_path(s, guest);
+    if (!host) {
+        info_report("ps3-ppu: prx: %s: no firmware root is set", guest);
+        return PS3_LV2_ENOENT;
+    }
+
+    if (!g_file_get_contents(host, &img, &len, &err)) {
+        info_report("ps3-ppu: prx: %s: cannot read (%s)", guest,
+                    err ? err->message : "unknown");
+        g_clear_error(&err);
+        return PS3_LV2_ENOENT;
+    }
+
+    is_self = len >= 0x40 && !memcmp(img, "SCE\0", 4);
+    if (is_self) {
+        if (!ps3_self_decrypt_app((uint8_t *)img, len, why, sizeof(why))) {
+            info_report("ps3-ppu: prx: %s: %s", guest, why);
+            return PS3_LV2_EINVAL;
+        }
+
+        for (i = 0x20; i + 0x40 < MIN(len, (gsize)0x400); i += 4) {
+            if (!memcmp(img + i, "\177ELF", 4)) {
+                elf_off = i;
+                break;
+            }
+        }
+        if (!elf_off) {
+            info_report("ps3-ppu: prx: %s: no ELF header inside the SELF",
+                        guest);
+            return PS3_LV2_EINVAL;
+        }
+    }
+
+    if (elf_off + 0x40 > len || memcmp(img + elf_off, "\177ELF", 4) ||
+        img[elf_off + 4] != 2 || img[elf_off + 5] != 2) {
+        info_report("ps3-ppu: prx: %s: not a 64-bit big-endian ELF", guest);
+        return PS3_LV2_EINVAL;
+    }
+
+    elf = (const uint8_t *)img + elf_off;
+    entry = (uint32_t)ps3_be64(elf + 0x18);
+    phoff = ps3_be64(elf + 0x20);
+    phentsize = ps3_be16(elf + 0x36);
+    phnum = ps3_be16(elf + 0x38);
+
+    if (phentsize != 0x38 || !phnum || phnum > 16 ||
+        elf_off + phoff + (uint64_t)phnum * phentsize > len) {
+        info_report("ps3-ppu: prx: %s: program headers do not fit", guest);
+        return PS3_LV2_EINVAL;
+    }
+
+    for (i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + phoff + (uint64_t)i * phentsize;
+
+        if (ps3_be32(ph) != 1) {
+            continue;
+        }
+        if (loads == ARRAY_SIZE(load_vaddr) ||
+            ps3_be64(ph + 0x28) > ram_size) {
+            info_report("ps3-ppu: prx: %s: too many segments", guest);
+            return PS3_LV2_EINVAL;
+        }
+        load_vaddr[loads] = ps3_be64(ph + 0x10);
+        load_memsz[loads] = ps3_be64(ph + 0x28);
+        span = MAX(span, (uint64_t)load_vaddr[loads] + load_memsz[loads]);
+        loads++;
+    }
+
+    if (!loads) {
+        info_report("ps3-ppu: prx: %s carries no loadable segment", guest);
+        return PS3_LV2_EINVAL;
+    }
+
+    /* The module gets its own 64 KiB-aligned block above the heap. */
+    mod_size = (span + 0xFFFF) & ~(uint64_t)0xFFFF;
+    heap = ps3_be32(ram + PS3_LV2_HEAP);
+    base = (heap + 0xFFFF) & ~(uint64_t)0xFFFF;
+    if (!base || base + mod_size > ram_size ||
+        base + mod_size > 0xFFFFFFFFull) {
+        info_report("ps3-ppu: prx: %s: no room for 0x%" PRIX64 " bytes",
+                    guest, mod_size);
+        return PS3_LV2_ENOMEM;
+    }
+
+    memset(ram + base, 0, mod_size);
+    ps3_put_be32(ram + PS3_LV2_HEAP, (uint32_t)(base + mod_size));
+
+    for (i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + phoff + (uint64_t)i * phentsize;
+        uint64_t vaddr = ps3_be64(ph + 0x10);
+        uint64_t filesz = ps3_be64(ph + 0x20);
+        uint64_t memsz = ps3_be64(ph + 0x28);
+        const uint8_t *src = NULL;
+        uint64_t stored = 0;
+        uint32_t compression = 1;
+
+        if (ps3_be32(ph) != 1) {
+            continue;
+        }
+
+        if (is_self) {
+            if (!ps3_lv2_self_section((const uint8_t *)img, len, i, &src,
+                                      &stored, &compression)) {
+                info_report("ps3-ppu: prx: %s: no stored section for "
+                            "segment %u", guest, i);
+                return PS3_LV2_EINVAL;
+            }
+        } else {
+            uint64_t off = ps3_be64(ph + 0x08);
+
+            if (off > len || filesz > len - off) {
+                info_report("ps3-ppu: prx: %s: segment %u runs past the "
+                            "file", guest, i);
+                return PS3_LV2_EINVAL;
+            }
+            src = (const uint8_t *)img + off;
+            stored = filesz;
+        }
+
+        if (!filesz || filesz > memsz) {
+            info_report("ps3-ppu: prx: %s: segment %u sizes look wrong",
+                        guest, i);
+            return PS3_LV2_EINVAL;
+        }
+
+        if (compression == 2) {
+            uLongf out = filesz;
+            int rc = uncompress(ram + base + vaddr, &out, src, stored);
+
+            if (rc != Z_OK || out != filesz) {
+                info_report("ps3-ppu: prx: %s: segment %u does not expand "
+                            "(zlib %d, 0x%" PRIX64 " of 0x%" PRIX64 ")",
+                            guest, i, rc, (uint64_t)out, filesz);
+                return PS3_LV2_EINVAL;
+            }
+        } else {
+            memcpy(ram + base + vaddr, src, MIN(stored, filesz));
+        }
+
+        if (memsz > filesz) {
+            memset(ram + base + vaddr + filesz, 0, memsz - filesz);
+        }
+
+        info_report("ps3-ppu: prx: %s: segment %u: vaddr 0x%" PRIX64
+                    " memsz 0x%" PRIX64 " -> RAM 0x%" PRIX64, guest, i,
+                    vaddr, memsz, base + vaddr);
+    }
+
+    /* Relocations: the PT_SCE_PPURELA table, in lv2's own record format. */
+    for (i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + phoff + (uint64_t)i * phentsize;
+        uint64_t filesz = ps3_be64(ph + 0x20);
+        const uint8_t *src = NULL;
+        uint64_t stored = 0;
+        uint32_t compression = 1;
+        g_autofree uint8_t *rela = NULL;
+        const uint8_t *table;
+        uint64_t offset;
+
+        if (ps3_be32(ph) != 0x700000A4) {
+            continue;
+        }
+
+        if (is_self) {
+            if (!ps3_lv2_self_section((const uint8_t *)img, len, i, &src,
+                                      &stored, &compression)) {
+                info_report("ps3-ppu: prx: %s: no relocation section", guest);
+                return PS3_LV2_EINVAL;
+            }
+        } else {
+            uint64_t off = ps3_be64(ph + 0x08);
+
+            if (off > len || filesz > len - off) {
+                return PS3_LV2_EINVAL;
+            }
+            src = (const uint8_t *)img + off;
+            stored = filesz;
+        }
+
+        table = src;
+        if (compression == 2) {
+            uLongf out = filesz;
+            int rc;
+
+            rela = g_malloc(filesz ? filesz : 1);
+            rc = uncompress(rela, &out, src, stored);
+            if (rc != Z_OK || out != filesz) {
+                info_report("ps3-ppu: prx: %s: relocation table does not "
+                            "expand (zlib %d)", guest, rc);
+                return PS3_LV2_EINVAL;
+            }
+            table = rela;
+        }
+
+        for (offset = 0; offset + 24 <= filesz; offset += 24) {
+            uint64_t target_off = ps3_be64(table + offset);
+            unsigned index_value = table[offset + 10];
+            unsigned index_addr = table[offset + 11];
+            uint32_t type = ps3_be32(table + offset + 12);
+            uint64_t ptr = ps3_be64(table + offset + 16);
+            uint64_t target, value;
+
+            if (index_addr >= loads ||
+                (index_value != 0xFF && index_value >= loads)) {
+                info_report("ps3-ppu: prx: %s: relocation %" PRIu64
+                            " names segment %u/%u", guest,
+                            offset / 24, index_value, index_addr);
+                return PS3_LV2_EINVAL;
+            }
+
+            target = base + load_vaddr[index_addr] + target_off;
+            if (target_off >= load_memsz[index_addr]) {
+                info_report("ps3-ppu: prx: %s: relocation %" PRIu64
+                            " runs past its segment", guest, offset / 24);
+                return PS3_LV2_EINVAL;
+            }
+
+            value = (index_value == 0xFF ? 0 : base + load_vaddr[index_value]) + ptr;
+            if (!ps3_lv2_reloc_one(ram, ram_size, target, value, type)) {
+                info_report("ps3-ppu: prx: %s: relocation type %u is not "
+                            "handled", guest, type);
+                return PS3_LV2_EINVAL;
+            }
+            relocations++;
+        }
+    }
+
+    if (s->lv2_mod_count == PS3_LV2_MODULE_MAX) {
+        info_report("ps3-ppu: prx: %s: module table is full", guest);
+        return PS3_LV2_ENOMEM;
+    }
+
+    {
+        PS3Lv2Module *m = &s->lv2_mod[s->lv2_mod_count++];
+
+        m->id = ++s->lv2_next_id;
+        m->base = (uint32_t)base;
+        m->size = (uint32_t)mod_size;
+        m->entry = entry;
+        g_strlcpy(m->path, guest, sizeof(m->path));
+
+        info_report("ps3-ppu: prx: %s: module %u at 0x%X (0x%X bytes, "
+                    "%u segment(s), %u relocation(s))",
+                    guest, m->id, m->base, m->size, loads, relocations);
+        return (int32_t)m->id;
+    }
+}
+
 /*
  * The lv2 services vsh-run answers, in the order the VSH asks for them.
  *
@@ -1543,6 +2006,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
     uint8_t *ram;
     uint64_t ram_size;
     uint32_t nr, a0, a1, a2, a3;
+    unsigned i;
     int32_t ret = PS3_LV2_ENOSYS;
 
     if (!cs) {
@@ -1682,6 +2146,33 @@ static void ps3_lv2_service(PS3BootROMState *s)
     case 0x15D:                 /* sys_memory_free(addr) */
         ret = 0;
         break;
+    case 0x1E0:                 /* _sys_prx_load_module(path, flags, opt) */
+    case 0x1F1:                 /* _sys_prx_load_module_on_memcontainer(path,
+                                 * container, flags, opt) */
+        ret = ps3_lv2_prx_load(s, ram, ram_size, a0);
+        break;
+    case 0x1E3:                 /* _sys_prx_unload_module(id, flags, opt) */
+        for (i = 0; i < s->lv2_mod_count; i++) {
+            if (s->lv2_mod[i].id == a0) {
+                break;
+            }
+        }
+        ret = i < s->lv2_mod_count ? 0 : PS3_LV2_ESRCH;
+        break;
+    case 0x1CD: {               /* _sys_prx_get_module_id_by_address(addr) */
+        uint32_t id = 0;
+
+        for (i = 0; i < s->lv2_mod_count; i++) {
+            const PS3Lv2Module *m = &s->lv2_mod[i];
+
+            if (a0 >= m->base && a0 < m->base + m->size) {
+                id = m->id;
+                break;
+            }
+        }
+        ret = (int32_t)id;
+        break;
+    }
     case 0x1E4:                 /* _sys_prx_register_module(param*) */
     case 0x1E6:                 /* _sys_prx_register_library(param*) */
         ret = 0;
@@ -2704,6 +3195,7 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         memset(ram + PS3_LV2_SCRATCH, 0, 8);
         s->lv2_next_id = 0;
         s->lv2_container_size = 0;
+        s->lv2_mod_count = 0;
         s->lv2_exited = false;
         s->lv2_exit_status = 0;
         ps3_put_be32(ram + PS3_LV2_HEAP, 0x01000000);
