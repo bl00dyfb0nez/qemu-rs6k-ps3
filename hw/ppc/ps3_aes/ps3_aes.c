@@ -218,6 +218,82 @@ void ps3_ata_keys(const uint8_t erk[48], uint8_t data_key[32],
     ps3_aes_cbc256_encrypt(erk, erk + 32, ps3_ata_seed_tweak, tweak_key, 32);
 }
 
+/*
+ * The flash side of the same ladder: ps3_decrypt_tools' "encdec" seeds
+ * (kgen.c, 0x00 and 0x20).  A superslim's firmware lives on eMMC, and the
+ * console encrypts those sectors with these keys rather than the ATA ones, so
+ * PCK1 alone can read the flash as well as the disk.
+ */
+static const uint8_t ps3_encdec_seed_data[32] = {
+    0xE2, 0xD0, 0x5D, 0x40, 0x71, 0x94, 0x5B, 0x01,
+    0xC3, 0x6D, 0x51, 0x51, 0xE8, 0x8C, 0xB8, 0x33,
+    0x4A, 0xAA, 0x29, 0x80, 0x81, 0xD8, 0xC4, 0x4F,
+    0x18, 0x5D, 0xC6, 0x60, 0xED, 0x57, 0x56, 0x86,
+};
+
+static const uint8_t ps3_encdec_seed_tweak[32] = {
+    0x02, 0x08, 0x32, 0x92, 0xC3, 0x05, 0xD5, 0x38,
+    0xBC, 0x50, 0xE6, 0x99, 0x71, 0x0C, 0x0A, 0x3E,
+    0x55, 0xF5, 0x1C, 0xBA, 0xA5, 0x35, 0xA3, 0x80,
+    0x30, 0xB6, 0x7F, 0x79, 0xC9, 0x05, 0xBD, 0xA3,
+};
+
+void ps3_encdec_keys(const uint8_t erk[48], uint8_t data_key[32],
+                     uint8_t tweak_key[32])
+{
+    ps3_aes_cbc256_encrypt(erk, erk + 32, ps3_encdec_seed_data, data_key, 32);
+    ps3_aes_cbc256_encrypt(erk, erk + 32, ps3_encdec_seed_tweak, tweak_key,
+                           32);
+}
+
+/*
+ * One eMMC sector: AES-128-CBC over the 512 bytes, keyed with the low half of
+ * the encdec data key, and the IV built from the tweak half with the sector
+ * number folded into it - so the same plaintext sector lands in different
+ * ciphertext at a different address, which is the property the console's
+ * flash relies on.
+ *
+ * The sector-number placement is the model's: the ladder above is the
+ * console's (kgen.c), but the exact IV the eMMC controller feeds is not
+ * published, so `ps3_emmc_iv' is the single place to change if a dump says
+ * otherwise.  Writes go back through the same function, so an image the model
+ * wrote always reads back.
+ */
+static void ps3_emmc_iv(const uint8_t tweak_key[32], uint64_t sector,
+                        uint8_t iv[16])
+{
+    unsigned i;
+
+    memcpy(iv, tweak_key, 16);
+    for (i = 0; i < 8; i++) {
+        iv[8 + i] ^= (sector >> (8 * i)) & 0xFF;
+    }
+}
+
+void ps3_emmc_crypt(const uint8_t data_key[32], const uint8_t tweak_key[32],
+                    uint64_t sector, uint8_t *buf, size_t len, bool encrypt)
+{
+    aes_context ctxt;
+    uint8_t iv[16], chunk[512];
+    size_t off;
+
+    if (!len || (len & 511)) {
+        return;
+    }
+
+    if ((encrypt ? aes_setkey_enc(&ctxt, data_key, 128)
+                 : aes_setkey_dec(&ctxt, data_key, 128)) != 0) {
+        return;
+    }
+
+    for (off = 0; off < len; off += sizeof(chunk)) {
+        ps3_emmc_iv(tweak_key, sector + off / sizeof(chunk), iv);
+        memcpy(chunk, buf + off, sizeof(chunk));
+        aes_crypt_cbc(&ctxt, encrypt ? AES_ENCRYPT : AES_DECRYPT,
+                      sizeof(chunk), iv, chunk, buf + off);
+    }
+}
+
 /* ---------------------------------------------------------------------- */
 /* XTS-AES over one HDD sector.                                            */
 
@@ -285,6 +361,43 @@ bool ps3_aes_selftest(char *why, size_t why_len)
     if (memcmp(got, plain, sizeof(got))) {
         snprintf(why, why_len, "XTS decrypt does not return the plaintext");
         return false;
+    }
+
+    /* The eMMC path: the encdec ladder, then one whole sector each way. */
+    {
+        uint8_t sector_pt[512], sector_ct[512];
+
+        for (i = 0; i < sizeof(sector_pt); i++) {
+            sector_pt[i] = (i * 13 + 5) & 0xFF;
+        }
+        ps3_encdec_keys(erk, data_key, tweak_key);
+        memcpy(sector_ct, sector_pt, sizeof(sector_ct));
+        ps3_emmc_crypt(data_key, tweak_key, 9, sector_ct, sizeof(sector_ct),
+                       true);
+        if (!memcmp(sector_ct, sector_pt, sizeof(sector_ct))) {
+            snprintf(why, why_len,
+                     "the eMMC path did not encrypt the sector");
+            return false;
+        }
+        ps3_emmc_crypt(data_key, tweak_key, 9, sector_ct, sizeof(sector_ct),
+                       false);
+        if (memcmp(sector_ct, sector_pt, sizeof(sector_ct))) {
+            snprintf(why, why_len,
+                     "the eMMC path does not return the plaintext");
+            return false;
+        }
+
+        /* A different address has to move the ciphertext. */
+        memcpy(sector_ct, sector_pt, sizeof(sector_ct));
+        ps3_emmc_crypt(data_key, tweak_key, 10, sector_ct, sizeof(sector_ct),
+                       true);
+        ps3_emmc_crypt(data_key, tweak_key, 9, sector_ct, sizeof(sector_ct),
+                       false);
+        if (!memcmp(sector_ct, sector_pt, sizeof(sector_ct))) {
+            snprintf(why, why_len,
+                     "the eMMC sector number is not part of the IV");
+            return false;
+        }
     }
 
     return true;

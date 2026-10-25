@@ -198,6 +198,91 @@ static void ps3_vga_text_overlay(PS3VGAState *s)
     }
 }
 
+/*
+ * The boot splash: the console's wordmark over the boot background, centred in
+ * the part of the screen the status lines have not used.  The glyphs are the
+ * VGA font scaled up - this is the model's rendition of the screen the console
+ * shows before vsh.self takes the scanout, not Sony's artwork (emer_init's own
+ * splash is in the console's firmware and is not redistributable).
+ */
+static void ps3_vga_scaled_char(PS3VGAState *s, char c, unsigned x0,
+                                unsigned y0, unsigned scale, uint32_t colour)
+{
+    const uint8_t *glyph = vgafont16 + (unsigned char)c * 16;
+    unsigned x, y, sx, sy;
+
+    for (y = 0; y < 16; y++) {
+        for (x = 0; x < 8; x++) {
+            if (!(glyph[y] & (0x80 >> x))) {
+                continue;
+            }
+            for (sy = 0; sy < scale; sy++) {
+                for (sx = 0; sx < scale; sx++) {
+                    unsigned px = x0 + x * scale + sx;
+                    unsigned py = y0 + y * scale + sy;
+
+                    if (px < PS3_VGA_BOOT_W && py < PS3_VGA_BOOT_H) {
+                        s->boot_fb[py * PS3_VGA_BOOT_W + px] = colour;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void ps3_vga_scaled_text(PS3VGAState *s, const char *text, unsigned y0,
+                                unsigned scale, uint32_t colour)
+{
+    unsigned len = strlen(text) * 8 * scale;
+    unsigned x0 = len < PS3_VGA_BOOT_W ? (PS3_VGA_BOOT_W - len) / 2 : 0;
+    unsigned i;
+
+    for (i = 0; text[i]; i++) {
+        ps3_vga_scaled_char(s, text[i], x0 + i * 8 * scale, y0, scale, colour);
+    }
+}
+
+void ps3_vga_boot_logo(const char *title, const char *caption)
+{
+    PS3VGAState *s = ps3_vga_current;
+    unsigned y0, y, x;
+
+    if (!s || !s->boot_fb || s->guest_mode) {
+        return;
+    }
+
+    /*
+     * Start below the last status line, so the chain's own messages stay
+     * readable above the wordmark.
+     */
+    y0 = s->lines * 16 + 24;
+    if (y0 + 16 * 10 + 60 > PS3_VGA_BOOT_H) {
+        y0 = PS3_VGA_BOOT_H / 3;
+    }
+
+    for (y = y0; y < PS3_VGA_BOOT_H; y++) {
+        for (x = 0; x < PS3_VGA_BOOT_W; x++) {
+            s->boot_fb[y * PS3_VGA_BOOT_W + x] = PS3_VGA_BG;
+        }
+    }
+
+    ps3_vga_scaled_text(s, title, y0 + 24, 10, PS3_VGA_FG);
+
+    if (caption) {
+        ps3_vga_scaled_text(s, caption, y0 + 24 + 16 * 10 + 24, 2,
+                            PS3_VGA_FG);
+    }
+
+    /* A thin rule under the wordmark, in the console's boot-screen style. */
+    y = y0 + 24 + 16 * 10 + 12;
+    for (x = PS3_VGA_BOOT_W / 4; x < PS3_VGA_BOOT_W * 3 / 4 &&
+         y < PS3_VGA_BOOT_H; x++) {
+        s->boot_fb[y * PS3_VGA_BOOT_W + x] = PS3_VGA_FG;
+    }
+
+    qemu_console_update_full(s->con);
+}
+
 static void ps3_vga_dump_screen(PS3VGAState *s)
 {
     FILE *f;

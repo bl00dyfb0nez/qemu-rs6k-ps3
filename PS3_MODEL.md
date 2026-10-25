@@ -96,6 +96,57 @@ ninja
 Only `ppc64-softmmu` is built; the PS3 machine is registered there.
 `build*/` is ignored by git.
 
+### A GUI build, for the window
+
+`build-ps3` has no display backend at all (`-display help` lists only `none`),
+which is what the headless checks want.  For the guest window, configure a
+second tree with SDL.  Run the configure from a **UCRT64 login shell**: in a
+plain MSYS shell the compiler check picks a `cc` it cannot run and configure
+stops early, which surfaces as `ERROR: Unknown target name '0'` rather than as
+a compiler error.
+
+```sh
+pacman -S --needed mingw-w64-ucrt-x86_64-SDL2
+MSYSTEM=UCRT64 /c/msys64/usr/bin/bash -lc '
+  cd /c/Users/Thewoodsman/qemu && mkdir -p build-ps3-gui &&
+  cd build-ps3-gui &&
+  ../configure --target-list=ppc64-softmmu --enable-sdl --disable-werror &&
+  ninja'
+```
+
+The window shows the `ps3-vga` scanout - the boot ROM's own messages, then
+whatever the guest draws - and the front LED rides in the title bar.
+
+```sh
+Q=build-ps3-gui/qemu-system-ppc64.exe
+$Q -M rs6000-ps3 -bios .tmp/rom/rom.bin \
+   -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
+   -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin \
+   -display sdl
+```
+
+The scanout reads `PS3 BOOT` / `SPU PAYLOAD: 67108864 INSTRUCTIONS` /
+`LV0LDR.2 CONTAINER VERIFIED: 191152 BYTES`.  Add the application layer and the
+same window carries on into VSH once the chain is done:
+
+```sh
+$Q -M rs6000-ps3 -bios .tmp/rom/rom.bin \
+   -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
+   -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin \
+   -global ps3-boot-rom.dev-flash=/c/Users/Thewoodsman/Documents/rs3/dev_flash \
+   -global ps3-boot-rom.dev-flash2=/c/Users/Thewoodsman/Documents/rs3/dev_flash2 \
+   -global ps3-boot-rom.dev-flash3=/c/Users/Thewoodsman/Documents/rs3/dev_flash3 \
+   -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on \
+   -display sdl
+```
+
+A third line appears above the two chain lines - `VSH: 2 SEGMENT(S), 7291232
+BYTES MAPPED, ENTERING` - and the log continues with the modules vsh.self
+loads (`libfs_utility2`, `sys_audio`, `sys_config`, the `_sys_micin_main` /
+`_sys_camera_main` workers).  A running window can be dumped from the monitor
+(`-monitor tcp:127.0.0.1:55555,server,nowait`, then `screendump file.ppm`),
+which is how the two screenshots in this section were taken.
+
 ## Run
 
 The Windows binary links the MSYS2 DLLs, so from outside an MSYS2 shell put
@@ -424,9 +475,12 @@ The calls the VSH asks for, in the order it first asks for them:
 | 502/503 | `0x1F6`/`0x1F7` | `sys_hid_manager_read`/`ioctl` | pad data, and the `0x054C:0x0268` HID identity |
 | 508-514 | `0x1FC`-`0x202` | focus, permission and hot-key calls | succeed (`check_focus` 1) |
 | 516-522 | `0x204`-`0x20A` | `sys_config_*` | ids from the counter; no service events are queued |
-| 52 | `0x34` | `_sys_ppu_thread_create` | id, and the thread is reported but not scheduled |
+| 52 | `0x34` | `_sys_ppu_thread_create` | id; with `threads=on` a real context (see below) |
 | 50/51/53 | `0x32`/`0x33`/`0x35` | thread stop/restart/start | succeed |
+| 29 | `0x1D` | `sys_ppu_thread_exit` | the thread is retired and switched away |
+| 44 | `0x2C` | `sys_ppu_thread_join` | blocks the caller until the target exits |
 | 141 | `0x8D` | `sys_timer_usleep` | succeed at once: the guest's 100 ms polls |
+| 650 | `0x28A`-`0x293` | `sys_rsxaudio_*` | the audio ring page, and the pull side of it |
 
 `_sys_process_get_paramsfo` was what used to stop the boot: liblv2 asks for
 the process's PARAM.SFO, and with `-ENOSYS` it printed `liblv2 can't get
@@ -452,6 +506,92 @@ looking for `/dev_flash2/etc` and reporting `LIBBTSETTING:
 btsetting_initialize() failed! (80010003)`.  Those are the next things this
 bring-up lv2 does not have, not blockers of the handshake.  The first sleep is
 reported as `ps3-ppu: lv2: sys_timer_usleep(100000 us)`.
+
+### Threads and their entry environment
+
+The scheduler is opt-in, `-global ps3-boot-rom.threads=on`.  With it off, a
+created thread is reported and its body never runs, which is what the early
+bring-up needed.  With it on, `_sys_ppu_thread_create` gets a real context and
+the 1 ms tick switches between threads.
+
+The call is the one sysPrxForUser's wrapper makes:
+
+```
+_sys_ppu_thread_create(id*, param*, arg, unk, prio, stack, flags, name*)
+```
+
+and `param` is `{ u64 entry descriptor, u32 tls, u32 pad }`, which is the part
+that is easy to get wrong:
+
+* `param` itself is a pointer into the caller's stack.  It is **not** a function
+  descriptor; the descriptor is the first word inside it, so the code and TOC
+  have to be read from `param->entry`.
+* the descriptor is lv2's packed 8-byte form, `{ u32 code; u32 toc }` (a
+  16-byte word pair is accepted as a fallback).  Reading the parameter block as
+  an OPD instead put threads at `0x6DE770`, an export table, and the run died
+  at `0`/`0x700`.
+* the `tls` word is where lv2 takes `r13` from.  A user thread starts with
+  `r3 = arg`, `r2 = toc`, `r13 = tls` and a zeroed register file, not with the
+  creator's registers.
+* the creator is executing in lv2, so its `MSR[PR]` is clear.  A user thread
+  must run with `PR` set or its `sc` takes the hypervisor vector `0x700`
+  instead of the lv2 trampoline at `0xC00`; `FP` and `VR` are set as well.
+* `r1` points at the top of the thread's stack (the requested size, 4 KiB when
+  zero) and the return address is a per-thread stub that calls
+  `sys_ppu_thread_exit(0)` and then spins; a body that simply returns ends
+  cleanly.
+
+With those in place the VSH's worker threads enter their own module code (for
+example `sys_audio`'s `_sys_micin_main` at `0x14A8DAC`), make lv2 calls and
+exit.  What still faults is a service that calls an import the model has no
+provider for and then follows the `-1` return as a pointer - camera and mic
+have no hardware in this model yet - not the entry environment.
+
+### The sound driver
+
+The guest reaches the audio hardware through lv2's `sys_rsxaudio` calls, which
+`sys_audio.sprx` makes on behalf of `cellAudio`.  The model implements them:
+
+| Key | Service | Model |
+| --- | --- | --- |
+| `0x28A` | `sys_rsxaudio_initialize` | a zeroed 4 KiB shared page from the lv2 heap, handle `1` |
+| `0x28B` | `sys_rsxaudio_finalize` | drop the page and the handle |
+| `0x28C`/`0x28D` | import/unimport shared memory | the page address |
+| `0x28E`/`0x28F` | create/close connection | succeed |
+| `0x290` | prepare process | succeed |
+| `0x291`/`0x292` | start/stop process | start and stop the 5 ms ring drain |
+| `0x293` | get DMA param | zero |
+
+The page holds the three ring buffers of `rsxaudio_shmem`: the serial ring is
+the stereo mix for HDMI and the AV multi out, and the two S/PDIF rings sit
+next to it.  An entry names a 256-byte block - 32 stereo frames of big-endian
+floats - and the guest publishes it by advancing `write_idx`.  The model's
+timer takes entries while `read_idx` trails `write_idx`, converts each block to
+S16 and hands it to QEMU's audio subsystem, then clears `valid`, advances
+`read_idx` and writes `next_blk_idx` back.  Three rings exist but only the
+serial one carries the mix; an idle ring costs nothing.
+
+`ps3_audio.c` is the host side.  It opens a 48 kHz stereo `s16` voice on an
+`-audiodev` backend, converts the guest's floats with clipping, and stays out
+of the way otherwise; with no backend the rings are still drained, silently.
+
+```sh
+Q=build-ps3/qemu-system-ppc64.exe
+$Q -M rs6000-ps3 -display none \
+   -audiodev dsound,id=snd \
+   -global ps3-boot-rom.dev-flash=C:/Users/Thewoodsman/Documents/rs3/dev_flash \
+   -global ps3-boot-rom.audio=snd \
+   -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on \
+   -global ps3-boot-rom.ppu-ticks=3000 -global ps3-boot-rom.ppu-tick-ns=1000000
+```
+
+`wav` works for a file capture (`-audiodev wav,id=snd,path=out.wav`), `dsound`
+is the Windows default, `none` is silence.  The backend opening is reported as
+`ps3-audio: 48 kHz stereo out on "snd"`; the guest's own start of the stream
+prints `ps3-audio: sound driver running, serial ring at 0x...`.  In this
+bring-up the VSH gets its `sys_audio` module loaded and running before it
+reaches `cellAudio` initialisation, so the ring is still empty there - the
+backend and the drain path are in place, not yet exercised by that run.
 
 ### The gamepad ports
 
@@ -716,6 +856,39 @@ device selftest runs a shorter version of it on every boot. For the sample
 pair above the payload is byte-identical to `lv0ldr.dec` (191152 bytes,
 SHA-256 prefix `17db3fde46a0bf9a`).
 
+### Rebuilding the flash image from the decrypted chain
+
+`spu_rom/norbuild.py` goes the other way from the ROM: it seals the decrypted
+stages back into their containers with the console's channel-66 key and writes
+them into the NOR slots the mask ROM looks at - `metldr` at `0x840`, inside the
+asecure_loader bank, and `lv0ldr.2` at `0xFC0000`, the bootldr region.  Nothing
+is copied blindly: each container is opened with the readout first (its own
+CBC-MAC decides, not a guess at the key), its plaintext is compared with the
+decrypted stage, and the finished image is read back and re-opened.
+
+```sh
+py spu_rom/norbuild.py --readout .tmp/dlt/readout.bin \
+    --stage lv0ldr=.tmp/pctool_lv0ldr.bin \
+    --dec   lv0ldr=.tmp/lv0ldr_container.dec \
+    --base  .tmp/4301c_flash493.bin \
+    -o .tmp/bootchain_flash.bin
+```
+
+```
+norbuild: bootchain_flash.bin, 1 stage(s), readout 72fe9adc185d6b93
+  lv0ldr  bootldr region 0xFC0000  11947 blocks  191216 bytes  ch66 [0:16]/[16:32]  plain sha 17db3fde46a0bf9a
+norbuild: wrote .tmp/bootchain_flash.bin, 16777216 bytes, sha 11d64119addc40b0...
+```
+
+Boot that file as the pflash drive, exactly as in step 1.  The run prints the
+same verdict as the paired sample - `container verified, 191152 bytes of
+payload`, the SPU interpreter replaying the ROM at `42765 instructions`,
+`selftest passed` - and the payload it leaves at `0x400` of the `ls-dump` is
+byte-identical to `lv0ldr_container.dec` (SHA-256 prefix `17db3fde46a0bf9a`).
+`--dec` is what makes that a check rather than a claim.  A readout that does not
+belong to the container is refused before a byte is written, as is a decrypted
+stage whose bytes are not the container's plaintext.
+
 ### 3. Run the rest of the chain stage by stage
 
 ```sh
@@ -834,6 +1007,52 @@ byte-identical to `ps3tools`' `bootldrdec.py` output (SHA-256
 | `.tmp_lv1/lv1ldr.elf` | a decrypted ELF, for the raw-ELF stage path |
 | `spu_rom/ls_sift.py` | readout recovery from an LS dump |
 | `bootldrdec.py` | container format, CCM/CTR routines the model mirrors |
+
+## Storage: eMMC and booting from the disk
+
+A 4xxx superslim such as the CECH-4201A has no NOR: metldr and the loaders
+live on eMMC, and the console encrypts those sectors with the *encdec* keys
+PCK1 derives - the same AES-256-CBC ladder as the ATA keys, over the two
+`kgen.c` seeds at 0x00 and 0x20 instead of the SB indiv blocks.  The model
+carries the medium and the ladder:
+
+| Property | Meaning |
+| --- | --- |
+| `emmc-file` | raw eMMC image; created sparse at `emmc-size` if absent |
+| `emmc-size` | bytes (default `12 * GiB`; `-global` takes a plain number, not `12G`) |
+| `boot-medium` | where the boot ROM looks: `flash` (default, the pflash drive), `emmc` or `hdd` |
+| `erk` / `erk-file` | PCK1; derives the encdec keys (and the ATA keys, unchanged) |
+
+Every eMMC access goes through `ps3_emmc_crypt`: AES-128-CBC over 512-byte
+sectors with the low half of the encdec data key, and an IV built from the
+tweak half with the sector number folded in.  The ladder is the console's; the
+byte placement of the sector number inside the IV is the model's, because the
+controller's IV is not published - it sits in one function so a dump can
+settle it.  Sector 7 is decrypted, re-encrypted and compared at startup, so a
+ladder or IV mistake fails at boot instead of corrupting an image later.
+
+Booting the superslim firmware:
+
+```sh
+Q=build-ps3/qemu-system-ppc64.exe
+$Q -M rs6000-ps3 -bios .tmp/rom/rom.bin \
+   -global ps3-boot-rom.emmc-file=CECH4201A.emmc \
+   -global ps3-boot-rom.boot-medium=emmc \
+   -global ps3-boot-rom.erk-file=erk48.bin \
+   -global ps3-boot-rom.readout-file=ch66.bin -display none -nodefaults
+```
+
+`boot-medium=hdd` runs the same container search over the first 16 MiB of the
+disk after the ATA decryption (sector 0 of a keyed disk is the wrapped key
+sector and is left out), so a chain staged on the HDD boots as well.
+
+Observed on this build:
+
+| Run | Result |
+| --- | --- |
+| `boot-medium=emmc`, plaintext image made with `norbuild.py` | `eMMC: ... unkeyed`, sector 7 round trip, `container verified, 191152 bytes of payload` |
+| `boot-medium=emmc` + `erk-file`, blank image | `encdec keys from the EID root key`, sector 7 round trip, `selftest passed` |
+| `boot-medium=hdd`, unkeyed 64 MiB disk with the rebuilt image at 0 | `boot medium hdd`, `container verified, 191152 bytes of payload` |
 
 ## Expected messages
 

@@ -94,12 +94,16 @@
 #ifdef CONFIG_WHPX
 #include "system/whpx.h"
 #endif
+#include "hw/ide/isa.h"
+#include "hw/core/irq.h"
+#include "hw/isa/isa.h"
 #include "ui/console.h"
 #include "ui/input.h"
 
 #include "ps3_spu.h"
 #include "ps3_self.h"
 #include "ps3_vga.h"
+#include "ps3_audio.h"
 #include "ps3_aes/ps3_aes.h"
 
 #include <zlib.h>
@@ -472,8 +476,17 @@ typedef struct PS3Thread {
     bool main;
     uint32_t id;
     uint32_t join_target;
+    /* Returning here lands on `li r11,0x29; sc`, i.e. sys_ppu_thread_exit. */
+    uint32_t exit_stub;
     uint64_t gpr[32];
     uint64_t lr, ctr, xer, msr, nip;
+    /*
+     * A thread can be switched out between its `sc` and the trampoline's
+     * `rfid`; the return address and MSR of that exception live here, so they
+     * belong to the thread's context too.  Without them a resumed trampoline
+     * returns through another thread's SRR0.
+     */
+    uint64_t srr0, srr1;
     uint32_t crf[8];
 } PS3Thread;
 
@@ -546,6 +559,7 @@ struct PS3BootROMState {
      * lv2 layer itself is not modelled yet, so a run stops at the first lv2
      * call and the trace says which one.
      */
+    char *audio_dev;             /* the -audiodev id the sound driver uses */
     char *vsh_self;
     char *vsh_dump;
     char *vsh_erk;
@@ -593,6 +607,21 @@ struct PS3BootROMState {
     bool lv2_video_reported;        /* cellVideoOut configured a mode */
     bool lv2_time_reported;         /* sys_time_get_current_time's first call */
     uint8_t lv2_video_res;          /* the mode the guest selected */
+    bool lv2_audio_reported;        /* the sound driver started */
+
+    /*
+     * The sound driver.  sys_audio reaches the hardware through lv2's
+     * sys_rsxaudio calls: initialize hands out a handle, import_shared_memory
+     * publishes a page of ring buffers the guest fills with PCM, and
+     * start_process tells the hardware to pull.  This model keeps that page
+     * and drains the serial ring to the host's audiodev.
+     */
+    PS3Audio *audio;
+    uint32_t rsxaudio_handle;
+    uint32_t rsxaudio_shmem;
+    bool rsxaudio_running;
+    QEMUTimer *rsxaudio_timer;
+    uint64_t rsxaudio_blocks;
     /* Host keyboard, as the pad's digital buttons the guest reads. */
     uint16_t kbd_buttons;
     QemuInputHandlerState *kbd;
@@ -624,6 +653,25 @@ struct PS3BootROMState {
     uint8_t hdd_data_key[32];
     uint8_t hdd_tweak_key[32];
     bool hdd_keyed;
+
+    /*
+     * The eMMC: the superslim's firmware medium.  A 4xxx console has no NOR -
+     * metldr and the loaders live on eMMC - so the image here is the whole
+     * flash, encrypted with the encdec keys PCK1 derives (the same ladder as
+     * the disk, different seeds).  `boot-medium` says which of the three
+     * media the boot ROM looks in: pflash (default), emmc or hdd.
+     */
+    char *emmc_file;
+    uint64_t emmc_size;
+    BlockBackend *emmc;
+    bool emmc_created;
+    uint8_t emmc_data_key[32];
+    uint8_t emmc_tweak_key[32];
+    bool emmc_keyed;
+    char *boot_medium;
+    bool boot_logo;                 /* the boot screen, once the chain is done */
+    char *emer_self;                /* emer_init.self, the recovery program */
+    bool recovery;                  /* lv2 started the emergency program */
 
     /*
      * The console's gamepad ports (sys_io/cellPad) and its front LED
@@ -1039,6 +1087,48 @@ static void ps3_ls_write_dump(PS3BootROMState *s)
     }
 }
 
+/*
+ * The chain's own result, before anything is allowed to run: the container is
+ * in the flash, the readout opens it and its tag checks.  lv2 asks the same
+ * question of the vflash filesystem before it starts /dev_flash/vsh.self.
+ */
+static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
+{
+    const char *name = s->container ?: "lv0ldr.2";
+    uint64_t offset = 0;
+    uint32_t blocks, result;
+    uint8_t *plain, key[16];
+
+    if (!s->flash) {
+        snprintf(why, why_len, "no flash image");
+        return false;
+    }
+
+    if (!ps3_container_find(s->flash, s->flash_len, name, &offset,
+                            why, why_len)) {
+        return false;
+    }
+
+    if (!s->has_readout) {
+        snprintf(why, why_len, "no channel-66 readout");
+        return false;
+    }
+
+    blocks = ps3_be32(s->flash + offset + 0x10);
+    plain = g_malloc0((size_t)blocks * 16);
+    result = ps3_rom_open(s->flash + offset, s->flash + offset + PS3_CONTAINER_HDR,
+                          (size_t)blocks * 16, s->readout_bytes, plain, key);
+    g_free(plain);
+
+    if (result != PS3_BOOT_OK) {
+        snprintf(why, why_len, "the %s container does not verify (stop 0x%X)",
+                 name, result);
+        return false;
+    }
+
+    return true;
+}
+
 static void ps3_rom_boot(PS3BootROMState *s)
 {
     const char *name = s->container ?: "lv0ldr.2";
@@ -1134,6 +1224,15 @@ static void ps3_rom_boot(PS3BootROMState *s)
     snprintf(why, sizeof(why), "%s at flash 0x%" PRIx64,
              name, s->container_offset);
     ps3_rom_set_status(s, result, why);
+
+    /*
+     * The chain is done, so put the console's boot screen up: the wordmark,
+     * below the stage lines so both stay readable.  vsh.self's scanout takes
+     * the screen over when the guest programs cellVideoOut.
+     */
+    if (result == PS3_BOOT_OK && s->boot_logo) {
+        ps3_vga_boot_logo("RS6K", "Playstation 3 Emulator");
+    }
 }
 
 static void ps3_rom_selftest(PS3BootROMState *s)
@@ -2822,6 +2921,8 @@ static const PS3PadProduct ps3_pad_products[] = {
     { "dj",         0x12BA, 0x0140, 0x0003, 0x000007FF, PS3_PAD_CAP_STANDARD },
     { "dancemat",   0x1CCF, 0x1010, 0x0004, 0x000000FF, PS3_PAD_CAP_STANDARD },
     { "navigation", 0x054C, 0x042F, 0x0005, 0x00000000, PS3_PAD_CAP_STANDARD },
+    /* The Move motion controller: its own product id and HID class. */
+    { "move",       0x054C, 0x03D5, 0x0006, 0x00000000, PS3_PAD_CAP_STANDARD },
     /* A skateboard has no sticks, no pressures and no rumble. */
     { "skateboard", 0x12BA, 0x0400, 0x8001, 0x00000000,
       PS3_PAD_CAP_CONFORMITY | PS3_PAD_CAP_PRESS_MODE |
@@ -3623,6 +3724,8 @@ static void ps3_thread_save(PS3Thread *t, CPUPPCState *env)
     t->lr = env->lr;
     t->ctr = env->ctr;
     t->xer = env->xer;
+    t->srr0 = env->spr[SPR_SRR0];
+    t->srr1 = env->spr[SPR_SRR1];
     memcpy(t->crf, env->crf, sizeof(t->crf));
     t->msr = env->msr;
     t->nip = env->nip;
@@ -3634,6 +3737,11 @@ static void ps3_thread_restore(const PS3Thread *t, CPUPPCState *env)
     env->lr = t->lr;
     env->ctr = t->ctr;
     env->xer = t->xer;
+    /*
+     * SRR0/SRR1 are deliberately left alone: only a thread stopped inside the
+     * lv2 trampoline carries meaningful ones, and switches are held off until
+     * the call has returned (ps3_sched_tick), so they are stale by then.
+     */
     memcpy(env->crf, t->crf, sizeof(t->crf));
     env->msr = t->msr;
     env->nip = t->nip;
@@ -3673,6 +3781,11 @@ static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
 
     s->thr_cur = next;
     ps3_thread_restore(&s->thr[next], env);
+    if (s->ppu_trace) {
+        info_report("ps3-ppu: sched: -> thread 0x%X at 0x%" PRIX64
+                    " (msr=0x%" PRIX64 ")", s->thr[next].id,
+                    s->thr[next].nip, s->thr[next].msr);
+    }
 }
 
 static void ps3_sched_tick(void *opaque)
@@ -3680,7 +3793,57 @@ static void ps3_sched_tick(void *opaque)
     PS3BootROMState *s = opaque;
     CPUState *cs = qemu_get_cpu(0);
 
+    /*
+     * A thread that called sys_ppu_thread_exit is parked on its trampoline's
+     * `b .`; lv2 switches away from it at the next tick.  Set the yield here
+     * too, or the run idles on a dead thread when its exit did not ask for a
+     * switch itself.
+     */
+    if (cs && s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
+        s->thr[s->thr_cur].dead) {
+        s->sched_pending = true;
+    }
+
+    /*
+     * A thread caught between its `sc` and the trampoline's `rfid` is not at
+     * a safe point: the trampoline's return state is not a thread context the
+     * guest can resume at will.  Leave the yield pending and take it at the
+     * next tick, once the call has returned.
+     */
     if (cs && s->sched_pending) {
+        CPUPPCState *env = &POWERPC_CPU(cs)->env;
+        uint64_t nip = env->nip;
+
+        if (nip >= 0xC00 && nip < 0xC60) {
+            uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+            uint64_t ram_size = memory_region_size(s->ram);
+            uint32_t sp = env->gpr[1];
+            uint32_t cr;
+            unsigned i;
+
+            /*
+             * The tick can land after the trampoline published its call and
+             * before it returned - that is where a yield usually happens,
+             * because a sleep or an exit asks for the switch from inside the
+             * call.  A thread cannot be resumed mid-trampoline, so finish the
+             * epilogue here (0xC40..0xC54: r12, CR, r0 and the frame, then
+             * rfid's MSR/NIP restore) and the context is an ordinary one.
+             */
+            if (nip < 0xC28 || (uint64_t)sp + 0x14 > ram_size) {
+                return;                 /* the call is still in flight */
+            }
+
+            env->gpr[12] = ps3_be32(ram + sp + 0x10);
+            cr = ps3_be32(ram + sp + 0x0C);
+            for (i = 0; i < 8; i++) {
+                env->crf[i] = (cr >> (28 - 4 * i)) & 0xF;
+            }
+            env->gpr[0] = ps3_be32(ram + sp + 0x08);
+            env->gpr[1] = sp + 0x20;
+            env->nip = env->spr[SPR_SRR0];
+            env->msr = env->spr[SPR_SRR1];
+        }
+
         s->sched_pending = false;
         ps3_sched_switch(s, &POWERPC_CPU(cs)->env);
     }
@@ -3698,8 +3861,9 @@ static void ps3_sched_tick(void *opaque)
  */
 static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
                                        uint64_t ram_size, CPUPPCState *env,
-                                       uint32_t entry, uint32_t arg,
-                                       uint32_t stack, uint32_t name)
+                                       uint32_t entry, uint32_t tls,
+                                       uint32_t arg, uint32_t stack,
+                                       uint32_t name)
 {
     char text[32];
     PS3Thread *t = NULL;
@@ -3749,21 +3913,21 @@ static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
     ps3_put_be32(ram + stub + 8, 0x48000000u);   /* b . */
 
     /*
-     * Two OPD layouts appear here.  A process entry is a 16-byte OPD (64-bit
-     * code and TOC); the small entries sysPrxForUser makes for its thread
-     * thunks are 8 bytes, code then TOC.  Read both and take the packed one
-     * when both halves are usable addresses.
+     * The entry is a function descriptor, which lv2 writes as a packed
+     * 8-byte pair: the code address then the module's TOC.  The 16-byte
+     * word-pair layout appears in a few process entries, so fall back to it
+     * when the packed half is not usable.
      */
-    code = ps3_be64(ram + entry);
-    toc = ps3_be64(ram + entry + 8);
-    if ((uint64_t)entry + 16 <= ram_size) {
-        uint32_t code32 = ps3_be32(ram + entry);
-        uint32_t toc32 = ps3_be32(ram + entry + 4);
-
-        if (code32 && code32 < ram_size && toc32 && toc32 < ram_size) {
-            code = code32;
-            toc = toc32;
-        }
+    code = 0;
+    toc = 0;
+    if ((uint64_t)entry + 8 <= ram_size) {
+        code = ps3_be32(ram + entry);
+        toc = ps3_be32(ram + entry + 4);
+    }
+    if ((!code || code >= ram_size || !toc || toc >= ram_size) &&
+        (uint64_t)entry + 16 <= ram_size) {
+        code = ps3_be64(ram + entry);
+        toc = ps3_be64(ram + entry + 8);
     }
     if (!toc || toc >= ram_size) {
         toc = env->gpr[2];
@@ -3781,15 +3945,21 @@ static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
     memset(t, 0, sizeof(*t));
     t->used = true;
     t->id = ++s->lv2_next_id;
-    /* Start from the creator's registers so r13 (TLS) and r31 stay valid. */
-    memcpy(t->gpr, env->gpr, sizeof(t->gpr));
+    /*
+     * lv2 starts a user thread with a clean register file: r3 is the
+     * argument, r13 the thread's TLS base, r2 the entry's TOC.  Inheriting
+     * the creator's registers would leak its syscall result (r3/r31) and
+     * scratch values into the thread body.
+     */
+    memset(t->gpr, 0, sizeof(t->gpr));
     t->gpr[1] = top;
     t->gpr[2] = toc;
     t->gpr[3] = arg;
-    /* r13 is the process TLS base; keep it only when it is guest memory. */
+    t->gpr[13] = (tls && tls < ram_size) ? tls : env->gpr[13];
     if (t->gpr[13] >= ram_size) {
         t->gpr[13] = 0;
     }
+    t->exit_stub = stub;
     t->lr = stub;
     t->nip = code;
     /*
@@ -4321,7 +4491,8 @@ static bool ps3_lv2_sys_io(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
         }
         {
             uint32_t tid = ps3_lv2_thread_created(s, ram, ram_size, env,
-                                                  a1, a2, a4, a6);
+                                                  a1, env->gpr[13], a2,
+                                                  a4, a6);
 
             if (!tid) {
                 r = -EAGAIN;
@@ -4394,7 +4565,7 @@ static bool ps3_pad_defaults(PS3BootROMState *s, Error **errp)
                        "\"standard\", \"guitar\", \"guitar-rb\", "
                        "\"drums\", \"drums-rb\", \"drums-rb3\", "
                        "\"drums-rr\", \"dj\", \"dancemat\", "
-                       "\"navigation\" or \"skateboard\")", want);
+                       "\"navigation\", \"move\" or \"skateboard\")", want);
             g_strfreev(names);
             return false;
         }
@@ -4506,6 +4677,85 @@ static void ps3_lv2_stat(uint8_t *out, bool is_dir, int64_t atime,
  * arguments are read from the CPU here and the result is left in the scratch
  * block at RAM 0x880 for the trampoline to collect.
  */
+/*
+ * The sound driver's DMA side.
+ *
+ * sys_rsxaudio gives the guest a page of ring buffers: the serial ring is the
+ * stereo mix that goes to HDMI and the AV multi out, and two S/PDIF rings sit
+ * beside it.  Every entry names a 256-byte block (32 stereo frames of
+ * big-endian floats) plus a timestamp; the hardware pulls entries while
+ * read_idx trails write_idx and clears `valid` as it goes.  This is that pull:
+ * it runs on a 5 ms timer, turns each block into S16 for the host backend and
+ * publishes its progress back into the guest's page.
+ */
+#define PS3_RSXAUDIO_RING_STRIDE  0x230
+#define PS3_RSXAUDIO_ENTRY_BASE   0x30
+#define PS3_RSXAUDIO_ENTRY_STRIDE 0x20
+#define PS3_RSXAUDIO_ENTRIES      16
+#define PS3_RSXAUDIO_BLOCK_BYTES  256
+#define PS3_RSXAUDIO_RING_ACTIVE  0x00
+#define PS3_RSXAUDIO_RING_READ    0x08
+#define PS3_RSXAUDIO_RING_WRITE   0x0C
+#define PS3_RSXAUDIO_RING_NEXT    0x28
+#define PS3_RSXAUDIO_ENTRY_VALID  0x00
+#define PS3_RSXAUDIO_ENTRY_BUF    0x18
+
+static void ps3_rsxaudio_tick(void *opaque);
+
+static void ps3_rsxaudio_kick(PS3BootROMState *s)
+{
+    if (!s->rsxaudio_timer) {
+        s->rsxaudio_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         ps3_rsxaudio_tick, s);
+    }
+    timer_mod(s->rsxaudio_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5000000);
+}
+
+static void ps3_rsxaudio_tick(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+    uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+    uint64_t ram_size = memory_region_size(s->ram);
+    uint32_t ring = s->rsxaudio_shmem;
+    unsigned taken = 0;
+
+    if (s->rsxaudio_running && ring && (uint64_t)ring + 0x1000 <= ram_size &&
+        ps3_be32(ram + ring + PS3_RSXAUDIO_RING_ACTIVE)) {
+        while (taken < 8) {
+            uint32_t rd = ps3_be32(ram + ring + PS3_RSXAUDIO_RING_READ);
+            uint32_t wr = ps3_be32(ram + ring + PS3_RSXAUDIO_RING_WRITE);
+            uint32_t entry, valid, buf;
+
+            if (rd == wr) {
+                break;
+            }
+
+            entry = ring + PS3_RSXAUDIO_ENTRY_BASE +
+                    (rd % PS3_RSXAUDIO_ENTRIES) * PS3_RSXAUDIO_ENTRY_STRIDE;
+            valid = ps3_be32(ram + entry + PS3_RSXAUDIO_ENTRY_VALID);
+            buf = ps3_be32(ram + entry + PS3_RSXAUDIO_ENTRY_BUF);
+
+            if (valid && buf &&
+                (uint64_t)buf + PS3_RSXAUDIO_BLOCK_BYTES <= ram_size) {
+                ps3_audio_play_f32be(s->audio, ram + buf);
+                s->rsxaudio_blocks++;
+            }
+
+            /* The block is consumed whether or not it held audio. */
+            ps3_put_be32(ram + entry + PS3_RSXAUDIO_ENTRY_VALID, 0);
+            ps3_put_be64(ram + ring + PS3_RSXAUDIO_RING_NEXT,
+                         (uint64_t)rd + 1);
+            ps3_put_be32(ram + ring + PS3_RSXAUDIO_RING_READ, rd + 1);
+            taken++;
+        }
+    }
+
+    if (s->rsxaudio_running) {
+        ps3_rsxaudio_kick(s);
+    }
+}
+
 static void ps3_lv2_service(PS3BootROMState *s)
 {
     CPUState *cs = qemu_get_cpu(0);
@@ -4654,6 +4904,68 @@ static void ps3_lv2_service(PS3BootROMState *s)
         /* The AV layer: this is how the VSH reads the sink and picks a mode. */
         if (ps3_lv2_video_out(s, &cpu->env, ram, ram_size, nid, &ret)) {
             break;
+        }
+
+        /*
+         * A worker that calls a service the model does not have cannot be
+         * answered with -1: the lv2 library it came from uses the return as
+         * a pointer and the whole machine ends at 0x700.  Retire the thread
+         * instead - it lands on its exit stub, wakes anyone joining it and
+         * the scheduler moves on.  The process's main thread keeps -1, where
+         * a failure is the guest's own decision to handle.
+         */
+        if (s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
+            !s->thr[s->thr_cur].main && s->thr[s->thr_cur].exit_stub) {
+            PS3Thread *t = &s->thr[s->thr_cur];
+
+            info_report("ps3-ppu: lv2: thread 0x%X retired: no provider for "
+                        "%s:0x%08X (it cannot use -1 as a pointer)",
+                        t->id, stub ? stub->lib : "?", nid);
+            cpu->env.spr[SPR_SRR0] = t->exit_stub;
+            s->sched_pending = true;
+            ret = 0;
+            break;
+        }
+
+        /*
+         * libpadconfig asserts ret == CELL_OK on every call it makes, so a
+         * cellPad entry this model does not answer must still report success
+         * rather than -1 - a missing pad reply is not a fatal condition, the
+         * port simply has no data.
+         */
+        if (stub && (!strcmp(stub->lib, "cellPad") ||
+                     !strncmp(stub->lib, "libpad", 6))) {
+            ret = 0;
+            break;
+        }
+
+        /*
+         * sys_audio's camera and mic bring-up asks sysPrxForUser for helpers
+         * whose failure is fatal to those workers, and there is no camera or
+         * mic hardware here at all.  Succeeding them keeps the services alive
+         * and idle instead of retiring the threads.
+         */
+        {
+            static const uint32_t camera_ok[] = {
+                0x318F17E1, 0x2F85C0EF, 0xBDB18F83, 0xF7F7FB20,
+                0xB5D5F64E, 0x8EECD140,
+            };
+            static bool camera_reported;
+
+            for (i = 0; i < ARRAY_SIZE(camera_ok); i++) {
+                if (camera_ok[i] == nid) {
+                    if (!camera_reported) {
+                        camera_reported = true;
+                        info_report("ps3-ppu: lv2: camera/mic service stubbed "
+                                    "(no camera hardware); the workers idle");
+                    }
+                    ret = 0;
+                    break;
+                }
+            }
+            if (i < ARRAY_SIZE(camera_ok)) {
+                break;
+            }
         }
 
         if (stub) {
@@ -5052,17 +5364,32 @@ static void ps3_lv2_service(PS3BootROMState *s)
         s->sched_pending = nr != 0x32;
         ret = 0;
         break;
-    case 0x34: {                /* _sys_ppu_thread_create(id*, entry, arg,
-                                 * prio, stack, flags, name*) */
-        uint32_t name = cpu->env.gpr[9];
+    case 0x34: {                /* _sys_ppu_thread_create(id*, param*, arg,
+                                 * unk, prio, stack, flags, name*)
+                                 *
+                                 * param is { entry descriptor, tls, pad }:
+                                 * the descriptor is not the parameter block,
+                                 * and the TLS word is where lv2 takes r13
+                                 * from, so neither can be reconstructed
+                                 * from the creator's registers.
+                                 */
+        uint32_t name = cpu->env.gpr[10];
+        uint32_t entry, tls;
 
         if (!a0 || (uint64_t)a0 + 4 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
         }
+        if (!a1 || (uint64_t)a1 + 16 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        entry = ps3_be64(ram + a1);
+        tls = ps3_be32(ram + a1 + 8);
         {
             uint32_t tid = ps3_lv2_thread_created(s, ram, ram_size,
-                                                  &cpu->env, a1, a2, a4, name);
+                                                  &cpu->env, entry, tls, a2,
+                                                  a5, name);
 
             if (!tid) {
                 ret = -EAGAIN;
@@ -5073,6 +5400,104 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
+    /*
+     * sys_rsxaudio: the audio module's view of the hardware.  One instance
+     * exists at a time, as on the console.  The shared page it hands out is
+     * where the guest writes its ring buffers; the timer above plays them.
+     */
+    case 0x28A: {               /* sys_rsxaudio_initialize(handle*) */
+        uint32_t shmem;
+
+        if (!a0 || (uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (s->rsxaudio_handle) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (ps3_lv2_alloc(s, ram, ram_size, 0x1000, a0) != 0) {
+            ret = PS3_LV2_ENOMEM;
+            break;
+        }
+        shmem = ps3_be32(ram + a0);
+        memset(ram + shmem, 0, 0x1000);
+        s->rsxaudio_shmem = shmem;
+        s->rsxaudio_handle = 1;
+        ps3_put_be32(ram + a0, s->rsxaudio_handle);
+        ret = 0;
+        break;
+    }
+    case 0x28B:                 /* sys_rsxaudio_finalize(handle) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        s->rsxaudio_running = false;
+        s->rsxaudio_shmem = 0;
+        s->rsxaudio_handle = 0;
+        ret = 0;
+        break;
+    case 0x28C:                 /* sys_rsxaudio_import_shared_memory(h, addr*) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 8 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be64(ram + a1, s->rsxaudio_shmem);
+        ret = 0;
+        break;
+    case 0x28D:                 /* sys_rsxaudio_unimport_shared_memory(h) */
+    case 0x28E:                 /* sys_rsxaudio_create_connection(h) */
+    case 0x28F:                 /* sys_rsxaudio_close_connection(h) */
+    case 0x290:                 /* sys_rsxaudio_prepare_process(h) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ret = 0;
+        break;
+    case 0x291:                 /* sys_rsxaudio_start_process(h) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!s->rsxaudio_running) {
+            s->rsxaudio_running = true;
+            ps3_rsxaudio_kick(s);
+        }
+        if (!s->lv2_audio_reported) {
+            s->lv2_audio_reported = true;
+            info_report("ps3-audio: sound driver running, serial ring at "
+                        "0x%X%s", s->rsxaudio_shmem,
+                        ps3_audio_active(s->audio) ? "" :
+                        " (no host backend: silence)");
+        }
+        ret = 0;
+        break;
+    case 0x292:                 /* sys_rsxaudio_stop_process(h) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        s->rsxaudio_running = false;
+        ret = 0;
+        break;
+    case 0x293:                 /* sys_rsxaudio_get_dma_param(h, flag, out*) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!a2 || (uint64_t)a2 + 8 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be64(ram + a2, 0);
+        ret = 0;
+        break;
     case 0x182:                 /* sys_sm_control_led(led, action) */
         ps3_console_led(s, a0, a1);
         ret = 0;
@@ -5767,6 +6192,220 @@ static bool ps3_hdd_write(PS3BootROMState *s, uint64_t sector, void *buf,
 
     return true;
 }
+/*
+ * The eMMC, sector for sector.  Every access goes through ps3_emmc_crypt with
+ * the encdec keys, so the host image stays the ciphertext the console wrote
+ * and the guest sees the plaintext flash; a kernel image built for this model
+ * can be dropped into the same image the console uses.
+ */
+static bool ps3_emmc_read(PS3BootROMState *s, uint64_t sector, void *buf,
+                          size_t sectors)
+{
+    if (!s->emmc || !sectors) {
+        return false;
+    }
+
+    if (blk_pread(s->emmc, sector * PS3_LV2_SECTOR,
+                  sectors * PS3_LV2_SECTOR, buf, 0) < 0) {
+        return false;
+    }
+
+    if (s->emmc_keyed) {
+        ps3_emmc_crypt(s->emmc_data_key, s->emmc_tweak_key, sector, buf,
+                       sectors * PS3_LV2_SECTOR, false);
+    }
+
+    return true;
+}
+
+static bool ps3_emmc_write(PS3BootROMState *s, uint64_t sector, void *buf,
+                           size_t sectors)
+{
+    g_autofree uint8_t *sealed = NULL;
+
+    if (!s->emmc || !sectors) {
+        return false;
+    }
+
+    if (s->emmc_keyed) {
+        size_t len = sectors * PS3_LV2_SECTOR;
+
+        sealed = g_memdup2(buf, len);
+        ps3_emmc_crypt(s->emmc_data_key, s->emmc_tweak_key, sector, sealed,
+                       len, true);
+        buf = sealed;
+    }
+
+    return blk_pwrite(s->emmc, sector * PS3_LV2_SECTOR,
+                      sectors * PS3_LV2_SECTOR, buf, 0) >= 0;
+}
+
+static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
+{
+    Error *err = NULL;
+    QDict *opts;
+    int fd;
+
+    if (!s->emmc_file) {
+        if (s->has_erk) {
+            info_report("ps3-boot-rom: EID root key read; encdec (eMMC) keys "
+                        "derived, no eMMC image to key");
+        }
+        return true;
+    }
+
+    if (!g_file_test(s->emmc_file, G_FILE_TEST_EXISTS)) {
+        fd = qemu_open_old(s->emmc_file, O_RDWR | O_CREAT | O_EXCL | O_BINARY,
+                           0600);
+        if (fd < 0) {
+            error_setg_errno(errp, errno, "ps3-boot-rom: cannot create %s",
+                             s->emmc_file);
+            return false;
+        }
+        if (ftruncate(fd, s->emmc_size) < 0) {
+            error_setg_errno(errp, errno, "ps3-boot-rom: cannot size %s to "
+                             "%" PRIu64 " bytes", s->emmc_file,
+                             s->emmc_size);
+            close(fd);
+            return false;
+        }
+        close(fd);
+        s->emmc_created = true;
+    }
+
+    opts = qdict_new();
+    qdict_put_str(opts, "driver", "raw");
+    s->emmc = blk_new_open(s->emmc_file, NULL, opts, BDRV_O_RDWR, &err);
+    if (!s->emmc) {
+        error_setg(errp, "ps3-boot-rom: cannot open eMMC image %s: %s",
+                   s->emmc_file,
+                   err ? error_get_pretty(err) : "unknown error");
+        error_free(err);
+        return false;
+    }
+
+    if (s->has_erk) {
+        ps3_encdec_keys(s->erk, s->emmc_data_key, s->emmc_tweak_key);
+        s->emmc_keyed = true;
+    }
+
+    s->emmc_size = blk_getlength(s->emmc);
+
+    info_report("ps3-boot-rom: eMMC: %s, %" PRIu64 " MiB raw%s%s",
+                s->emmc_file, s->emmc_size / MiB,
+                s->emmc_created ? " (created)" : "",
+                s->emmc_keyed ? ", encdec keys from the EID root key"
+                              : ", unkeyed");
+    ps3_vga_printf("EMMC: %" PRIu64 " MIB, %s", s->emmc_size / MiB,
+                   s->emmc_keyed ? "ENCDEC KEYS FROM EID ROOT KEY" : "UNKEYED");
+
+    /*
+     * Sector 7 is past any header a real image starts with and inside the
+     * region the loaders occupy, so a decrypt/encrypt round trip there proves
+     * the ladder and the IV before the guest reads the flash.
+     */
+    {
+        uint8_t raw[PS3_LV2_SECTOR], plain[PS3_LV2_SECTOR], back[PS3_LV2_SECTOR];
+
+        if (blk_pread(s->emmc, 7 * PS3_LV2_SECTOR, sizeof(raw), raw, 0) == 0) {
+            memcpy(plain, raw, sizeof(plain));
+            if (!ps3_emmc_read(s, 7, plain, 1) ||
+                !ps3_emmc_write(s, 7, plain, 1)) {
+                error_setg(errp, "ps3-boot-rom: eMMC sector 7 does not round "
+                           "trip");
+                return false;
+            }
+            memset(back, 0, sizeof(back));
+            if (blk_pread(s->emmc, 7 * PS3_LV2_SECTOR, sizeof(back), back,
+                          0) < 0 || memcmp(raw, back, sizeof(raw))) {
+                error_setg(errp, "ps3-boot-rom: eMMC re-encryption did not "
+                           "reproduce sector 7");
+                return false;
+            }
+            info_report("ps3-boot-rom: eMMC sector 7: decrypt and re-encrypt "
+                        "reproduce the image byte for byte");
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Where the boot ROM looks.  A NOR boot is the default (`-drive if=pflash`),
+ * but a console whose firmware lives on eMMC boots from that image, and a
+ * chain staged on the disk can be booted by naming the HDD - the same
+ * container search then runs over the decrypted sectors of whichever medium
+ * was named.
+ */
+static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
+{
+    const char *medium = s->boot_medium ?: "flash";
+    BlockBackend *blk;
+    uint64_t len, sectors, i;
+
+    if (!strcmp(medium, "flash")) {
+        return true;
+    }
+
+    if (!strcmp(medium, "emmc")) {
+        blk = s->emmc;
+    } else if (!strcmp(medium, "hdd")) {
+        blk = s->hdd;
+    } else {
+        error_setg(errp, "ps3-boot-rom: boot-medium must be flash, emmc or "
+                   "hdd, not \"%s\"", medium);
+        return false;
+    }
+
+    if (!blk) {
+        error_setg(errp, "ps3-boot-rom: boot-medium=%s but no image was "
+                   "given", medium);
+        return false;
+    }
+
+    len = blk_getlength(blk);
+    if (len <= 0) {
+        error_setg(errp, "ps3-boot-rom: the %s image has no size", medium);
+        return false;
+    }
+    if (len > 16 * MiB) {
+        len = 16 * MiB;
+    }
+
+    sectors = len / PS3_LV2_SECTOR;
+    g_free(s->flash);
+    s->flash = g_malloc0(len);
+    s->flash_len = len;
+
+    if (!sectors || blk_pread(blk, 0, len, s->flash, 0) < 0) {
+        error_setg(errp, "ps3-boot-rom: cannot read the %s image", medium);
+        return false;
+    }
+
+    if (!strcmp(medium, "emmc") && s->emmc_keyed) {
+        ps3_emmc_crypt(s->emmc_data_key, s->emmc_tweak_key, 0, s->flash,
+                       sectors * PS3_LV2_SECTOR, false);
+    } else if (!strcmp(medium, "hdd") && s->hdd_keyed) {
+        /*
+         * Sector 0 of a keyed disk is the wrapped key sector, not data, and
+         * the chain does not start there; leave it out of the view.
+         */
+        memset(s->flash, 0, PS3_LV2_SECTOR);
+        for (i = 1; i < sectors; i++) {
+            ps3_xts_crypt_sector(s->hdd_data_key, s->hdd_tweak_key, i,
+                                 s->flash + i * PS3_LV2_SECTOR,
+                                 PS3_LV2_SECTOR, false);
+        }
+    }
+
+    info_report("ps3-boot-rom: boot medium %s: the container search runs over "
+                "the first %" PRIu64 " MiB of %s", medium, len / MiB,
+                medium);
+    ps3_vga_printf("BOOT MEDIUM: %s", medium);
+
+    return true;
+}
+
 static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
 {
     Error *err = NULL;
@@ -5927,6 +6566,12 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
     return true;
 }
 
+/* The PS3 has no interrupt controller wired to an ISA bus; the IDE line is
+ * accepted and dropped, which is enough for a polled ATA driver. */
+static void ps3_isa_noop(void *opaque, int line, int level)
+{
+}
+
 static void ps3_rom_realize(DeviceState *dev, Error **errp)
 {
     PS3BootROMState *kbd_s = PS3_BOOT_ROM(dev);
@@ -5975,6 +6620,21 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     }
 
     /*
+     * The sound driver.  A host with no audiodev still boots; the rings are
+     * drained and dropped, so a missing backend never stops the guest.
+     */
+    {
+        Error *audio_err = NULL;
+
+        s->audio = ps3_audio_new(s->audio_dev, &audio_err);
+        if (!s->audio) {
+            warn_report("ps3-audio: %s (running silent)",
+                        error_get_pretty(audio_err));
+            error_free(audio_err);
+        }
+    }
+
+    /*
      * Describe the gamepad ports first: lv2 hands them to the VSH during its
      * startup, and the front LED starts out as the pretend "console is on"
      * green rather than dark.
@@ -5983,6 +6643,12 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         return;
     }
     if (!ps3_hdd_setup(s, errp)) {
+        return;
+    }
+    if (!ps3_emmc_setup(s, errp)) {
+        return;
+    }
+    if (!ps3_boot_medium_setup(s, errp)) {
         return;
     }
 
@@ -6246,6 +6912,37 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         } else {
             info_report("ps3-boot-rom: dev_usb000 attached from %s, no "
                         "PS3/UPDATE/PS3UPDAT.PUP in it", s->usb_dir);
+        }
+    }
+
+    /*
+     * Which application comes up is lv2's decision, not a command-line one.
+     * The chain is asked first: when it verifies and vsh.self is on dev_flash,
+     * the initial process is /dev_flash/vsh.self.  When it does not - the
+     * flash is missing, the readout does not open the container, or there is no
+     * vsh.self - lv2 does what the firmware does and creates the vflash recover
+     * process (emergency program), which is emer_init.self.
+     */
+    if (s->emer_self && s->vsh_run) {
+        char why[192] = "";
+        bool chain_ok = ps3_chain_check(s, why, sizeof(why));
+        bool vsh_ok = s->vsh_self &&
+                      g_file_test(s->vsh_self, G_FILE_TEST_EXISTS);
+
+        if (chain_ok && vsh_ok) {
+            info_report("ps3-boot-rom: chain checks passed; lv2 starts "
+                        "/dev_flash/vsh.self");
+        } else {
+            info_report("ps3-boot-rom: ### Vflash recovery mode");
+            info_report("ps3-boot-rom: %s; creating the vflash recover "
+                        "process (emergency program): %s",
+                        chain_ok ? "no vsh.self on dev_flash" : why,
+                        s->emer_self);
+            g_free(s->vsh_self);
+            s->vsh_self = g_strdup(s->emer_self);
+            s->recovery = true;
+            ps3_vga_printf("RECOVERY: %s",
+                           chain_ok ? "NO VSH.SELF" : why);
         }
     }
 
@@ -7204,6 +7901,7 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("stage-limit", PS3BootROMState, stage_limit, 0),
     DEFINE_PROP_UINT64("stage-wait", PS3BootROMState, stage_wait, 0),
     DEFINE_PROP_UINT64("stage-version", PS3BootROMState, stage_version, 0),
+    DEFINE_PROP_STRING("audio", PS3BootROMState, audio_dev),
     DEFINE_PROP_STRING("vsh-self", PS3BootROMState, vsh_self),
     DEFINE_PROP_STRING("vsh-dump", PS3BootROMState, vsh_dump),
     DEFINE_PROP_STRING("vsh-erk", PS3BootROMState, vsh_erk),
@@ -7218,6 +7916,11 @@ static const Property ps3_rom_properties[] = {
                        3600),
     DEFINE_PROP_BOOL("threads", PS3BootROMState, threads_enabled, false),
     DEFINE_PROP_STRING("hdd-file", PS3BootROMState, hdd_file),
+    DEFINE_PROP_STRING("emmc-file", PS3BootROMState, emmc_file),
+    DEFINE_PROP_UINT64("emmc-size", PS3BootROMState, emmc_size, 12 * GiB),
+    DEFINE_PROP_STRING("boot-medium", PS3BootROMState, boot_medium),
+    DEFINE_PROP_BOOL("boot-logo", PS3BootROMState, boot_logo, true),
+    DEFINE_PROP_STRING("emer-self", PS3BootROMState, emer_self),
     DEFINE_PROP_UINT64("hdd-size", PS3BootROMState, hdd_size, 20 * GiB),
     DEFINE_PROP_STRING("erk", PS3BootROMState, erk_prop),
     DEFINE_PROP_STRING("erk-file", PS3BootROMState, erk_file),
@@ -7513,6 +8216,25 @@ static void rs6000_ps3_init(MachineState *machine)
     vga = qdev_new("ps3-vga");
     sysbus_realize_and_unref(SYS_BUS_DEVICE(vga), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(vga), 0, PS3_VGA_MMIO_BASE);
+
+    /*
+     * The disc.  On hardware the Blu-ray drive is an ATA device; the guest's
+     * ATA driver reaches it through the same command block either way, so the
+     * model hands it QEMU's legacy IDE/ATAPI interface with the image as a
+     * CD-ROM.  `-drive if=ide,media=cdrom,file=disc.iso,format=raw` attaches
+     * it; without one the channel is simply empty.
+     */
+    {
+        ISABus *isabus = isa_bus_new(NULL, get_system_memory(),
+                                     get_system_io(), &error_fatal);
+        DriveInfo *disc = drive_get(IF_IDE, 0, 0);
+
+        isa_bus_register_input_irqs(isabus,
+                                    qemu_allocate_irqs(ps3_isa_noop, NULL, 16));
+        isa_ide_init(isabus, 0x1F0, 0x3F6, 14, disc, NULL);
+        info_report("rs6000-ps3: disc: IDE/ATAPI channel at 0x1F0%s",
+                    disc ? " with the image attached" : " (no image)");
+    }
 
     rom = qdev_new(TYPE_PS3_BOOT_ROM);
     object_property_set_link(OBJECT(rom), "ram", OBJECT(ram), &error_abort);

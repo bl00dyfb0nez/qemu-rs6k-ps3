@@ -17,6 +17,13 @@ void ps3_vga_puts(const char *line);
 void ps3_vga_printf(const char *fmt, ...);
 
 /*
+ * The console's boot screen once the chain is done: `title' as the wordmark,
+ * `caption' under it.  The glyphs are the console font scaled up, so this is
+ * the model's rendition of the splash, not Sony's artwork.
+ */
+void ps3_vga_boot_logo(const char *title, const char *caption);
+
+/*
  * The AV path: the guest hands the device the framebuffer it rendered into,
  * and reads the sink's EDID (an HDMI identity with 720p/1080p modes) before
  * it picks a mode.  Both are what lv2's display calls do for the VSH here.
