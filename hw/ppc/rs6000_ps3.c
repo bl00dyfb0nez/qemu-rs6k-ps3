@@ -559,6 +559,8 @@ struct PS3BootROMState {
      */
     char *vsh_self;
     char *vsh_dump;
+    char *vsh_erk;
+    char *vsh_riv;
     char *dev_flash;
     char *dev_flash3;
     bool vsh_run;
@@ -1570,6 +1572,22 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
                                        "vsh.self", NULL);
     }
 
+    /*
+     * dev_flash3 is the second writable firmware mount; some dumps put the
+     * application tree there instead of dev_flash.  Use it when the first
+     * path does not exist and the caller named no image directly.
+     */
+    if (s->dev_flash3) {
+        g_autofree char *alt = g_build_filename(s->dev_flash3, "vsh",
+                                                "module", "vsh.self", NULL);
+
+        if ((!s->vsh_self || !g_file_test(s->vsh_self, G_FILE_TEST_EXISTS)) &&
+            g_file_test(alt, G_FILE_TEST_EXISTS)) {
+            g_free(s->vsh_self);
+            s->vsh_self = g_strdup(alt);
+        }
+    }
+
     if (s->vsh_self) {
         if (!ps3_vsh_stage(s, errp)) {
             return;
@@ -2093,7 +2111,7 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
  * the right opener.  A plain ELF is accepted too, which is what the
  * "decrypted" files in a dev_flash dump can be.
  */
-static const uint8_t *ps3_vsh_open(uint8_t *img, size_t len,
+static const uint8_t *ps3_vsh_open(PS3BootROMState *s, uint8_t *img, size_t len,
                                    uint64_t *header_len, uint32_t *meta_offset,
                                    char *why, size_t why_len)
 {
@@ -2112,7 +2130,12 @@ static const uint8_t *ps3_vsh_open(uint8_t *img, size_t len,
         return img;
     }
 
-    if (!ps3_self_decrypt_app(img, len, why, why_len)) {
+    if (s->vsh_erk || s->vsh_riv) {
+        if (!ps3_self_decrypt_key(img, len, s->vsh_erk, s->vsh_riv,
+                                  why, why_len)) {
+            return NULL;
+        }
+    } else if (!ps3_self_decrypt_app(img, len, why, why_len)) {
         return NULL;
     }
 
@@ -2179,7 +2202,8 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
     }
 
     is_self = len >= 4 && !memcmp(img, "SCE\0", 4);
-    elf = ps3_vsh_open(img, len, &header_len, &meta_offset, why, sizeof(why));
+    elf = ps3_vsh_open(s, img, len, &header_len, &meta_offset, why,
+                       sizeof(why));
     if (!elf) {
         error_setg(errp, "ps3-vsh: %s: %s", s->vsh_self, why);
         return false;
@@ -2416,6 +2440,8 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("stage-version", PS3BootROMState, stage_version, 0),
     DEFINE_PROP_STRING("vsh-self", PS3BootROMState, vsh_self),
     DEFINE_PROP_STRING("vsh-dump", PS3BootROMState, vsh_dump),
+    DEFINE_PROP_STRING("vsh-erk", PS3BootROMState, vsh_erk),
+    DEFINE_PROP_STRING("vsh-riv", PS3BootROMState, vsh_riv),
     DEFINE_PROP_STRING("dev-flash", PS3BootROMState, dev_flash),
     DEFINE_PROP_STRING("dev-flash3", PS3BootROMState, dev_flash3),
     DEFINE_PROP_BOOL("vsh-run", PS3BootROMState, vsh_run, false),

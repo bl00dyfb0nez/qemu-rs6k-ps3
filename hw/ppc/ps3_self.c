@@ -580,6 +580,20 @@ bool ps3_self_decrypt_app(uint8_t *img, size_t len, char *why, size_t why_len)
                                (unsigned)ARRAY_SIZE(self_app_keys), why, why_len);
 }
 
+bool ps3_self_decrypt_key(uint8_t *img, size_t len, const char *erk,
+                          const char *riv, char *why, size_t why_len)
+{
+    const struct SelfKey key = { erk, riv };
+
+    if (!erk || !riv || strlen(erk) != 64 || strlen(riv) != 32) {
+        snprintf(why, why_len, "the explicit key must be 64 ERK and 32 RIV "
+                 "hex digits");
+        return false;
+    }
+
+    return self_decrypt_tables(img, len, &key, 1, why, why_len);
+}
+
 int ps3_self_load_ls(uint8_t *img, size_t len, uint8_t *ls, size_t ls_size,
                      uint32_t *entry_out, unsigned *segments, char *why,
                      size_t why_len)

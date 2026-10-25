@@ -246,6 +246,61 @@ This is also why `lv0.2` is not one of the `.2` loaders: `lv1ldr.2`,
 signed record of lv0.  Older consoles without lv0.2 keep the original sigfail
 path.
 
+### The application stage: vsh.self
+
+`appldr` is the last loader: it opens `/dev_flash/vsh/module/vsh.self` and
+hands it to lv2, which creates the VSH process.  This model now does the
+container and ELF work itself, so the application image can be brought up on
+the PPU without lv2's process manager:
+
+* the SELF metadata is opened with the application keyset (revision 0x1C is
+  built in, and `vsh-erk` / `vsh-riv` accept any other pair as 64/32 hex
+  digits);
+* each `PT_LOAD` section is taken from its metadata descriptor, zlib-expanded
+  when `compressed == 2`, and placed at its physical address;
+* `e_entry` is treated as an OPD descriptor, so the PPU starts at its first
+  word with `r2` loaded from its second word (the TOC).  The VSH's first
+  instructions at `0x10230` are the usual `lis/ori/lwz` TOC setup, which
+  confirms the descriptor.
+
+`vsh-self` names the image, or `dev-flash` / `dev-flash3` name a firmware
+root and the loader looks for `vsh/module/vsh.self` there:
+
+```sh
+Q=build-ps3/qemu-system-ppc64.exe
+$Q -M rs6000-ps3 -display none \
+   -global ps3-boot-rom.dev-flash=C:/rpcs3/build/bin/dev_flash \
+   -global ps3-boot-rom.vsh-dump=vsh.dec
+```
+
+Without `vsh-run` this is load-only: the segments are mapped and the command
+exits 0, which is the check that the application keyset, the zlib sections and
+the addresses are right.  With `vsh-run=on` the PPU enters the VSH for a real
+LLE run:
+
+```sh
+$Q -M rs6000-ps3 -display none \
+   -global ps3-boot-rom.dev-flash=C:/rpcs3/build/bin/dev_flash \
+   -global ps3-boot-rom.vsh-run=on \
+   -global ps3-boot-rom.ppu-ticks=8 -global ps3-boot-rom.ppu-tick-ns=1000000 \
+   -global ps3-boot-rom.ppu-trace=on
+```
+
+Observed with the 4.93 `vsh.self` (3,154,016 bytes): two segments,
+`0x10000+0x6ABEA8` and `0x6C0000+0x91548`, both zlib.  The ELF entry is
+`0x6D5AC8`; its OPD gives code `0x10230` and TOC `0x6F5558`.  The guest runs
+from `_start` through its C runtime setup and reaches the lv2 boundary at
+`0x60C5C0` (first syscall `0x16`, `_sys_process_exit`), then `0x3DC`.
+
+A bare PPU has no handler at the `0xC00` vector, so `vsh-run` installs a small
+trampoline there.  It records the syscall number at RAM `0x800`, returns
+`-ENOSYS` in `r3`, restores `SRR0` and `rfid`s back to the caller.  That is a
+bring-up probe, not an lv2 implementation: it lets the guest's own startup
+path run far enough to identify the services it needs.  The next real step is
+the lv2 syscall layer (process/thread creation, memory containers and the
+module loader); until that exists, VSH can be mapped and entered, but not
+completed.
+
 ## Using it with the low-level boot chain
 
 The chain this model follows, in order:
@@ -257,6 +312,7 @@ The chain this model follows, in order:
 | 3 | the decrypted lv0ldr payload (SPU) | same run, on the SPU interpreter |
 | 4 | `lv1ldr`, `lv2ldr`, `appldr`, `isoldr` SELFs | `stage-elf`, one run per loader |
 | 5 | `lv0` (PPU hypervisor) | `ppu-elf` + `ppu-entry=0xc40`, runs on the 970FX |
+| 6 | `vsh.self` (application layer) | `vsh-self` / `dev-flash`, mapped and optionally entered with `vsh-run` |
 
 Steps 1-3 are one command. Step 4 has no automatic hand-off: each loader is
 handed its work through the local store (wait flag at `0x3E000`, arguments at

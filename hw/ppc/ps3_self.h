@@ -46,6 +46,10 @@ bool ps3_self_decrypt(uint8_t *img, size_t len, char *why, size_t why_len);
  */
 bool ps3_self_decrypt_app(uint8_t *img, size_t len, char *why, size_t why_len);
 
+/* Open with one caller-supplied ERK/RIV pair (hex, 64 and 32 digits). */
+bool ps3_self_decrypt_key(uint8_t *img, size_t len, const char *erk,
+                          const char *riv, char *why, size_t why_len);
+
 /*
  * Decrypt `img`, then place its segments into `ls` at their link addresses and
  * return the entry point.  Segments with no file data are zero-filled, which is
