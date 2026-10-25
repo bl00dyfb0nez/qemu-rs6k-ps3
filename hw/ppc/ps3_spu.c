@@ -56,6 +56,11 @@ struct PS3SPU {
     bool has_ch66;
     unsigned ch66_pos;
 
+    /* Channel 73: two 32-bit version words, drained in order by isoldr. */
+    uint32_t ch73[2];
+    bool has_ch73;
+    unsigned ch73_pos;
+
     uint32_t sig_hi;
     uint32_t sig_lo;
 
@@ -443,6 +448,11 @@ static uint32_t ch_read(PS3SPU *spu, unsigned ch)
             return be32(spu->ch66 + 4 * spu->ch66_pos++);
         }
         return 0;
+    case 0x49:                                  /* channel 73: loader version */
+        if (spu->has_ch73 && spu->ch73_pos < 2) {
+            return spu->ch73[spu->ch73_pos++];
+        }
+        return 0;
     default:
         return 0;
     }
@@ -455,6 +465,8 @@ static uint32_t ch_read_count(PS3SPU *spu, unsigned ch)
         return spu->tag_count;
     case 0x42:
         return (spu->has_ch66 && spu->ch66_pos < 8) ? 1 : 0;
+    case 0x49:
+        return (spu->has_ch73 && spu->ch73_pos < 2) ? 2 - spu->ch73_pos : 0;
     default:
         return 0;
     }
@@ -570,6 +582,14 @@ void ps3_spu_set_ch66(PS3SPU *spu, const uint8_t key[32])
     memcpy(spu->ch66, key, 32);
     spu->has_ch66 = true;
     spu->ch66_pos = 0;
+}
+
+void ps3_spu_set_ch73(PS3SPU *spu, uint32_t hi, uint32_t lo)
+{
+    spu->ch73[0] = hi;
+    spu->ch73[1] = lo;
+    spu->has_ch73 = true;
+    spu->ch73_pos = 0;
 }
 
 void ps3_spu_set_sig(PS3SPU *spu, uint32_t hi, uint32_t lo)

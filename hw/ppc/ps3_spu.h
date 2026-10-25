@@ -23,6 +23,13 @@ void ps3_spu_free(PS3SPU *spu);
 /* The 32 bytes the ROM reads from channel 66, in read order. */
 void ps3_spu_set_ch66(PS3SPU *spu, const uint8_t key[32]);
 
+/*
+ * Channel 73: the loader version is handed over in two rounds.  isoldr reads
+ * the high 32 bits first and the low 32 bits second; 0x0003004100000000 is
+ * firmware 3.41's answer, i.e. 0x00030041 then 0.
+ */
+void ps3_spu_set_ch73(PS3SPU *spu, uint32_t hi, uint32_t lo);
+
 /* SPU_RdSigNotify1/2, the image effective address the ROM fetches. */
 void ps3_spu_set_sig(PS3SPU *spu, uint32_t hi, uint32_t lo);
 

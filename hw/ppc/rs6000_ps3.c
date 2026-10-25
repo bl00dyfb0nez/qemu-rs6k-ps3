@@ -66,7 +66,9 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/core/boards.h"
+#include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
@@ -79,6 +81,7 @@
 #include "system/block-backend-io.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 
 #include "ps3_spu.h"
@@ -502,8 +505,30 @@ struct PS3BootROMState {
     /* One SPU stage image run on its own, for the boot-chain tests. */
     char *stage_elf;
     char *stage_dump;
+    char *stage_args;
     uint32_t stage_entry;
     uint64_t stage_limit;
+    uint64_t stage_wait;
+    uint64_t stage_version;
+
+    /*
+     * The PPU side of the chain.  lv0 and everything above it are 64-bit
+     * PowerPC, not SPU code, so they need the real CPU core rather than the
+     * SPU interpreter.  The stage loader places such an ELF in RAM and starts
+     * the 970FX at its entry point; the timer below is how a headless test
+     * bounds the run and reports where the core got to.
+     */
+    MemoryRegion *ram;
+    char *ppu_elf;
+    char *ppu_dump;
+    uint32_t ppu_entry;
+    uint64_t ppu_ticks;
+    uint64_t ppu_tick_ns;
+    QEMUTimer *ppu_timer;
+    uint64_t ppu_tick_count;
+    uint64_t ppu_last_pc;
+    bool ppu_trace;
+    char ppu_why[160];
 
     uint8_t rom[PS3_ROM_SIZE];
     size_t rom_len;
@@ -1164,6 +1189,119 @@ static void ps3_rom_reset(DeviceState *dev)
 }
 
 static int ps3_spu_stage(PS3BootROMState *s);
+static int ps3_ppu_dump(PS3BootROMState *s);
+static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp);
+
+/*
+ * The loaders' local-store hand-off, from docs/ldrs.txt in the ps3tools tree:
+ * all four spin on the 32-bit word at 0x3E000 until it equals 0xFF, then read
+ * their arguments from 0x3E800.  A stage run can therefore supply the flag and
+ * the argument block before the first instruction, which is what a PPU-side
+ * boot loader would have done.
+ */
+#define PS3_STAGE_WAIT_ADDR 0x3E000
+#define PS3_STAGE_ARGS_ADDR 0x3E800
+#define PS3_STAGE_ARGS_MAX  0x800
+
+static bool ps3_stage_parse_hex(const char *text, uint8_t *out, size_t cap,
+                                size_t *out_len)
+{
+    size_t n = 0;
+    int hi = -1;
+
+    for (; *text; text++) {
+        int v;
+
+        if (g_ascii_isspace(*text) || *text == ':' || *text == '_' ||
+            *text == '-') {
+            continue;
+        }
+
+        v = g_ascii_xdigit_value(*text);
+        if (v < 0) {
+            return false;
+        }
+
+        if (hi < 0) {
+            hi = v;
+        } else {
+            if (n >= cap) {
+                return false;
+            }
+            out[n++] = (hi << 4) | v;
+            hi = -1;
+        }
+    }
+
+    if (hi >= 0) {
+        return false;
+    }
+
+    *out_len = n;
+    return true;
+}
+
+static bool ps3_stage_preload(PS3BootROMState *s, uint8_t *ls,
+                              char *why, size_t why_len)
+{
+    size_t args_len = 0;
+
+    if (s->stage_wait) {
+        for (unsigned i = 0; i < 8; i++) {
+            ls[PS3_STAGE_WAIT_ADDR + i] =
+                (s->stage_wait >> (56 - 8 * i)) & 0xFF;
+        }
+    }
+
+    if (s->stage_args && *s->stage_args) {
+        if (s->stage_args[0] == '@') {
+            g_autofree gchar *buf = NULL;
+            gsize len = 0;
+            g_autoptr(GError) err = NULL;
+
+            if (!g_file_get_contents(s->stage_args + 1, &buf, &len, &err)) {
+                snprintf(why, why_len, "cannot read stage-args %s: %s",
+                         s->stage_args + 1, err->message);
+                return false;
+            }
+            if (len > PS3_STAGE_ARGS_MAX) {
+                snprintf(why, why_len, "stage-args is %u bytes, at most 0x%X fit",
+                         (unsigned)len, PS3_STAGE_ARGS_MAX);
+                return false;
+            }
+            memcpy(ls + PS3_STAGE_ARGS_ADDR, buf, len);
+            args_len = len;
+        } else if (!ps3_stage_parse_hex(s->stage_args, ls + PS3_STAGE_ARGS_ADDR,
+                                        PS3_STAGE_ARGS_MAX, &args_len)) {
+            snprintf(why, why_len,
+                     "stage-args must be hex bytes, or @file for a binary blob");
+            return false;
+        }
+    }
+
+    if (s->stage_version) {
+        ps3_spu_set_ch73(s->spu, s->stage_version >> 32,
+                         (uint32_t)s->stage_version);
+    }
+
+    /*
+     * The loaders take the local-store address of their parameter block in
+     * $3 (their first instruction saves $3 before any call clobbers it).
+     * Point it at the block the caller asked us to preload.
+     */
+    if (args_len) {
+        ps3_spu_set_reg(s->spu, 3, PS3_STAGE_ARGS_ADDR);
+    }
+
+    if (s->stage_wait || args_len || s->stage_version) {
+        info_report("ps3-spu-stage: preloaded wait=0x%" PRIX64 ", %u argument "
+                    "byte(s) at LS 0x%X, version=0x%" PRIX64,
+                    s->stage_wait, (unsigned)args_len, PS3_STAGE_ARGS_ADDR,
+                    s->stage_version);
+    }
+
+    return true;
+}
 
 static bool ps3_readout_from_hex(const char *text, uint8_t out[32])
 {
@@ -1295,6 +1433,22 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     if (s->stage_elf) {
         exit(ps3_spu_stage(s));
     }
+
+    /*
+     * The PPU is the other half of the first stage: lv0 and up are 64-bit
+     * PowerPC.  A dump is extraction only; an image is loaded into RAM and
+     * described to the CPU, which then runs it in the normal VM loop (the
+     * ppu-tick timer bounds and reports that run for the headless tests).
+     */
+    if (s->ppu_dump) {
+        exit(ps3_ppu_dump(s));
+    }
+
+    if (s->ppu_elf) {
+        if (!ps3_ppu_stage(s, errp)) {
+            return;
+        }
+    }
 }
 
 /*
@@ -1377,6 +1531,11 @@ static int ps3_spu_stage(PS3BootROMState *s)
             stage_entry = s->stage_entry;
         }
 
+        if (!ps3_stage_preload(s, ls, why, sizeof(why))) {
+            info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
+            return 2;
+        }
+
         ps3_spu_set_trace(s->spu, s->spu_trace);
         rc = ps3_spu_run(s->spu, stage_entry, s->stage_limit ?: (1 << 22),
                          why, sizeof(why));
@@ -1446,6 +1605,11 @@ static int ps3_spu_stage(PS3BootROMState *s)
         entry = s->stage_entry;
     }
 
+    if (!ps3_stage_preload(s, ls, why, sizeof(why))) {
+        info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
+        return 2;
+    }
+
     ps3_spu_set_trace(s->spu, s->spu_trace);
 
     rc = ps3_spu_run(s->spu, entry, s->stage_limit ?: (1 << 22),
@@ -1460,12 +1624,282 @@ static int ps3_spu_stage(PS3BootROMState *s)
     return rc == 2 ? 1 : 0;
 }
 
+/* ---------------------------------------------------------------------- */
+/* The PPU stage: lv0 and the 64-bit PowerPC side of the chain.            */
+/* ---------------------------------------------------------------------- */
+
+static uint64_t ps3_be64(const uint8_t *p)
+{
+    return ((uint64_t)ps3_be32(p) << 32) | ps3_be32(p + 4);
+}
+
+/*
+ * Open a PPU stage file: either a SELF (opened with the same loader keysets
+ * the SPU stages use) or a plain 64-bit big-endian ELF.  The ELF header is
+ * normally at the front of the certified file, but a SELF's extended header
+ * leaves it at a small offset, so the first 0x400 bytes are searched.
+ *
+ * Returns a pointer to the ELF header inside `img' (which the caller owns),
+ * or NULL with `why' set.
+ */
+static const uint8_t *ps3_ppu_open(uint8_t *img, size_t len,
+                                   char *why, size_t why_len)
+{
+    const uint8_t *elf = img;
+    size_t elf_len = len;
+
+    if (len >= 4 && !memcmp(img, "SCE\0", 4)) {
+        if (!ps3_self_decrypt(img, len, why, why_len)) {
+            return NULL;
+        }
+
+        elf = NULL;
+        for (size_t i = 0x20; i + 0x40 < MIN(len, (size_t)0x400); i += 4) {
+            if (!memcmp(img + i, "\177ELF", 4)) {
+                elf = img + i;
+                elf_len = len - i;
+                break;
+            }
+        }
+
+        if (!elf) {
+            snprintf(why, why_len, "no ELF header inside the SELF");
+            return NULL;
+        }
+    }
+
+    if (elf_len < 64 || memcmp(elf, "\177ELF", 4) ||
+        elf[4] != 2 || elf[5] != 2) {
+        snprintf(why, why_len, "not a 64-bit big-endian ELF");
+        return NULL;
+    }
+
+    return elf;
+}
+
+/*
+ * Extraction form of the PPU stage: open the container, write the decrypted
+ * bytes back out.  A plain ELF needs no opening and is copied as it is.
+ */
+static int ps3_ppu_dump(PS3BootROMState *s)
+{
+    g_autoptr(GError) err = NULL;
+    g_autofree uint8_t *img = NULL;
+    gsize len = 0;
+    char why[160];
+    const uint8_t *elf;
+
+    if (!g_file_get_contents(s->ppu_elf, (gchar **)&img, &len, &err)) {
+        info_report("ps3-ppu: cannot read %s: %s", s->ppu_elf, err->message);
+        return 2;
+    }
+
+    elf = ps3_ppu_open(img, len, why, sizeof(why));
+    if (!elf) {
+        info_report("ps3-ppu: %s: %s", s->ppu_elf, why);
+        return 1;
+    }
+
+    if (!g_file_set_contents(s->ppu_dump, (const char *)img, len, &err)) {
+        info_report("ps3-ppu: cannot write %s: %s", s->ppu_dump, err->message);
+        return 2;
+    }
+
+    info_report("ps3-ppu: %s: %" G_GSIZE_FORMAT " bytes written to %s "
+                "(ELF at 0x%" PRIXPTR ")",
+                s->ppu_elf, len, s->ppu_dump,
+                (uintptr_t)(elf - img));
+    return 0;
+}
+
+static void ps3_ppu_tick(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+    CPUState *cs = qemu_get_cpu(0);
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+
+    s->ppu_last_pc = cpu->env.nip;
+    s->ppu_tick_count++;
+
+    if (s->ppu_trace) {
+        info_report("ps3-ppu: tick %" PRIu64 " pc=0x%" PRIx64
+                    " lr=0x%" PRIx64 " msr=0x%" PRIx64,
+                    s->ppu_tick_count, (uint64_t)cpu->env.nip,
+                    (uint64_t)cpu->env.lr, (uint64_t)cpu->env.msr);
+    }
+
+    if (s->ppu_ticks && s->ppu_tick_count >= s->ppu_ticks) {
+        info_report("ps3-ppu: stopping after %" PRIu64 " ticks at pc=0x%"
+                    PRIx64 " (lr=0x%" PRIx64 ")",
+                    s->ppu_tick_count, s->ppu_last_pc,
+                    (uint64_t)cpu->env.lr);
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        return;
+    }
+
+    timer_mod(s->ppu_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ppu_tick_ns);
+}
+
+/*
+ * Load a 64-bit PowerPC ELF into guest RAM and start the PPU at its entry.
+ * The PS3's physical addresses are the low 36 bits of the ELF's virtual ones;
+ * lv0 links itself at 0 and 0x08000000, both of which are already physical, so
+ * the normal case is a straight copy.  A high virtual address is reduced when
+ * that is what makes it fit.
+ */
+static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
+{
+    g_autoptr(GError) err = NULL;
+    g_autofree uint8_t *img = NULL;
+    gsize len = 0;
+    const uint8_t *elf;
+    uint8_t *ram;
+    uint64_t ram_size;
+    uint64_t entry, phoff;
+    unsigned phentsize, phnum, loaded = 0;
+    uint64_t bytes = 0;
+    CPUState *cs;
+    PowerPCCPU *cpu;
+    char why[160];
+
+    if (!s->ram) {
+        error_setg(errp, "ps3-ppu: no RAM link");
+        return false;
+    }
+
+    if (!g_file_get_contents(s->ppu_elf, (gchar **)&img, &len, &err)) {
+        error_setg(errp, "ps3-ppu: cannot read %s: %s", s->ppu_elf,
+                   err->message);
+        return false;
+    }
+
+    elf = ps3_ppu_open(img, len, why, sizeof(why));
+    if (!elf) {
+        error_setg(errp, "ps3-ppu: %s: %s", s->ppu_elf, why);
+        return false;
+    }
+
+    ram = memory_region_get_ram_ptr(s->ram);
+    ram_size = memory_region_size(s->ram);
+
+    entry = ps3_be64(elf + 0x18);
+    phoff = ps3_be64(elf + 0x20);
+    phentsize = ((unsigned)elf[0x36] << 8) | elf[0x37];
+    phnum = ((unsigned)elf[0x38] << 8) | elf[0x39];
+
+    if (phentsize < 56 || phoff + (uint64_t)phnum * phentsize >
+        len - (size_t)(elf - img)) {
+        error_setg(errp, "ps3-ppu: %s: program header table does not fit",
+                   s->ppu_elf);
+        return false;
+    }
+
+    for (unsigned i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + phoff + (size_t)i * phentsize;
+        uint32_t type = ps3_be32(ph + 0x00);
+        uint64_t off = ps3_be64(ph + 0x08);
+        uint64_t vaddr = ps3_be64(ph + 0x10);
+        uint64_t paddr = ps3_be64(ph + 0x18);
+        uint64_t filesz = ps3_be64(ph + 0x20);
+        uint64_t memsz = ps3_be64(ph + 0x28);
+        uint64_t pa = paddr ? paddr : vaddr;
+        const uint8_t *src = img + (elf - img) + off;
+
+        if (type != 1) {
+            continue;
+        }
+
+        if (off > len - (size_t)(elf - img) ||
+            filesz > len - (size_t)(elf - img) - off || filesz > memsz) {
+            error_setg(errp, "ps3-ppu: %s: segment %u runs past the file",
+                       s->ppu_elf, i);
+            return false;
+        }
+
+        if (pa + memsz > ram_size) {
+            pa &= 0x0FFFFFFF;
+        }
+
+        if (pa + memsz > ram_size) {
+            error_setg(errp, "ps3-ppu: %s: segment %u (0x%" PRIX64
+                       "/0x%" PRIX64 ") does not fit RAM",
+                       s->ppu_elf, i, pa, memsz);
+            return false;
+        }
+
+        memset(ram + pa, 0, memsz);
+        memcpy(ram + pa, src, filesz);
+        loaded++;
+        bytes += filesz;
+
+        info_report("ps3-ppu: segment %u: 0x%" PRIX64 " + 0x%" PRIX64
+                    " -> RAM 0x%" PRIX64 " (filesz 0x%" PRIX64 ")",
+                    i, vaddr, memsz, pa, filesz);
+    }
+
+    if (!loaded) {
+        error_setg(errp, "ps3-ppu: %s carries no loadable segment",
+                   s->ppu_elf);
+        return false;
+    }
+
+    if (s->ppu_entry) {
+        entry = s->ppu_entry;
+    }
+
+    if (entry >= ram_size) {
+        entry &= 0x0FFFFFFF;
+    }
+
+    if (entry >= ram_size) {
+        error_setg(errp, "ps3-ppu: entry 0x%" PRIX64 " is outside RAM", entry);
+        return false;
+    }
+
+    cs = qemu_get_cpu(0);
+    if (!cs) {
+        error_setg(errp, "ps3-ppu: no CPU");
+        return false;
+    }
+
+    cpu = POWERPC_CPU(cs);
+    cpu->env.nip = entry;
+    cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME);
+    cpu->env.msr &= ~((1ULL << MSR_IR) | (1ULL << MSR_DR));
+    s->ppu_last_pc = entry;
+
+    info_report("ps3-ppu: %s: entry=0x%" PRIX64 ", %u segment(s), "
+                "0x%" PRIX64 " bytes; PPU started", s->ppu_elf, entry,
+                loaded, bytes);
+
+    if (s->ppu_tick_ns) {
+        s->ppu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_ppu_tick, s);
+        timer_mod(s->ppu_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ppu_tick_ns);
+    }
+
+    return true;
+}
+
 static const Property ps3_rom_properties[] = {
     DEFINE_PROP_DRIVE("drive", PS3BootROMState, blk),
     DEFINE_PROP_STRING("stage-elf", PS3BootROMState, stage_elf),
+    DEFINE_PROP_LINK("ram", PS3BootROMState, ram, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
+    DEFINE_PROP_STRING("ppu-elf", PS3BootROMState, ppu_elf),
+    DEFINE_PROP_STRING("ppu-dump", PS3BootROMState, ppu_dump),
+    DEFINE_PROP_UINT32("ppu-entry", PS3BootROMState, ppu_entry, 0),
+    DEFINE_PROP_UINT64("ppu-ticks", PS3BootROMState, ppu_ticks, 0),
+    DEFINE_PROP_UINT64("ppu-tick-ns", PS3BootROMState, ppu_tick_ns,
+                       10 * 1000 * 1000),
+    DEFINE_PROP_BOOL("ppu-trace", PS3BootROMState, ppu_trace, false),
     DEFINE_PROP_STRING("stage-dump", PS3BootROMState, stage_dump),
+    DEFINE_PROP_STRING("stage-args", PS3BootROMState, stage_args),
     DEFINE_PROP_UINT32("stage-entry", PS3BootROMState, stage_entry, 0),
     DEFINE_PROP_UINT64("stage-limit", PS3BootROMState, stage_limit, 0),
+    DEFINE_PROP_UINT64("stage-wait", PS3BootROMState, stage_wait, 0),
+    DEFINE_PROP_UINT64("stage-version", PS3BootROMState, stage_version, 0),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
     DEFINE_PROP_STRING("readout", PS3BootROMState, readout),
@@ -1563,6 +1997,7 @@ static void rs6000_ps3_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(mic), 0, PS3_MIC_MMIO_BASE);
 
     rom = qdev_new(TYPE_PS3_BOOT_ROM);
+    object_property_set_link(OBJECT(rom), "ram", OBJECT(ram), &error_abort);
 
     if (machine->firmware) {
         qdev_prop_set_string(rom, "rom-file", machine->firmware);
