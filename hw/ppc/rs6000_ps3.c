@@ -2017,6 +2017,63 @@ static void ps3_lv2_relink_all(PS3BootROMState *s, uint8_t *ram,
  * exports are patched, so a stray match elsewhere in the image cannot do any
  * damage.
  */
+/* A library name is a short run of letters, digits and underscores. */
+static bool ps3_lv2_library_name(const uint8_t *ram, uint64_t ram_size,
+                                 uint32_t addr, char *out, size_t cap)
+{
+    size_t n;
+
+    if (!ps3_lv2_guest_string((uint8_t *)ram, ram_size, addr, out, cap)) {
+        return false;
+    }
+
+    n = strlen(out);
+    if (n < 2 || n > 27 || (!g_ascii_isalpha(out[0]) && out[0] != '_')) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        if (!g_ascii_isalnum(out[i]) && out[i] != '_') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* One table entry plus its library name, with everything bounds-checked. */
+static bool ps3_lv2_entry(const uint8_t *ram, uint64_t ram_size, uint32_t addr,
+                          uint32_t end, PS3PrxEntry *e, char *lib, size_t cap)
+{
+    if (!ps3_prx_entry(ram, ram_size, addr, end, e) ||
+        (e->size != PS3_PRX_ENTRY_MIN && e->size != PS3_PRX_ENTRY_FULL) ||
+        !e->num_func || e->num_func > 1200 ||
+        !ps3_prx_array(ram_size, e->nids, e->num_func + e->num_var) ||
+        !ps3_prx_array(ram_size, e->addrs, e->num_func + e->num_var)) {
+        return false;
+    }
+
+    return ps3_lv2_library_name(ram, ram_size, e->name, lib, cap);
+}
+
+/* Tables come in runs; a lone struct in the middle of data is a coincidence. */
+static bool ps3_lv2_entry_chained(const uint8_t *ram, uint64_t ram_size,
+                                  uint32_t addr, uint32_t end,
+                                  const PS3PrxEntry *e)
+{
+    PS3PrxEntry next;
+    char lib[28];
+
+    if (ps3_lv2_entry(ram, ram_size, addr + e->size, end, &next, lib,
+                      sizeof(lib))) {
+        return true;
+    }
+
+    return addr >= e->size &&
+           ps3_lv2_entry(ram, ram_size, addr - e->size, end, &next, lib,
+                         sizeof(lib));
+}
+
 /* Does `opd' look like a function descriptor inside [lo, hi)? */
 static bool ps3_lv2_opd_ok(const uint8_t *ram, uint64_t ram_size, uint32_t opd,
                            uint32_t lo, uint32_t hi)
@@ -2053,13 +2110,11 @@ static unsigned ps3_lv2_register_process_exports(PS3BootROMState *s,
         PS3PrxEntry e;
         char lib[28];
 
-        if (!ps3_prx_entry(ram, ram_size, addr, s->vsh_hi, &e) ||
+        if (!ps3_lv2_entry(ram, ram_size, addr, s->vsh_hi, &e, lib,
+                           sizeof(lib)) ||
+            !ps3_lv2_entry_chained(ram, ram_size, addr, s->vsh_hi, &e) ||
             !(e.attributes & PS3_PRX_LIB_ATTRIBUTE) ||
             (e.attributes & PS3_PRX_LIB_STUB) ||
-            !e.num_func ||
-            !ps3_lv2_guest_string(ram, ram_size, e.name, lib, sizeof(lib)) ||
-            !ps3_prx_array(ram_size, e.nids, e.num_func) ||
-            !ps3_prx_array(ram_size, e.addrs, e.num_func) ||
             !ps3_lv2_opd_ok(ram, ram_size, ps3_be32(ram + e.addrs),
                             s->vsh_lo, s->vsh_hi)) {
             continue;
@@ -2097,12 +2152,11 @@ static unsigned ps3_lv2_link_process(PS3BootROMState *s, uint8_t *ram,
         PS3PrxEntry e;
         char lib[28];
 
-        if (!ps3_prx_entry(ram, ram_size, addr, s->vsh_hi, &e) ||
+        if (!ps3_lv2_entry(ram, ram_size, addr, s->vsh_hi, &e, lib,
+                           sizeof(lib)) ||
+            !ps3_lv2_entry_chained(ram, ram_size, addr, s->vsh_hi, &e) ||
             !(e.attributes & PS3_PRX_LIB_STUB) ||
-            !(e.attributes & PS3_PRX_LIB_ATTRIBUTE) ||
-            !ps3_lv2_guest_string(ram, ram_size, e.name, lib, sizeof(lib)) ||
-            !ps3_prx_array(ram_size, e.nids, e.num_func) ||
-            !ps3_prx_array(ram_size, e.addrs, e.num_func)) {
+            !(e.attributes & PS3_PRX_LIB_ATTRIBUTE)) {
             continue;
         }
 
