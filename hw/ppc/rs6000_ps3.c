@@ -4088,6 +4088,8 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     }
     snprintf(s->led_text, sizeof(s->led_text), "green on");
     qemu_console_set_status_led(s->led_text);
+    info_report("ps3-boot-rom: front LED: %s (pretend; the display puts it in "
+                "its window title)", s->led_text);
 
     memory_region_init_io(&s->regs_mr, OBJECT(s), &ps3_rom_regs_ops, s,
                           "ps3-boot-rom.regs", 0x40);

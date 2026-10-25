@@ -142,6 +142,8 @@ Ctrl-A x.
 | `ppu-ticks` | 0 | stop after this many `ppu-tick-ns` periods (0 keeps running) |
 | `ppu-tick-ns` | `10000000` | period between PPU progress reports |
 | `ppu-trace` | off | log PC/LR/MSR each period and the first console reads |
+| `pad-count` | 1 | gamepad ports the console has, 1..7 |
+| `pad-types` | `standard` | product in each port, comma separated (`standard`, `guitar`, `guitar-rb`, `drums`, `drums-rb`, `drums-rb3`, `drums-rr`, `dj`, `dancemat`, `navigation`, `skateboard`); one name applies to every port |
 | `flash-base` | `0x20000000` | window the flash image is mapped at |
 
 Without a readout the device feeds channel 66 32 zero bytes, which is what the
@@ -417,6 +419,13 @@ The calls the VSH asks for, in the order it first asks for them:
 | 352 | `0x160` | `sys_memory_get_user_memory_size` | total RAM and what the heap has left |
 | 389 | `0x185` | `sys_sm_set_fan_policy` | policy and manual duty are state; nothing turns |
 | 409 | `0x199` | `sys_sm_get_fan_policy` | duty from the policy (auto `0x4E`, full `0xFF`), 45 C |
+| 386 | `0x182` | `sys_sm_control_led` | front LED state, published to the display frontends |
+| 500 | `0x1F4` | `sys_hid_manager_open` | handle from `0x100`, and a pad port brings libpad up |
+| 502/503 | `0x1F6`/`0x1F7` | `sys_hid_manager_read`/`ioctl` | pad data, and the `0x054C:0x0268` HID identity |
+| 508-514 | `0x1FC`-`0x202` | focus, permission and hot-key calls | succeed (`check_focus` 1) |
+| 516-522 | `0x204`-`0x20A` | `sys_config_*` | ids from the counter; no service events are queued |
+| 52 | `0x34` | `_sys_ppu_thread_create` | id, and the thread is reported but not scheduled |
+| 50/51/53 | `0x32`/`0x33`/`0x35` | thread stop/restart/start | succeed |
 
 `_sys_process_get_paramsfo` was what used to stop the boot: liblv2 asks for
 the process's PARAM.SFO, and with `-ENOSYS` it printed `liblv2 can't get
@@ -431,6 +440,64 @@ reports the idle curve, full reports `0xFF`, manual reports what was set.  The
 reads as.  Calls the model does not implement answer `-1` (or `-ENOSYS`) and
 are otherwise passed through, so a missing service does not stop the run by
 itself.
+
+### The gamepad ports
+
+There is no USB stack: `sys_io` describes up to seven ports directly, and
+`pad-count` / `pad-types` say how many exist and what sits in each one.  The
+products are the ones RPCS3 knows, with their real vendor and product ids and
+their libpad class profile, so a guitar is a `PCLASS_TYPE_GUITAR` with five
+frets, a strum bar and a whammy, a drum kit is a `PCLASS_TYPE_DRUM` with the
+cymbals its model has, and a Move navigation controller is a navigation
+controller rather than a DualShock 3:
+
+| `pad-types` | vid:pid | class | profile |
+| --- | --- | --- | --- |
+| `standard` | `054C:0268` | standard | 0 |
+| `guitar` / `guitar-rb` | `12BA:0100` / `12BA:0200` | guitar | `0xFF` / `0x7FFF` |
+| `drums` / `drums-rb` / `drums-rb3` / `drums-rr` | `12BA:0120`, `0210`, `0218`, `0300` | drum | `0xBB`, `0xFF`, `0xBF`, `0xFB` |
+| `dj` | `12BA:0140` | DJ | `0x7FF` |
+| `dancemat` | `1CCF:1010` | dance mat | `0xFF` |
+| `navigation` | `054C:042F` | navigation | 0 |
+| `skateboard` | `12BA:0400` | skateboard | 0 (no sticks, no rumble) |
+
+```sh
+$Q -M rs6000-ps3 -display none -global ps3-boot-rom.dev-flash=... \
+   -global ps3-boot-rom.vsh-run=on \
+   -global ps3-boot-rom.pad-count=2 \
+   -global ps3-boot-rom.pad-types=standard,drums
+```
+
+`cellPadInit` (asked for by `sys_hid_manager_open` on a pad port, and by
+libpad itself), `cellPadGetInfo`/`GetInfo2`/`PeriphInfo` and the per-port data
+calls are answered from that table.  A pad reports the length a real one does
+(8 bytes, 20 with press mode, 24 with sensor mode), sticks centred at 128, the
+DS3's rest orientation when sensor mode is on, and the neutral value of every
+peripheral control the product has (whammy `0x80`, five-way switch `0x19`, DJ
+platters `0x80`).  Nothing is pressed: there is no input source yet, so the
+buttons word is zero and `cellPadSetActDirect` only records the motors.
+
+The ports are always in the state the properties described, so a port is
+either there with a product or absent, and the services say which.  That is
+what libpadconfig wants: with the sys_io exports answering `-1` the VSH's
+`libpadconfig_stub.cc` assertion (`ret == CELL_OK`) fired and killed the run;
+it now registers service `0x1030` (PADMANAGER), opens a config handle and gets
+past it.
+
+### The front LED, on the window title
+
+`sys_sm_control_led` is the only path the guest has to the front panel, and a
+virtual console has no lamp.  The model keeps the state (led 0 green, 1 red, 2
+the blue disc LED; action 0 off, 1 on, else blink) and publishes a short text
+through `qemu_console_set_status_led()`, which the display frontends show: a
+GTK build puts it in the window title as `QEMU - green blink`, next to
+`[Paused]`.  It starts as `green on` when the machine is realised, because a
+running emulator is a console that is switched on.  Headless builds still log
+every change as `ps3-ppu: lv2: front LED: green blink`.
+
+Nothing else reads it - there is no power LED register, no GPIO and no syscon
+command - so this is a pretence, not emulation of the lamp's wiring.  It exists
+because the guest's own LED calls are otherwise invisible.
 
 ### Import and export linkage
 
@@ -670,6 +737,43 @@ dump.bin --container <container>` walks every 32-byte window, runs the ladder
 on it, and keeps the window whose derived key reproduces the container's
 CBC-MAC tag. For model work, use a container and readout that were sealed
 together, as in the sample above.
+
+### Decrypting a superslim (4301C) dump
+
+`decrypt_4301c.py` carves and decrypts the two loader containers a CECH-4301C
+keeps in NOR, and proves each result with the container's own CBC-MAC:
+
+| Slot | Container | Opened by |
+| --- | --- | --- |
+| `0x000840` | `metldr.2` | the SPU mask ROM, at power-on |
+| `0xFC0000` | `bootldr` / `lv0ldr` | lv0, after `metldr.2` handed it the key |
+
+```sh
+python decrypt_4301c.py flash_4301c.bin --info
+python decrypt_4301c.py flash_4301c.bin --readout ch66.bin -o out/
+python decrypt_4301c.py flash_4301c.bin --erk erk.bin --eid0 eid0.bin -o out/
+python decrypt_4301c.py flash_4301c.bin --key 8E661E78CDD3D510B9EBC0ECB5F755DA
+```
+
+Three ways in, because the key is whatever that console has:
+
+* `--readout` is the 32 bytes the mask ROM reads from channel 66, in its order.
+  The container key is `Kp = AES-ENC(K_hi, hdr[0x20:0x30] XOR K_lo)`; both
+  orderings of the same readout are tried.
+* `--erk` is the console's 48-byte EID root key.  It derives eid0's
+  "individuals" blob (`AES-256-CBC` over the published seed, both directions),
+  and every key that blob can hand a container is swept; the ERK's halves are
+  swept directly too.  `--eid0` is optional and only adds the eid0 CMAC check.
+* `--key` is a 16-byte container key, for when the expanded value is known
+  already (the SPU's `$7`, or a key recovered by another route).
+
+A wrong key cannot pass the tag, so `MATCH` is proof rather than a guess; when
+nothing authenticates the tool writes nothing and exits 3 (`--force` writes the
+first candidate and labels it `UNVERIFIED`).  Outputs are `metldr.dec` and
+`lv0ldr.dec`, and the reader is checked by `--selftest`, which seals a container
+with a known key and reopens it.  On a paired sample the `lv0ldr` payload is
+byte-identical to `ps3tools`' `bootldrdec.py` output (SHA-256
+`17db3fde46a0bf9a...`).
 
 ### Companion files in the ps3tools tree
 

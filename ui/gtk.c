@@ -292,7 +292,9 @@ static gboolean gd_led_update(gpointer opaque)
     GtkDisplayState *s = opaque;
 
     s->led_update_source = 0;
-    gd_update_caption(s);
+    if (s->window) {
+        gd_update_caption(s);
+    }
     return G_SOURCE_REMOVE;
 }
 
