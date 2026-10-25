@@ -496,6 +496,19 @@ enum {
  */
 #define PS3_LV2_MODULE_MAX  16
 #define PS3_LV2_MODULE_PATH 96
+#define PS3_LV2_EXPORT_MAX  1024
+
+/*
+ * One exported function: a NID a library publishes, and the guest address of
+ * the OPD that describes it.  lv2's linkage is by (library name, NID) because
+ * the NID alone is not unique across libraries.
+ */
+typedef struct PS3Lv2Export {
+    char lib[28];
+    uint32_t nid;
+    uint32_t opd;
+    uint8_t owner;            /* module index + 1, 0 for none */
+} PS3Lv2Export;
 
 typedef struct PS3Lv2Module {
     uint32_t id;
@@ -503,6 +516,19 @@ typedef struct PS3Lv2Module {
     uint32_t size;
     uint32_t entry;
     char path[PS3_LV2_MODULE_PATH];
+    /*
+     * The PRX library header at the start of the image names the module, its
+     * attributes and the two tables lv2 has to walk.  The addresses are the
+     * guest's, and only valid once the relocations have been applied.
+     */
+    char name[28];
+    uint16_t attributes;
+    uint8_t version[2];
+    uint32_t exports_start, exports_end;
+    uint32_t imports_start, imports_end;
+    uint32_t start_opd, stop_opd, prologue_opd;
+    unsigned segments;
+    bool started;
 } PS3Lv2Module;
 
 struct PS3BootROMState {
@@ -593,6 +619,8 @@ struct PS3BootROMState {
     int32_t lv2_exit_status;
     PS3Lv2Module lv2_mod[PS3_LV2_MODULE_MAX];
     unsigned lv2_mod_count;
+    PS3Lv2Export lv2_export[PS3_LV2_EXPORT_MAX];
+    unsigned lv2_export_count;
 
     uint8_t rom[PS3_ROM_SIZE];
     size_t rom_len;
@@ -628,6 +656,11 @@ static uint32_t ps3_be32(const uint8_t *p)
  * The words are this program, already linked, so the runtime needs no
  * assembler:
  *
+ *     stwu  r1, -32(r1)
+ *     stw   r0, 8(r1)        lv2's `sc` preserves every register but r3
+ *     mfcr  r0
+ *     stw   r0, 12(r1)
+ *     stw   r12, 16(r1)
  *     lis   r12, 0
  *     ori   r12, r12, 0xF104
  *     slwi  r12, r12, 16
@@ -639,16 +672,21 @@ static uint32_t ps3_be32(const uint8_t *p)
  *     lwz   r0, 4(r12)       exit flag
  *     cmpwi r0, 0
  *     bne   halt
- *     mfspr r12, 26
- *     mtspr 26, r12
+ *     lwz   r12, 16(r1)
+ *     lwz   r0, 12(r1)
+ *     mtcrf 0xFF, r0
+ *     lwz   r0, 8(r1)
+ *     addi  r1, r1, 32
  *     rfid
  * halt:
  *     b     halt
  */
 static const uint32_t ps3_lv2_shim[] = {
+    0x9421FFE0, 0x90010008, 0x7C000026, 0x9001000C, 0x91810010,
     0x3D800000, 0x618CF104, 0x558C801E, 0x618C0014, 0x916C0000,
     0x3D800000, 0x618C0880, 0x806C0000, 0x800C0004, 0x2C000000,
-    0x40820010, 0x7D9A02A6, 0x7D9A03A6, 0x4C000024, 0x48000000,
+    0x4082001C, 0x81810010, 0x8001000C, 0x7C0FF120, 0x80010008,
+    0x38210020, 0x4C000024, 0x48000000,
 };
 
 static void ps3_put_be32(uint8_t *p, uint32_t v)
@@ -1706,14 +1744,270 @@ static bool ps3_lv2_reloc_one(uint8_t *ram, uint64_t ram_size, uint64_t target,
 }
 
 /*
+ * The PRX library header sits at the first byte of a module's first segment.
+ * It names the module and points at the two tables lv2 walks: the libraries it
+ * exports (`.lib.ent`) and the ones it imports (`.lib.stub`).  The PRX
+ * relocation table covers these pointers too, so after relocation they are
+ * guest addresses and can be read straight out of RAM.
+ */
+#define PS3_PRX_LIB_ATTRIBUTE  0x8000   /* the entry exports a library */
+#define PS3_PRX_LIB_MANAGEMENT 0x4000   /* the entry holds the module hooks */
+#define PS3_PRX_START_NID      0xBC9A0086u
+#define PS3_PRX_STOP_NID       0xAB779874u
+#define PS3_PRX_PROLOGUE_NID   0x0D10FD3Fu
+
+/* One export/import table entry; `size` is zero when it is the full 0x2C. */
+#define PS3_PRX_ENTRY_MIN      0x1C
+#define PS3_PRX_ENTRY_FULL     0x2C
+
+typedef struct PS3PrxEntry {
+    uint32_t size;                 /* stride to the next entry */
+    uint16_t version;
+    uint16_t attributes;
+    uint16_t num_func;
+    uint16_t num_var;
+    uint32_t name;                 /* char[28] */
+    uint32_t nids;                 /* u32[num_func + num_var] */
+    uint32_t addrs;                /* exports: OPDs, imports: slots */
+    uint32_t vnids;
+    uint32_t vstubs;
+} PS3PrxEntry;
+
+static void ps3_put_be16(uint8_t *p, uint16_t v)
+{
+    p[0] = v >> 8;
+    p[1] = v;
+}
+
+static void ps3_put_be64(uint8_t *p, uint64_t v)
+{
+    ps3_put_be32(p, (uint32_t)(v >> 32));
+    ps3_put_be32(p + 4, (uint32_t)v);
+}
+
+static PS3Lv2Module *ps3_lv2_module(PS3BootROMState *s, uint32_t id)
+{
+    for (unsigned i = 0; i < s->lv2_mod_count; i++) {
+        if (s->lv2_mod[i].id && s->lv2_mod[i].id == id) {
+            return &s->lv2_mod[i];
+        }
+    }
+
+    return NULL;
+}
+
+static bool ps3_prx_entry(const uint8_t *ram, uint64_t ram_size, uint32_t addr,
+                          uint32_t end, PS3PrxEntry *e)
+{
+    const uint8_t *p;
+
+    if ((uint64_t)addr + PS3_PRX_ENTRY_MIN > end ||
+        (uint64_t)addr + PS3_PRX_ENTRY_MIN > ram_size) {
+        return false;
+    }
+
+    p = ram + addr;
+    e->size = p[0] ? p[0] : PS3_PRX_ENTRY_FULL;
+    e->version = ps3_be16(p + 2);
+    e->attributes = ps3_be16(p + 4);
+    e->num_func = ps3_be16(p + 6);
+    e->num_var = ps3_be16(p + 8);
+    e->name = ps3_be32(p + 0x10);
+    e->nids = ps3_be32(p + 0x14);
+    e->addrs = ps3_be32(p + 0x18);
+    e->vnids = ps3_be32(p + 0x1C);
+    e->vstubs = ps3_be32(p + 0x20);
+
+    return e->size >= PS3_PRX_ENTRY_MIN;
+}
+
+/* Do `count' words at `addr' stay inside RAM? */
+static bool ps3_prx_array(uint64_t ram_size, uint32_t addr, unsigned count)
+{
+    return (uint64_t)addr + 4ull * count <= ram_size;
+}
+
+static void ps3_lv2_add_export(PS3BootROMState *s, const char *lib,
+                               uint32_t nid, uint32_t opd, unsigned owner)
+{
+    PS3Lv2Export *e;
+
+    if (s->lv2_export_count == PS3_LV2_EXPORT_MAX) {
+        return;
+    }
+
+    e = &s->lv2_export[s->lv2_export_count++];
+    g_strlcpy(e->lib, lib, sizeof(e->lib));
+    e->nid = nid;
+    e->opd = opd;
+    e->owner = owner + 1;
+}
+
+static uint32_t ps3_lv2_find_export(PS3BootROMState *s, const char *lib,
+                                    uint32_t nid)
+{
+    for (unsigned i = 0; i < s->lv2_export_count; i++) {
+        if (s->lv2_export[i].nid == nid &&
+            !strcmp(s->lv2_export[i].lib, lib)) {
+            return s->lv2_export[i].opd;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Walk a module's export table and record every published NID.  The
+ * management entry is not a library: it carries the module's own start, stop
+ * and prologue hooks, which `_sys_prx_start_module` hands back to the caller so
+ * it can run them.
+ */
+static void ps3_lv2_register_exports(PS3BootROMState *s, uint8_t *ram,
+                                     uint64_t ram_size, PS3Lv2Module *m,
+                                     uint32_t start, uint32_t end)
+{
+    uint32_t addr;
+    unsigned added = 0;
+
+    if (!start || end <= start || end > ram_size) {
+        return;
+    }
+
+    for (addr = start; addr + PS3_PRX_ENTRY_MIN <= end; ) {
+        PS3PrxEntry e;
+        char lib[28];
+
+        if (!ps3_prx_entry(ram, ram_size, addr, end, &e) ||
+            !ps3_lv2_guest_string(ram, ram_size, e.name, lib, sizeof(lib)) ||
+            !ps3_prx_array(ram_size, e.nids,
+                            e.num_func + e.num_var) ||
+            !ps3_prx_array(ram_size, e.addrs,
+                            e.num_func + e.num_var)) {
+            break;
+        }
+
+        if (e.attributes & PS3_PRX_LIB_ATTRIBUTE) {
+            for (unsigned i = 0; i < e.num_func; i++) {
+                ps3_lv2_add_export(s, lib, ps3_be32(ram + e.nids + 4 * i),
+                                   ps3_be32(ram + e.addrs + 4 * i),
+                                   m - s->lv2_mod);
+                added++;
+            }
+
+            info_report("ps3-ppu: prx: %s: exports %s (v%u.%u, %u function(s))",
+                        m->path, lib, e.version >> 8, e.version & 0xFF,
+                        e.num_func);
+        } else if (!(e.attributes & PS3_PRX_LIB_MANAGEMENT)) {
+            for (unsigned i = 0; i < e.num_func + e.num_var; i++) {
+                uint32_t nid = ps3_be32(ram + e.nids + 4 * i);
+                uint32_t opd = ps3_be32(ram + e.addrs + 4 * i);
+
+                if (nid == PS3_PRX_START_NID) {
+                    m->start_opd = opd;
+                } else if (nid == PS3_PRX_STOP_NID) {
+                    m->stop_opd = opd;
+                } else if (nid == PS3_PRX_PROLOGUE_NID) {
+                    m->prologue_opd = opd;
+                }
+            }
+        }
+
+        addr += e.size;
+    }
+
+    m->exports_start = start;
+    m->exports_end = end;
+
+    info_report("ps3-ppu: prx: %s: %u export(s) registered, start 0x%X "
+                "stop 0x%X prologue 0x%X", m->path, added, m->start_opd,
+                m->stop_opd, m->prologue_opd);
+}
+
+/*
+ * Resolve a module's import table against what is registered so far.  An
+ * import entry is a library name, a NID array and an array of 4-byte slots;
+ * lv2 writes the exported OPD's address into each slot, and the module's stub
+ * code loads the OPD from there and branches through it.
+ */
+static unsigned ps3_lv2_link_imports(PS3BootROMState *s, uint8_t *ram,
+                                     uint64_t ram_size, PS3Lv2Module *m,
+                                     uint32_t start, uint32_t end)
+{
+    uint32_t addr;
+    unsigned total = 0, linked = 0;
+
+    if (!start || end <= start || end > ram_size) {
+        return 0;
+    }
+
+    for (addr = start; addr + PS3_PRX_ENTRY_MIN <= end; ) {
+        PS3PrxEntry e;
+        char lib[28];
+        unsigned got = 0;
+
+        if (!ps3_prx_entry(ram, ram_size, addr, end, &e) ||
+            !ps3_lv2_guest_string(ram, ram_size, e.name, lib, sizeof(lib)) ||
+            !ps3_prx_array(ram_size, e.nids,
+                            e.num_func + e.num_var) ||
+            !ps3_prx_array(ram_size, e.addrs,
+                            e.num_func + e.num_var)) {
+            break;
+        }
+
+        for (unsigned i = 0; i < e.num_func; i++) {
+            uint32_t slot = e.addrs + 4 * i;
+            uint32_t nid = ps3_be32(ram + e.nids + 4 * i);
+            uint32_t opd = ps3_lv2_find_export(s, lib, nid);
+
+            total++;
+
+            if (!opd) {
+                continue;
+            }
+
+            ps3_put_be32(ram + slot, opd);
+            got++;
+            linked++;
+        }
+
+        if (got) {
+            info_report("ps3-ppu: prx: %s: linked %u/%u import(s) from %s",
+                        m->path, got, e.num_func, lib);
+        }
+
+        addr += e.size;
+    }
+
+    m->imports_start = start;
+    m->imports_end = end;
+
+    return linked;
+}
+
+/*
+ * A new module's exports can satisfy imports that another module (or the
+ * process) asked for earlier, so every known import table is walked again.
+ * lv2 does the same: modules are linked in both directions as they appear.
+ */
+static void ps3_lv2_relink_all(PS3BootROMState *s, uint8_t *ram,
+                               uint64_t ram_size)
+{
+    for (unsigned i = 0; i < s->lv2_mod_count; i++) {
+        PS3Lv2Module *m = &s->lv2_mod[i];
+
+        if (m->imports_end > m->imports_start) {
+            ps3_lv2_link_imports(s, ram, ram_size, m, m->imports_start,
+                                 m->imports_end);
+        }
+    }
+}
+
+/*
  * lv2's module loader, as far as the VSH needs it: open the SELF with the
  * application keyset, expand the stored sections, place the PT_LOAD segments
- * in a module region and run the PRX relocation table against that region.
- *
- * Imports are not linked here - that is the part of lv2 that resolves one
- * module's export table against another's import table - so a module that
- * depends on another module's exports is mapped but not linked.  The load
- * itself is the contract the caller sees: a mapped image and a module id.
+ * in a module region, run the PRX relocation table against that region, and
+ * then link the module's exports and imports the way lv2 does.  The load is
+ * the contract the caller sees: a relocated image and a module id.
  */
 static int32_t ps3_lv2_prx_load(PS3BootROMState *s, uint8_t *ram,
                                 uint64_t ram_size, uint32_t path_addr)
@@ -1971,16 +2265,58 @@ static int32_t ps3_lv2_prx_load(PS3BootROMState *s, uint8_t *ram,
 
     {
         PS3Lv2Module *m = &s->lv2_mod[s->lv2_mod_count++];
+        uint32_t hdr = (uint32_t)(base + load_vaddr[0]);
+        uint32_t exports_start = 0, exports_end = 0;
+        uint32_t imports_start = 0, imports_end = 0;
 
         m->id = ++s->lv2_next_id;
         m->base = (uint32_t)base;
         m->size = (uint32_t)mod_size;
         m->entry = entry;
+        m->segments = loads;
+        m->started = false;
         g_strlcpy(m->path, guest, sizeof(m->path));
+
+        /*
+         * The PRX library header.  A module that has none is still a valid
+         * load - it just exports and imports nothing - so a header that does
+         * not look like one is only reported, not refused.
+         */
+        if (hdr + 0x34 <= ram_size) {
+            uint32_t n = hdr + 4;
+
+            m->attributes = ps3_be16(ram + hdr);
+            m->version[0] = ram[hdr + 2];
+            m->version[1] = ram[hdr + 3];
+
+            for (i = 0; i < sizeof(m->name) - 1 && ram[n + i]; i++) {
+                m->name[i] = ram[n + i];
+            }
+            m->name[i] = 0;
+
+            exports_start = ps3_be32(ram + hdr + 0x24);
+            exports_end   = ps3_be32(ram + hdr + 0x28);
+            imports_start = ps3_be32(ram + hdr + 0x2C);
+            imports_end   = ps3_be32(ram + hdr + 0x30);
+
+            info_report("ps3-ppu: prx: %s: library '%s' v%u.%u, attributes "
+                        "0x%X, exports 0x%X..0x%X, imports 0x%X..0x%X",
+                        guest, m->name, m->version[0], m->version[1],
+                        m->attributes, exports_start, exports_end,
+                        imports_start, imports_end);
+
+            ps3_lv2_register_exports(s, ram, ram_size, m, exports_start,
+                                     exports_end);
+        }
 
         info_report("ps3-ppu: prx: %s: module %u at 0x%X (0x%X bytes, "
                     "%u segment(s), %u relocation(s))",
                     guest, m->id, m->base, m->size, loads, relocations);
+
+        /* The new exports first, then this module's own imports. */
+        ps3_lv2_relink_all(s, ram, ram_size);
+        ps3_lv2_link_imports(s, ram, ram_size, m, imports_start, imports_end);
+
         return (int32_t)m->id;
     }
 }
@@ -2151,14 +2487,164 @@ static void ps3_lv2_service(PS3BootROMState *s)
                                  * container, flags, opt) */
         ret = ps3_lv2_prx_load(s, ram, ram_size, a0);
         break;
+    case 0x1E1:                 /* _sys_prx_start_module(id, flags, opt) */
+    case 0x1E2: {               /* _sys_prx_stop_module(id, flags, opt) */
+        PS3Lv2Module *m = ps3_lv2_module(s, a0);
+        uint32_t opd;
+        uint64_t cmd, res;
+
+        if (!m) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!a2 || (uint64_t)a2 + 0x28 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+
+        cmd = ps3_be64(ram + a2 + 0x08);
+        res = ps3_be64(ram + a2 + 0x18);
+
+        /*
+         * lv2 runs no guest code here: it fills the caller's option block
+         * with the module's entry point and the caller invokes it.  That is
+         * why `cmd' comes back a second time, with the result in `res'.
+         */
+        switch (cmd & 0xF) {
+        case 1:
+            opd = nr == 0x1E1 ? m->start_opd : m->stop_opd;
+            ps3_put_be64(ram + a2 + 0x10, opd ? opd : 0xFFFFFFFFull);
+            if (opd && ps3_be64(ram + a2) != 0x20) {
+                ps3_put_be64(ram + a2 + 0x20,
+                             m->prologue_opd ? m->prologue_opd
+                                             : 0xFFFFFFFFull);
+            }
+            info_report("ps3-ppu: prx: %s: %s entry 0x%X", m->path,
+                        nr == 0x1E1 ? "start" : "stop", opd);
+            ret = 0;
+            break;
+        case 2:
+            if (res & 0xFFFFFFFF) {
+                info_report("ps3-ppu: prx: %s: %s routine returned 0x%" PRIX64,
+                            m->path, nr == 0x1E1 ? "start" : "stop", res);
+                ret = (int32_t)res;
+                break;
+            }
+            if (nr == 0x1E1) {
+                m->started = true;
+            } else {
+                m->started = false;
+            }
+            ret = 0;
+            break;
+        default:
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        break;
+    }
     case 0x1E3:                 /* _sys_prx_unload_module(id, flags, opt) */
         for (i = 0; i < s->lv2_mod_count; i++) {
             if (s->lv2_mod[i].id == a0) {
                 break;
             }
         }
-        ret = i < s->lv2_mod_count ? 0 : PS3_LV2_ESRCH;
+        if (i < s->lv2_mod_count) {
+            /* Its NIDs go away with it; the image itself stays mapped. */
+            for (unsigned j = 0; j < s->lv2_export_count; j++) {
+                if (s->lv2_export[j].owner == i + 1) {
+                    s->lv2_export[j].owner = 0;
+                    s->lv2_export[j].opd = 0;
+                }
+            }
+            s->lv2_mod[i].id = 0;
+            s->lv2_mod[i].started = false;
+            ret = 0;
+        } else {
+            ret = PS3_LV2_ESRCH;
+        }
         break;
+    case 0x1EE: {               /* _sys_prx_get_module_list(flags, opt) */
+        uint32_t max, count = 0, list;
+
+        if (!a1 || (uint64_t)a1 + 0x1C > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+
+        max = ps3_be32(ram + a1 + 0x0C);
+        list = ps3_be32(ram + a1 + 0x14);
+
+        for (i = 0; i < s->lv2_mod_count && count < max; i++) {
+            if (!s->lv2_mod[i].id) {
+                continue;
+            }
+            if (list && (uint64_t)list + 4 * (count + 1) <= ram_size) {
+                ps3_put_be32(ram + list + 4 * count, s->lv2_mod[i].id);
+            }
+            count++;
+        }
+
+        ps3_put_be32(ram + a1 + 0x10, count);
+        ret = 0;
+        break;
+    }
+    case 0x1EF: {               /* _sys_prx_get_module_info(id, flags, opt) */
+        PS3Lv2Module *m = ps3_lv2_module(s, a0);
+        uint32_t info;
+        uint32_t filename, filename_size;
+
+        if (!m) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!a2 || (uint64_t)a2 + 0x10 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+
+        info = ps3_be32(ram + a2 + 0x08);
+        if (!info || (uint64_t)info + 0x48 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+
+        memset(ram + info + 0x08, 0, 0x40);
+        g_strlcpy((char *)ram + info + 0x08, m->name, 30);
+        ram[info + 0x26] = m->version[0];
+        ram[info + 0x27] = m->version[1];
+        ps3_put_be32(ram + info + 0x28, m->attributes);
+        ps3_put_be32(ram + info + 0x2C, m->start_opd);
+        ps3_put_be32(ram + info + 0x30, m->stop_opd);
+        ps3_put_be32(ram + info + 0x34, m->segments);
+
+        filename = ps3_be32(ram + info + 0x38);
+        filename_size = ps3_be32(ram + info + 0x3C);
+        if (filename && filename_size &&
+            (uint64_t)filename + filename_size <= ram_size) {
+            g_strlcpy((char *)ram + filename, m->path,
+                      MIN(filename_size, (uint32_t)sizeof(m->path)));
+        }
+        ps3_put_be32(ram + info + 0x44, 0);
+        ret = 0;
+        break;
+    }
+    case 0x1F0: {               /* _sys_prx_get_module_id_by_name(name, ...) */
+        char name[28];
+
+        if (!ps3_lv2_guest_string(ram, ram_size, a0, name, sizeof(name))) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+
+        for (i = 0; i < s->lv2_mod_count; i++) {
+            if (s->lv2_mod[i].id && !strcmp(s->lv2_mod[i].name, name)) {
+                break;
+            }
+        }
+        ret = i < s->lv2_mod_count ? (int32_t)s->lv2_mod[i].id : 0;
+        break;
+    }
     case 0x1CD: {               /* _sys_prx_get_module_id_by_address(addr) */
         uint32_t id = 0;
 
@@ -2188,14 +2674,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = ps3_lv2_alloc(ram, ram_size, a1, a3);
         break;
     case 0x193: {               /* sys_tty_write(channel, buf, len, written) */
-        uint32_t i;
+        uint32_t n;
 
         if ((uint64_t)a1 + a2 > ram_size || (uint64_t)a3 + 4 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
         }
-        for (i = 0; i < a2; i++) {
-            ps3_uart_putc(s, ram[a1 + i]);
+        for (n = 0; n < a2; n++) {
+            ps3_uart_putc(s, ram[a1 + n]);
         }
         ps3_put_be32(ram + a3, a2);
         ret = 0;
@@ -2568,11 +3054,6 @@ static int ps3_spu_stage(PS3BootROMState *s)
 /* ---------------------------------------------------------------------- */
 /* The PPU stage: lv0 and the 64-bit PowerPC side of the chain.            */
 /* ---------------------------------------------------------------------- */
-
-static uint64_t ps3_be64(const uint8_t *p)
-{
-    return ((uint64_t)ps3_be32(p) << 32) | ps3_be32(p + 4);
-}
 
 /*
  * Open a PPU stage file: either a SELF (opened with the same loader keysets
