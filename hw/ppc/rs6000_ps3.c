@@ -67,6 +67,7 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/sockets.h"
 #include "qemu/timer.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
@@ -386,6 +387,10 @@ enum {
 /* The gamepad ports libpad numbers; sys_io describes all of them. */
 #define PS3_PAD_PORT_MAX    7
 
+/* lv2's sockets: a small table, guest handles are indices above 0x2FF. */
+#define PS3_NET_MAX         32
+#define PS3_NET_FD_BASE     0x300
+
 /*
  * An unresolved import's stub OPD carries this placeholder as its code word:
  * the linker had nothing to write, so it is the loader's job.
@@ -451,6 +456,26 @@ typedef struct PS3Lv2Module {
 /* Guest file handles: small integers, handed out in order. */
 #define PS3_LV2_FD_MAX  32
 #define PS3_LV2_SECTOR  512
+
+/*
+ * PPU threads.  One core still runs guest code, but lv2's threads are now real:-
+ * each has a saved context, and the blocking calls the VSH makes (sleep, join,
+ * exit) hand the core to the next runnable one.  The switch happens from the
+ * tick timer, never in the middle of the syscall trampoline.
+ */
+#define PS3_THREAD_MAX 32
+
+typedef struct PS3Thread {
+    bool used;
+    bool dead;
+    bool blocked;
+    bool main;
+    uint32_t id;
+    uint32_t join_target;
+    uint64_t gpr[32];
+    uint64_t lr, ctr, xer, msr, nip;
+    uint32_t crf[8];
+} PS3Thread;
 
 struct PS3BootROMState {
     SysBusDevice parent_obj;
@@ -612,6 +637,18 @@ struct PS3BootROMState {
     uint32_t pad_max_connect;       /* cellPadInit's argument, 0 = closed */
     uint32_t pad_setting[PS3_PAD_PORT_MAX];
     uint8_t pad_motor[PS3_PAD_PORT_MAX][2]; /* the two vibration motors */
+    int net_fd[PS3_NET_MAX];        /* host sockets behind the guest's */
+    bool net_used[PS3_NET_MAX];
+    uint8_t *net_pending[PS3_NET_MAX]; /* a synthesized DNS reply */
+    unsigned net_pending_len[PS3_NET_MAX];
+    bool net_iface_reported;
+
+    /* The guest's PPU threads and the round-robin that runs them. */
+    PS3Thread thr[PS3_THREAD_MAX];
+    int thr_cur;
+    bool sched_pending;
+    QEMUTimer *sched_timer;
+    bool threads_enabled;           /* opt in: run lv2's threads for real */
     uint32_t hid_next_handle;       /* sys_hid_manager_open's handles */
     uint8_t led_action[3];          /* green, red, blue: 0 off 1 on 2 blink */
     char led_text[24];
@@ -2884,6 +2921,505 @@ static unsigned ps3_pad_connect(const PS3BootROMState *s)
 
 /* A CellPadData word, in place: the length is four bytes, then the words. */
 /*
+ * lv2's network services: the wired link.  The PS3's Ethernet is virtualized
+ * below lv2 (gelic is driven through lv1 hypercalls on a real console), and
+ * the guest here reaches the network only through these sys_net calls, so the
+ * hosts's own stack is what the link is backed by.  Addresses are NetBSD/PS3
+ * sockaddr: length, family, big-endian port, 4-byte address.
+ */
+
+static void ps3_net_close_fd(int fd)
+{
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+static void ps3_net_set_nonblock(int fd)
+{
+#ifdef _WIN32
+    u_long one = 1;
+
+    ioctlsocket(fd, FIONBIO, &one);
+#else
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+#endif
+}
+
+/* Index of the guest handle's slot, or -1 when it is not a live socket. */
+static int ps3_net_index(PS3BootROMState *s, int guest_fd)
+{
+    int i = guest_fd - PS3_NET_FD_BASE;
+
+    if (i < 0 || i >= PS3_NET_MAX || !s->net_used[i]) {
+        return -1;
+    }
+    return i;
+}
+
+static int ps3_net_alloc(PS3BootROMState *s, int host_fd)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_NET_MAX; i++) {
+        if (!s->net_used[i]) {
+            s->net_used[i] = true;
+            s->net_fd[i] = host_fd;
+            return PS3_NET_FD_BASE + i;
+        }
+    }
+    return -EMFILE;
+}
+
+static bool ps3_net_decode_addr(const uint8_t *p, uint32_t len,
+                                struct sockaddr_in *sin)
+{
+    if (!p || len < 8 || p[1] != 2) {
+        return false;
+    }
+
+    memset(sin, 0, sizeof(*sin));
+    sin->sin_family = AF_INET;
+    sin->sin_port = (p[2] << 8) | p[3];
+    memcpy(&sin->sin_addr, p + 4, 4);
+    return true;
+}
+
+static void ps3_net_encode_addr(uint8_t *p, const struct sockaddr_in *sin)
+{
+    p[0] = 16;
+    p[1] = 2;
+    p[2] = sin->sin_port >> 8;
+    p[3] = sin->sin_port;
+    memcpy(p + 4, &sin->sin_addr, 4);
+    memset(p + 8, 0, 8);
+}
+
+/*
+ * The guest's resolver asks the nameserver it was given over UDP.  There is no
+ * nameserver at that address in this model, so a query to it is answered here:
+ * the name is resolved with the host resolver and the reply is queued on the
+ * socket for the guest's next recvfrom.  This is what makes names, and with
+ * them the console's time servers, resolve over the wired link.
+ */
+#define PS3_NET_DNS_IP  "\x0a\x00\x02\x03"   /* 10.0.2.3 */
+
+static int ps3_dns_query_name(const uint8_t *q, unsigned len, char *out,
+                              unsigned cap, unsigned *end)
+{
+    unsigned p = 12, o = 0;
+
+    while (p < len && q[p]) {
+        unsigned n = q[p++];
+
+        if (n > 63 || p + n > len || o + n + 2 > cap) {
+            return -1;
+        }
+        if (o) {
+            out[o++] = '.';
+        }
+        memcpy(out + o, q + p, n);
+        o += n;
+        p += n;
+    }
+    out[o] = 0;
+
+    if (p + 5 > len) {
+        return -1;
+    }
+    *end = p + 5;                 /* zero label + qtype + qclass */
+    return (int)o;
+}
+
+static unsigned ps3_dns_reply(const uint8_t *q, unsigned qlen, uint8_t *out,
+                              unsigned cap)
+{
+    struct addrinfo hints, *res = NULL;
+    char name[256];
+    unsigned end, len;
+    uint8_t ip[4] = { 0, 0, 0, 0 };
+    bool found = false;
+
+    if (qlen < 17 || cap < qlen + 16 ||
+        ps3_dns_query_name(q, qlen, name, sizeof(name), &end) < 0) {
+        return 0;
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(name, NULL, &hints, &res) == 0 && res) {
+        memcpy(ip, &((struct sockaddr_in *)res->ai_addr)->sin_addr, 4);
+        found = true;
+    }
+    if (res) {
+        freeaddrinfo(res);
+    }
+
+    memcpy(out, q, end);
+    out[2] = q[2] | 0x80;            /* QR, keep the query's RD */
+    out[3] = found ? (q[3] | 0x80) : 0x83; /* RA, or NXDOMAIN */
+    out[6] = 0; out[7] = found ? 1 : 0;  /* ANCOUNT */
+    out[8] = 0; out[9] = 0;              /* NSCOUNT */
+    out[10] = 0; out[11] = 0;            /* ARCOUNT */
+    len = end;
+
+    if (found) {
+        static const uint8_t answer[12] = {
+            0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x3C, 0x00, 0x04,
+        };
+
+        memcpy(out + len, answer, sizeof(answer));
+        memcpy(out + len + sizeof(answer), ip, 4);
+        len += sizeof(answer) + 4;
+    }
+
+    info_report("ps3-ppu: net: resolved %s -> %u.%u.%u.%u", name, ip[0],
+                ip[1], ip[2], ip[3]);
+    return len;
+}
+
+static bool ps3_net_dns(PS3BootROMState *s, int ni, const uint8_t *buf,
+                        unsigned len, const struct sockaddr_in *dst)
+{
+    uint8_t reply[512];
+    unsigned n;
+
+    if (ntohs(dst->sin_port) != 53 ||
+        memcmp(&dst->sin_addr, PS3_NET_DNS_IP, 4)) {
+        return false;
+    }
+
+    n = ps3_dns_reply(buf, len, reply, sizeof(reply));
+    if (!n) {
+        return false;
+    }
+
+    g_free(s->net_pending[ni]);
+    s->net_pending[ni] = g_malloc(n);
+    memcpy(s->net_pending[ni], reply, n);
+    s->net_pending_len[ni] = n;
+    return true;
+}
+
+/*
+ * The wired interface's own address, as NetBSD ioctls report it.  ioctl is
+ * request-encoded: the group is 'i' and the low byte names the request, so the
+ * size bits a caller may or may not set do not matter here.  The interface is
+ * the console's Ethernet, with the address block this model gives it.
+ */
+#define PS3_NET_IP      ((const uint8_t [4]){ 10, 0, 2, 15 })
+#define PS3_NET_MASK    ((const uint8_t [4]){ 255, 255, 255, 0 })
+#define PS3_NET_BCAST   ((const uint8_t [4]){ 10, 0, 2, 255 })
+#define PS3_NET_GW      ((const uint8_t [4]){ 10, 0, 2, 2 })
+
+static void ps3_net_ifreq_addr(uint8_t *ram, uint32_t req, const uint8_t ip[4])
+{
+    ram[req + 16] = 16;         /* sockaddr length */
+    ram[req + 17] = 2;          /* AF_INET */
+    ram[req + 18] = 0;
+    ram[req + 19] = 0;
+    memcpy(ram + req + 20, ip, 4);
+    memset(ram + req + 24, 0, 8);
+}
+
+static bool ps3_net_ioctl(uint8_t *ram, uint64_t ram_size, uint32_t request,
+                          uint32_t arg, int32_t *ret)
+{
+    unsigned group = (request >> 8) & 0xFF;
+    unsigned num = request & 0xFF;
+    const uint8_t *ip;
+
+    if (group != 'i' || !arg || (uint64_t)arg + 32 > ram_size) {
+        return false;
+    }
+
+    switch (num) {
+    case 36: {                  /* SIOCGIFCONF */
+        uint32_t len = ps3_be32(ram + arg);
+        uint32_t buf = ps3_be32(ram + arg + 4);
+
+        if (buf && len >= 32 && (uint64_t)buf + 32 <= ram_size) {
+            memset(ram + buf, 0, 32);
+            memcpy(ram + buf, "eth0", 4);
+            ps3_net_ifreq_addr(ram, buf, PS3_NET_IP);
+            ps3_put_be32(ram + arg, 32);
+        } else {
+            ps3_put_be32(ram + arg, 0);
+        }
+        *ret = 0;
+        return true;
+    }
+    case 33:                    /* SIOCGIFADDR */
+        ip = PS3_NET_IP;
+        break;
+    case 37:                    /* SIOCGIFNETMASK */
+        ip = PS3_NET_MASK;
+        break;
+    case 35:                    /* SIOCGIFBRDADDR */
+        ip = PS3_NET_BCAST;
+        break;
+    case 34:                    /* SIOCGIFDSTADDR */
+        ip = PS3_NET_GW;
+        break;
+    case 17:                    /* SIOCGIFFLAGS */
+        memset(ram + arg + 16, 0, 16);
+        ram[arg + 16] = 0x43;   /* UP | BROADCAST | RUNNING */
+        ram[arg + 17] = 0x80;   /* MULTICAST */
+        *ret = 0;
+        return true;
+    case 51:                    /* SIOCGIFMTU */
+        ps3_put_be32(ram + arg + 16, 1500);
+        *ret = 0;
+        return true;
+    default:
+        return false;
+    }
+
+    ps3_net_ifreq_addr(ram, arg, ip);
+    *ret = 0;
+    return true;
+}
+
+static bool ps3_lv2_net(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
+                        uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
+                        uint32_t a3, uint32_t a4, uint32_t a5, int32_t *ret)
+{
+    struct sockaddr_in sin, peer;
+    socklen_t slen = sizeof(peer);
+    int ni;
+    int fd;
+
+    switch (nr) {
+    case 0x2C9:                 /* socket(family, type, protocol) */
+        if (a0 != 2 || (a1 != 1 && a1 != 2)) {
+            *ret = -EAFNOSUPPORT;
+            break;
+        }
+        fd = qemu_socket(AF_INET, a1 == 1 ? SOCK_STREAM : SOCK_DGRAM, 0);
+        if (fd < 0) {
+            *ret = -errno;
+            break;
+        }
+        ps3_net_set_nonblock(fd);
+        *ret = ps3_net_alloc(s, fd);
+        info_report("ps3-ppu: net: socket(%s) = 0x%X",
+                    a1 == 1 ? "stream" : "dgram", *ret);
+        break;
+    case 0x2CA:                 /* close(fd) */
+        ni = ps3_net_index(s, a0);
+        if (ni < 0) {
+            *ret = -EBADF;
+            break;
+        }
+        ps3_net_close_fd(s->net_fd[ni]);
+        s->net_used[ni] = false;
+        g_free(s->net_pending[ni]);
+        s->net_pending[ni] = NULL;
+        s->net_pending_len[ni] = 0;
+        *ret = 0;
+        break;
+    case 0x2BD:                 /* bind(fd, addr, len) */
+        ni = ps3_net_index(s, a0);
+        if (ni < 0 || !ps3_net_decode_addr(ram + a1, a2, &sin)) {
+            *ret = -EINVAL;
+            break;
+        }
+        *ret = bind(s->net_fd[ni], (struct sockaddr *)&sin, sizeof(sin)) < 0 ?
+               -errno : 0;
+        break;
+    case 0x2BE:                 /* connect(fd, addr, len) */
+        ni = ps3_net_index(s, a0);
+        if (ni < 0 || !ps3_net_decode_addr(ram + a1, a2, &sin)) {
+            *ret = -EINVAL;
+            break;
+        }
+        if (connect(s->net_fd[ni], (struct sockaddr *)&sin, sizeof(sin)) < 0 &&
+            errno != EINPROGRESS && errno != EWOULDBLOCK) {
+            *ret = -errno;
+            break;
+        }
+        *ret = 0;
+        break;
+    case 0x2C2:                 /* listen(fd, backlog) */
+        ni = ps3_net_index(s, a0);
+        *ret = ni < 0 ? -EBADF :
+               (listen(s->net_fd[ni], a1) < 0 ? -errno : 0);
+        break;
+    case 0x2BC:                 /* accept(fd, addr*, len*) */
+        ni = ps3_net_index(s, a0);
+        if (ni < 0) {
+            *ret = -EBADF;
+            break;
+        }
+        fd = qemu_accept(s->net_fd[ni], (struct sockaddr *)&peer, &slen);
+        if (fd < 0) {
+            *ret = -errno;
+            break;
+        }
+        ps3_net_set_nonblock(fd);
+        if (a1 && (uint64_t)a1 + 16 <= ram_size) {
+            ps3_net_encode_addr(ram + a1, &peer);
+        }
+        if (a2 && (uint64_t)a2 + 4 <= ram_size) {
+            ps3_put_be32(ram + a2, 16);
+        }
+        *ret = ps3_net_alloc(s, fd);
+        break;
+    case 0x2C6: {               /* sendto(fd, buf, len, flags, addr, alen) */
+        ssize_t sent;
+
+        ni = ps3_net_index(s, a0);
+        if (ni < 0 || !a1 || (uint64_t)a1 + a2 > ram_size) {
+            *ret = -EINVAL;
+            break;
+        }
+        if (a4 && ps3_net_decode_addr(ram + a4, a5, &sin) &&
+            ps3_net_dns(s, ni, ram + a1, a2, &sin)) {
+            sent = a2;          /* answered locally, as the nameserver */
+        } else if (a4 && ps3_net_decode_addr(ram + a4, a5, &sin)) {
+            sent = sendto(s->net_fd[ni], (const void *)(ram + a1), a2, 0,
+                          (struct sockaddr *)&sin, sizeof(sin));
+        } else if (getpeername(s->net_fd[ni], (struct sockaddr *)&sin,
+                               &slen) == 0 &&
+                   ps3_net_dns(s, ni, ram + a1, a2, &sin)) {
+            sent = a2;
+        } else {
+            sent = send(s->net_fd[ni], (const void *)(ram + a1), a2, 0);
+        }
+        *ret = sent < 0 ? -errno : (int32_t)sent;
+        break;
+    }
+    case 0x2C3: {              /* recvfrom(fd, buf, len, flags, addr, len*) */
+        ssize_t got;
+
+        ni = ps3_net_index(s, a0);
+        if (ni < 0 || !a1 || (uint64_t)a1 + a2 > ram_size) {
+            *ret = -EINVAL;
+            break;
+        }
+        if (s->net_pending[ni]) {
+            unsigned n = MIN(a2, s->net_pending_len[ni]);
+
+            memcpy(ram + a1, s->net_pending[ni], n);
+            g_free(s->net_pending[ni]);
+            s->net_pending[ni] = NULL;
+            s->net_pending_len[ni] = 0;
+            if (a4 && (uint64_t)a4 + 16 <= ram_size) {
+                memset(ram + a4, 0, 16);
+                ram[a4] = 16;
+                ram[a4 + 1] = 2;
+                ram[a4 + 2] = 0;
+                ram[a4 + 3] = 53;
+                memcpy(ram + a4 + 4, PS3_NET_DNS_IP, 4);
+                if (a5 && (uint64_t)a5 + 4 <= ram_size) {
+                    ps3_put_be32(ram + a5, 16);
+                }
+            }
+            *ret = (int32_t)n;
+            break;
+        }
+
+        memset(&peer, 0, sizeof(peer));
+        slen = sizeof(peer);
+        if (a4) {
+            got = recvfrom(s->net_fd[ni], (void *)(ram + a1), a2, 0,
+                           (struct sockaddr *)&peer, &slen);
+        } else {
+            got = recv(s->net_fd[ni], (void *)(ram + a1), a2, 0);
+        }
+        if (got < 0) {
+            *ret = -errno;
+            break;
+        }
+        if (a4 && slen >= 16 && (uint64_t)a4 + 16 <= ram_size) {
+            ps3_net_encode_addr(ram + a4, &peer);
+            if (a5 && (uint64_t)a5 + 4 <= ram_size) {
+                ps3_put_be32(ram + a5, 16);
+            }
+        }
+        *ret = (int32_t)got;
+        break;
+    }
+    case 0x2C0:                 /* getsockname(fd, addr*, len*) */
+    case 0x2BF: {               /* getpeername(fd, addr*, len*) */
+        ni = ps3_net_index(s, a0);
+        if (ni < 0) {
+            *ret = -EBADF;
+            break;
+        }
+        memset(&peer, 0, sizeof(peer));
+        slen = sizeof(peer);
+        if (nr == 0x2C0) {
+            getsockname(s->net_fd[ni], (struct sockaddr *)&peer, &slen);
+        } else {
+            getpeername(s->net_fd[ni], (struct sockaddr *)&peer, &slen);
+        }
+        if (a1 && (uint64_t)a1 + 16 <= ram_size) {
+            ps3_net_encode_addr(ram + a1, &peer);
+        }
+        if (a2 && (uint64_t)a2 + 4 <= ram_size) {
+            ps3_put_be32(ram + a2, 16);
+        }
+        *ret = 0;
+        break;
+    }
+    case 0x2C7:                 /* setsockopt: accepted, no tuning */
+        *ret = 0;
+        break;
+    case 0x2C1: {               /* getsockopt(fd, lvl, opt, val, len*) */
+        uint32_t optlen = 0;
+
+        if (a4 && (uint64_t)a4 + 4 <= ram_size) {
+            optlen = ps3_be32(ram + a4);
+        }
+        if (a3 && optlen && (uint64_t)a3 + optlen <= ram_size) {
+            memset(ram + a3, 0, optlen);
+        }
+        *ret = 0;
+        break;
+    }
+    case 0x2C8:                 /* shutdown(fd, how) */
+        ni = ps3_net_index(s, a0);
+        *ret = ni < 0 ? -EBADF :
+               (shutdown(s->net_fd[ni], a1) < 0 ? -errno : 0);
+        break;
+    case 0x2D2:                 /* infoctl(cmd, arg) */
+        if (a0 == 9 && a1 && (uint64_t)a1 + 8 <= ram_size) {
+            /* {u32 zero; u32 name*} - the resolver's nameserver line. */
+            uint32_t name = ps3_be32(ram + a1 + 4);
+            static const char ns[] = "nameserver 10.0.2.3";
+
+            ps3_put_be32(ram + a1, 0);
+            if (name && (uint64_t)name + sizeof(ns) <= ram_size) {
+                memcpy(ram + name, ns, sizeof(ns));
+            }
+        }
+        *ret = 0;
+        break;
+    case 0x2D3:                 /* control: interface commands succeed */
+        *ret = 0;
+        break;
+    case 0x2D4:                 /* bnet_ioctl(fd, request, arg) */
+        if (!ps3_net_ioctl(ram, ram_size, a1, a2, ret)) {
+            *ret = 0;           /* other requests are accepted */
+        } else if (!s->net_iface_reported) {
+            s->net_iface_reported = true;
+            info_report("ps3-ppu: net: wired interface eth0 10.0.2.15/24, "
+                        "gateway 10.0.2.2, DNS 10.0.2.3");
+        }
+        break;
+    default:
+        return false;
+    }
+
+    return true;
+}
+
+/*
  * The host's keyboard, delivered as the pad buttons the recovery menu and the
  * VSH already read: arrows are the d-pad, Enter is cross, Escape is circle,
  * Backspace is square, Space is start and Tab is select.  QEMU hands the events
@@ -3081,18 +3617,160 @@ static void ps3_pad_periph_info(const PS3BootROMState *s, uint8_t *info)
     }
 }
 
+static void ps3_thread_save(PS3Thread *t, CPUPPCState *env)
+{
+    memcpy(t->gpr, env->gpr, sizeof(t->gpr));
+    t->lr = env->lr;
+    t->ctr = env->ctr;
+    t->xer = env->xer;
+    memcpy(t->crf, env->crf, sizeof(t->crf));
+    t->msr = env->msr;
+    t->nip = env->nip;
+}
+
+static void ps3_thread_restore(const PS3Thread *t, CPUPPCState *env)
+{
+    memcpy(env->gpr, t->gpr, sizeof(t->gpr));
+    env->lr = t->lr;
+    env->ctr = t->ctr;
+    env->xer = t->xer;
+    memcpy(env->crf, t->crf, sizeof(t->crf));
+    env->msr = t->msr;
+    env->nip = t->nip;
+}
+
+static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
+{
+    int start = s->thr_cur;
+    int next = -1;
+    int i;
+
+    if (start >= 0 && s->thr[start].used) {
+        ps3_thread_save(&s->thr[start], env);
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: sched: thread 0x%X yields at 0x%" PRIX64
+                        " (lr=0x%" PRIX64 ")", s->thr[start].id,
+                        s->thr[start].nip, s->thr[start].lr);
+        }
+    }
+
+    for (i = 1; i <= PS3_THREAD_MAX; i++) {
+        int idx = (start + i + PS3_THREAD_MAX) % PS3_THREAD_MAX;
+
+        if (s->thr[idx].used && !s->thr[idx].dead && !s->thr[idx].blocked) {
+            next = idx;
+            break;
+        }
+    }
+
+    if (next < 0 && start >= 0 && s->thr[start].used &&
+        !s->thr[start].dead && !s->thr[start].blocked) {
+        next = start;
+    }
+    if (next < 0) {
+        return;
+    }
+
+    s->thr_cur = next;
+    ps3_thread_restore(&s->thr[next], env);
+}
+
+static void ps3_sched_tick(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+    CPUState *cs = qemu_get_cpu(0);
+
+    if (cs && s->sched_pending) {
+        s->sched_pending = false;
+        ps3_sched_switch(s, &POWERPC_CPU(cs)->env);
+    }
+
+    if (s->sched_timer) {
+        timer_mod(s->sched_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  1000000);
+    }
+}
+
 /*
- * A thread the guest asked lv2 to create.
- *
- * One PPU context and no scheduler: the call is given an id and reported, but
- * the body never runs.  The services that thread would call are answered by
- * this model anyway, which is why the VSH can get through its startup with
- * threads that exist only on paper.
+ * A thread the guest asked lv2 to create.  It gets a stack and an entry
+ * context now, and the tick timer starts running it once the creating thread
+ * blocks or sleeps.
  */
-static void ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
-                                   uint64_t ram_size, uint32_t name)
+static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
+                                       uint64_t ram_size, CPUPPCState *env,
+                                       uint32_t entry, uint32_t arg,
+                                       uint32_t stack, uint32_t name)
 {
     char text[32];
+    PS3Thread *t = NULL;
+    uint32_t code, toc, stub, base, size, top;
+    unsigned i;
+
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        if (!s->thr[i].used) {
+            t = &s->thr[i];
+            break;
+        }
+    }
+    if (!t || !entry) {
+        return 0;
+    }
+
+    if (!s->threads_enabled) {
+        /* Default: report the thread without running its body. */
+        uint32_t id = ++s->lv2_next_id;
+
+        g_strlcpy(text, "?", sizeof(text));
+        if (name && !ps3_lv2_guest_string(ram, ram_size, name, text,
+                                          sizeof(text))) {
+            g_strlcpy(text, "?", sizeof(text));
+        }
+        info_report("ps3-ppu: lv2: thread \"%s\" created (id 0x%X) but not "
+                    "scheduled (threads=off)", text, id);
+        return id;
+    }
+
+    size = stack ? (stack & ~0x0000000Fu) : 0x10000;
+    size = CLAMP(size, 0x4000, 0x200000);
+    base = (s->lv2_heap + 0xF) & ~0x0000000Fu;
+    stub = (base + size + 0xF) & ~0x0000000Fu;
+    if ((uint64_t)stub + 0x10 > ram_size ||
+        (uint64_t)base + size > stub) {
+        return 0;
+    }
+    top = base + size - 0x100;
+    ps3_put_be64(ram + top, 0);  /* the outermost frame's back chain */
+    s->lv2_heap = stub + 0x10;
+    ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
+
+    /* Returning from the entry ends at sys_ppu_thread_exit(0). */
+    ps3_put_be32(ram + stub, 0x39600029u);       /* li r11, 0x29 */
+    ps3_put_be32(ram + stub + 4, 0x44000002u);   /* sc */
+    ps3_put_be32(ram + stub + 8, 0x48000000u);   /* b . */
+
+    /*
+     * Two OPD layouts appear here.  A process entry is a 16-byte OPD (64-bit
+     * code and TOC); the small entries sysPrxForUser makes for its thread
+     * thunks are 8 bytes, code then TOC.  Read both and take the packed one
+     * when both halves are usable addresses.
+     */
+    code = ps3_be64(ram + entry);
+    toc = ps3_be64(ram + entry + 8);
+    if ((uint64_t)entry + 16 <= ram_size) {
+        uint32_t code32 = ps3_be32(ram + entry);
+        uint32_t toc32 = ps3_be32(ram + entry + 4);
+
+        if (code32 && code32 < ram_size && toc32 && toc32 < ram_size) {
+            code = code32;
+            toc = toc32;
+        }
+    }
+    if (!toc || toc >= ram_size) {
+        toc = env->gpr[2];
+    }
+    if (!code || code >= ram_size) {
+        return 0;
+    }
 
     g_strlcpy(text, "?", sizeof(text));
     if (name &&
@@ -3100,8 +3778,54 @@ static void ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
         g_strlcpy(text, "?", sizeof(text));
     }
 
-    info_report("ps3-ppu: lv2: thread \"%s\" created (id 0x%X) but not "
-                "scheduled: this model runs one thread", text, s->lv2_next_id);
+    memset(t, 0, sizeof(*t));
+    t->used = true;
+    t->id = ++s->lv2_next_id;
+    /* Start from the creator's registers so r13 (TLS) and r31 stay valid. */
+    memcpy(t->gpr, env->gpr, sizeof(t->gpr));
+    t->gpr[1] = top;
+    t->gpr[2] = toc;
+    t->gpr[3] = arg;
+    /* r13 is the process TLS base; keep it only when it is guest memory. */
+    if (t->gpr[13] >= ram_size) {
+        t->gpr[13] = 0;
+    }
+    t->lr = stub;
+    t->nip = code;
+    /*
+     * The creator runs this call inside lv2, so its MSR has PR clear.  A user
+     * thread must run with PR set, or its sc goes to the hypervisor vector
+     * 0x700 instead of the lv2 trampoline at 0xC00.  lv2 also enables FP and
+     * VR for user processes.
+     */
+    t->msr = env->msr | (1ULL << MSR_PR) | (1ULL << MSR_FP) |
+             (1ULL << MSR_VR);
+
+    if (s->thr_cur < 0) {
+        /* Register the thread that is running now as the process's main one. */
+        for (i = 0; i < PS3_THREAD_MAX; i++) {
+            if (&s->thr[i] != t && !s->thr[i].used) {
+                s->thr[i].used = true;
+                s->thr[i].main = true;
+                s->thr[i].id = 0;
+                /* Its context is saved by the first switch, not here. */
+                s->thr_cur = i;
+                break;
+            }
+        }
+    }
+
+    if (!s->sched_timer) {
+        s->sched_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_sched_tick, s);
+    }
+    s->sched_pending = true;
+    timer_mod(s->sched_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+
+    info_report("ps3-ppu: lv2: thread \"%s\" created (id 0x%X), entry "
+                "0x%X, toc 0x%X, stack 0x%X-0x%X", text, t->id, code, toc,
+                base, top);
+    return t->id;
 }
 
 /*
@@ -3297,6 +4021,7 @@ static bool ps3_lv2_sys_io(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
     uint32_t a0 = env->gpr[3];
     uint32_t a1 = env->gpr[4];
     uint32_t a2 = env->gpr[5];
+    uint32_t a4 = env->gpr[7];
     uint32_t a5 = env->gpr[8];
     uint32_t a6 = env->gpr[9];
     unsigned connected = ps3_pad_connect(s);
@@ -3594,8 +4319,16 @@ static bool ps3_lv2_sys_io(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
             r = PS3_LV2_EFAULT;
             break;
         }
-        ps3_put_be32(ram + a0, ++s->lv2_next_id);
-        ps3_lv2_thread_created(s, ram, ram_size, a6);
+        {
+            uint32_t tid = ps3_lv2_thread_created(s, ram, ram_size, env,
+                                                  a1, a2, a4, a6);
+
+            if (!tid) {
+                r = -EAGAIN;
+                break;
+            }
+            ps3_put_be32(ram + a0, tid);
+        }
         break;
     default:
         return false;
@@ -3779,7 +4512,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
     PowerPCCPU *cpu;
     uint8_t *ram;
     uint64_t ram_size;
-    uint32_t nr, a0, a1, a2, a3;
+    uint32_t nr, a0, a1, a2, a3, a4, a5;
     unsigned i;
     int32_t ret = PS3_LV2_ENOSYS;
 
@@ -3795,6 +4528,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
     a1 = cpu->env.gpr[4];
     a2 = cpu->env.gpr[5];
     a3 = cpu->env.gpr[6];
+    a4 = cpu->env.gpr[7];
+    a5 = cpu->env.gpr[8];
+
+    /* The wired link: lv2's sys_net calls run on the host's sockets. */
+    if (ps3_lv2_net(s, ram, ram_size, nr, a0, a1, a2, a3,
+                    cpu->env.gpr[7], cpu->env.gpr[8], &ret)) {
+        goto publish;
+    }
 
     if (s->ppu_trace) {
         info_report("ps3-ppu: lv2 syscall 0x%X (lr=0x%" PRIX64
@@ -3865,11 +4606,12 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EFAULT;
             break;
         }
-        s->lv2_container_size = a1 & ~0xFFFFFu;
-        if (!s->lv2_container_size) {
-            ret = PS3_LV2_ENOMEM;
+        if (!a1) {
+            ret = PS3_LV2_EINVAL;
             break;
         }
+        /* lv2 rounds a container up to its 1 MiB granularity. */
+        s->lv2_container_size = (a1 + 0xFFFFF) & ~0xFFFFFu;
         ps3_put_be32(ram + a0, ++s->lv2_next_id);
         ret = 0;
         break;
@@ -4227,10 +4969,12 @@ static void ps3_lv2_service(PS3BootROMState *s)
          */
         if (!s->lv2_usleep_reported) {
             s->lv2_usleep_reported = true;
-            info_report("ps3-ppu: lv2: sys_timer_usleep(%" PRIu64 " us): the "
-                        "model does not wait",
+            info_report("ps3-ppu: lv2: sys_timer_usleep(%" PRIu64 " us): "
+                        "yields to the next guest thread",
                         (uint64_t)cpu->env.gpr[3]);
         }
+        /* A sleep is the scheduler's yield: run whoever is waiting. */
+        s->sched_pending = true;
         ret = 0;
         break;
     }
@@ -4255,9 +4999,57 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
+    case 0x029: {               /* sys_ppu_thread_exit(errorcode) */
+        int idx = s->thr_cur;
+
+        if (idx >= 0 && s->thr[idx].used) {
+            uint32_t id = s->thr[idx].id;
+
+            s->thr[idx].dead = true;
+            for (i = 0; i < PS3_THREAD_MAX; i++) {
+                if (s->thr[i].used && s->thr[i].blocked &&
+                    s->thr[i].join_target == id) {
+                    s->thr[i].blocked = false;
+                }
+            }
+            s->sched_pending = true;
+        }
+        ret = 0;
+        break;
+    }
+    case 0x02C: {               /* sys_ppu_thread_join(id, vptr) */
+        PS3Thread *t = NULL;
+
+        for (i = 0; i < PS3_THREAD_MAX; i++) {
+            if (s->thr[i].used && s->thr[i].id == a0) {
+                t = &s->thr[i];
+                break;
+            }
+        }
+        if (a1 && (uint64_t)a1 + 8 <= ram_size) {
+            ps3_put_be64(ram + a1, 0);
+        }
+        if (t && !t->dead && s->thr_cur >= 0) {
+            s->thr[s->thr_cur].blocked = true;
+            s->thr[s->thr_cur].join_target = a0;
+            s->sched_pending = true;
+        }
+        ret = 0;
+        break;
+    }
     case 0x32:                  /* sys_ppu_thread_stop(thread_id) */
     case 0x33:                  /* sys_ppu_thread_restart(thread_id) */
     case 0x35:                  /* sys_ppu_thread_start(thread_id) */
+        for (i = 0; i < PS3_THREAD_MAX; i++) {
+            if (s->thr[i].used && s->thr[i].id == a0) {
+                s->thr[i].blocked = nr == 0x32;
+                if (nr != 0x32) {
+                    s->thr[i].dead = false;
+                }
+                break;
+            }
+        }
+        s->sched_pending = nr != 0x32;
         ret = 0;
         break;
     case 0x34: {                /* _sys_ppu_thread_create(id*, entry, arg,
@@ -4268,8 +5060,16 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EFAULT;
             break;
         }
-        ps3_put_be32(ram + a0, ++s->lv2_next_id);
-        ps3_lv2_thread_created(s, ram, ram_size, name);
+        {
+            uint32_t tid = ps3_lv2_thread_created(s, ram, ram_size,
+                                                  &cpu->env, a1, a2, a4, name);
+
+            if (!tid) {
+                ret = -EAGAIN;
+                break;
+            }
+            ps3_put_be32(ram + a0, tid);
+        }
         ret = 0;
         break;
     }
@@ -4829,6 +5629,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         break;
     }
 
+publish:
     ps3_put_be32(ram + PS3_LV2_SCRATCH, (uint32_t)ret);
 }
 
@@ -5129,6 +5930,19 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
 static void ps3_rom_realize(DeviceState *dev, Error **errp)
 {
     PS3BootROMState *kbd_s = PS3_BOOT_ROM(dev);
+    unsigned net_i;
+
+    /* No guest thread has been created yet; the first switch registers one. */
+    kbd_s->thr_cur = -1;
+
+    /* No sockets are open until the guest asks for one. */
+    for (net_i = 0; net_i < PS3_NET_MAX; net_i++) {
+        kbd_s->net_used[net_i] = false;
+        kbd_s->net_fd[net_i] = -1;
+    }
+
+    info_report("ps3-boot-rom: wired network: lv2 sys_net sockets on the "
+                "host's stack");
 
     /* The console's keyboard: the window's keys are the pad's buttons. */
     kbd_s->kbd = qemu_input_handler_register(dev, &ps3_kbd_handler);
@@ -6402,6 +7216,7 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_STRING("hdd1-dir", PS3BootROMState, hdd1_dir),
     DEFINE_PROP_UINT32("idle-off-seconds", PS3BootROMState, idle_off_seconds,
                        3600),
+    DEFINE_PROP_BOOL("threads", PS3BootROMState, threads_enabled, false),
     DEFINE_PROP_STRING("hdd-file", PS3BootROMState, hdd_file),
     DEFINE_PROP_UINT64("hdd-size", PS3BootROMState, hdd_size, 20 * GiB),
     DEFINE_PROP_STRING("erk", PS3BootROMState, erk_prop),
