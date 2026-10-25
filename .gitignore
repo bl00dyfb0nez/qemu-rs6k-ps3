@@ -1,5 +1,7 @@
 /GNUmakefile
 /build/
+# Out-of-tree build trees, including the PS3 model's (see PS3_MODEL.md)
+/build-*/
 /.cache/
 /.vscode/
 *.pyc

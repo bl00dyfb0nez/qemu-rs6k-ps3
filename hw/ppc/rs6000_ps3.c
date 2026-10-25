@@ -7,7 +7,8 @@
  *
  * Local research model.  QEMU's code-provenance policy does not allow
  * AI-written code in upstream contributions; this file is an experiment and
- * is not intended to be submitted upstream.
+ * is not intended to be submitted upstream.  Build and run instructions are
+ * in PS3_MODEL.md at the top of the tree.
  *
  * The PS3 is a Cell BE: a 64-bit PowerPC PPU derived from the RS/6000 line,
  * eight SPUs, and a memory interface controller (MIC) that has to be

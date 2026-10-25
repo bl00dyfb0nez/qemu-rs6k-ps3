@@ -1,4 +1,0 @@
-#!/bin/bash
-# SPDX-License-Identifier: GPL-2.0-or-later
-
-exec C:/Users/Thewoodsman/qemu/build-ps3/pyvenv/bin/meson devenv -C C:/Users/Thewoodsman/qemu/build-ps3 -w "$PWD" "$@"
