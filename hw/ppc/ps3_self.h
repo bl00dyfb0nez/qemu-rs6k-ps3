@@ -51,6 +51,16 @@ bool ps3_self_decrypt_key(uint8_t *img, size_t len, const char *erk,
                           const char *riv, char *why, size_t why_len);
 
 /*
+ * The .2 loaders keep their ERK wrapped under the console's per-console root
+ * key 2.  Unwrap it (32 bytes in, 32 out) and then open the SELF with it; both
+ * steps run on the caller's own PCK2, never on a key compiled into the model.
+ */
+void ps3_self_unwrap_erk(const uint8_t wrapped[32], const uint8_t pck2[48],
+                         uint8_t erk[32]);
+bool ps3_self_decrypt_pck2(uint8_t *img, size_t len, const uint8_t pck2[48],
+                           char *why, size_t why_len);
+
+/*
  * Decrypt `img`, then place its segments into `ls` at their link addresses and
  * return the entry point.  Segments with no file data are zero-filled, which is
  * what the loader does for .bss.  Returns 0 on success, 1 when no keyset opened

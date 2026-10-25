@@ -1,0 +1,752 @@
+/*
+ * PS3 framebuffer display ("ps3-vga")
+ *
+ * Copyright (c) 2026
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * The RSX is not modelled, so the machine needs somewhere to show a picture.
+ * This is deliberately the smallest useful scanout: a register block that
+ * names a surface in guest RAM (the XDR region lv2 hands out), and a display
+ * refreshed from it at 60 Hz.  It is not a VGA card and does not pretend to
+ * be one - it is the "display for now" until the RSX exists.
+ *
+ * Registers (big-endian, as the console is):
+ *
+ *   0x00  ID        read-only, 'PS3V'
+ *   0x04  width     pixels, 16..1920
+ *   0x08  height    pixels, 16..1080
+ *   0x0C  stride    bytes per line, 0 means width * 4
+ *   0x10  base      guest physical address of the top-left pixel
+ *   0x14  enable    1 starts scanning out, 0 blanks
+ *   0x18  vblank    read-only, 60 Hz counter the guest can poll
+ *
+ * The pixel format is XRGB8888 (a little-endian 32-bit word on the guest
+ * side), which is what a linear framebuffer is when nothing has configured
+ * an RSX surface yet.
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/cutils.h"
+#include "qemu/error-report.h"
+#include "system/kvm.h"
+#ifdef CONFIG_HVF
+#include "system/hvf.h"
+#endif
+#ifdef CONFIG_WHPX
+#include "system/whpx.h"
+#endif
+#include "qapi/error.h"
+#include "ps3_vga.h"
+#include "ps3_vga_edid.h"
+#include "ui/vgafont.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
+#include "qemu/module.h"
+#include "qemu/timer.h"
+#include "qom/object.h"
+#include "ui/console.h"
+#include "system/physmem.h"
+
+#define TYPE_PS3_VGA "ps3-vga"
+OBJECT_DECLARE_SIMPLE_TYPE(PS3VGAState, PS3_VGA)
+
+#define PS3_VGA_REG_ID      0x00
+#define PS3_VGA_REG_WIDTH   0x04
+#define PS3_VGA_REG_HEIGHT  0x08
+#define PS3_VGA_REG_STRIDE  0x0C
+#define PS3_VGA_REG_BASE    0x10
+#define PS3_VGA_REG_ENABLE  0x14
+#define PS3_VGA_REG_VBLANK  0x18
+#define PS3_VGA_REG_SINK    0x1C   /* 1 = HDMI sink */
+#define PS3_VGA_REG_MAX_W   0x20
+#define PS3_VGA_REG_MAX_H   0x24
+#define PS3_VGA_REG_EDID    0x40   /* 256 bytes, base block + CEA */
+#define PS3_VGA_REG_SIZE    (PS3_VGA_REG_EDID + 256)
+
+#define PS3_VGA_ID          0x50533356  /* 'PS3V' */
+#define PS3_VGA_MAX_WIDTH   1920
+#define PS3_VGA_MAX_HEIGHT  1080
+#define PS3_VGA_REFRESH_NS  (1000000000ULL / 60)
+
+/* The boot screen: 1024x768, 8x16 glyphs, so 128 columns by 48 rows. */
+#define PS3_VGA_BOOT_W      1024
+#define PS3_VGA_BOOT_H      768
+#define PS3_VGA_TEXT_COLS   (PS3_VGA_BOOT_W / 8)
+#define PS3_VGA_TEXT_ROWS   (PS3_VGA_BOOT_H / 16)
+#define PS3_VGA_FG          0x00E6E6E6
+#define PS3_VGA_BG          0x00101418
+
+struct PS3VGAState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion regs;
+    QemuConsole *con;
+    QEMUTimer *refresh;
+
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t base;
+    uint32_t enable;
+    uint32_t vblank;
+
+    bool reported;
+
+    /* The scanout: boot text, then the guest's frame with text over it. */
+    uint32_t *boot_fb;
+    DisplaySurface *boot_surface;
+    char text[PS3_VGA_TEXT_ROWS][PS3_VGA_TEXT_COLS + 1];
+    unsigned lines;
+    bool guest_mode;
+    uint32_t guest_base, guest_w, guest_h, guest_stride;
+    char *dump;                 /* write the boot screen here after a line */
+    bool demo;                  /* take the scanout at reset, to test it */
+    bool allow_highres;         /* kept for old command lines; no gate now */
+    bool bench;                 /* measure the 720p/1080p compose paths */
+    bool av_test;               /* read the EDID, take the scanout, log it */
+};
+
+#define PS3_VGA_OVERLAY_ROWS 6
+
+/*
+ * Which host accelerator is running the machine.  This is reported with the
+ * benchmarks; it no longer gates the scanout, because composing the overlay
+ * measured about 0.07 ms a frame at 1080p under TCG, well inside the budget.
+ */
+static bool ps3_vga_accel(void)
+{
+    if (kvm_enabled()) {
+        return true;
+    }
+#ifdef CONFIG_HVF
+    if (hvf_enabled()) {
+        return true;
+    }
+#endif
+#ifdef CONFIG_WHPX
+    if (whpx_enabled()) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+/*
+ * Only one PS3 board exists in a machine, and the boot code that prints here
+ * is the device's own peer, so a singleton is enough - and it keeps the board
+ * code free of display plumbing.
+ */
+static PS3VGAState *ps3_vga_current;
+
+static void ps3_vga_row_at(PS3VGAState *s, unsigned row, unsigned y0)
+{
+    unsigned x, y, col;
+
+    if (!s->text[row][0] || y0 + 16 > PS3_VGA_BOOT_H) {
+        return;
+    }
+
+    for (y = 0; y < 16; y++) {
+        for (x = 0; x < PS3_VGA_BOOT_W; x++) {
+            s->boot_fb[(y0 + y) * PS3_VGA_BOOT_W + x] = PS3_VGA_BG;
+        }
+    }
+
+    for (col = 0; col < PS3_VGA_TEXT_COLS && s->text[row][col]; col++) {
+        const uint8_t *glyph = vgafont16 +
+                               (unsigned char)s->text[row][col] * 16;
+
+        for (y = 0; y < 16; y++) {
+            for (x = 0; x < 8; x++) {
+                uint32_t v = (glyph[y] & (0x80 >> x)) ?
+                             PS3_VGA_FG : PS3_VGA_BG;
+
+                s->boot_fb[(y0 + y) * PS3_VGA_BOOT_W + col * 8 + x] = v;
+            }
+        }
+    }
+}
+
+static void ps3_vga_text_top(PS3VGAState *s)
+{
+    unsigned row;
+
+    for (row = 0; row < s->lines; row++) {
+        ps3_vga_row_at(s, row, row * 16);
+    }
+}
+
+/*
+ * After the guest owns the scanout the console still has to be readable, so
+ * the last few lines are drawn over the bottom of its frame on a solid bar.
+ */
+static void ps3_vga_text_overlay(PS3VGAState *s)
+{
+    unsigned first = s->lines > PS3_VGA_OVERLAY_ROWS ?
+                     s->lines - PS3_VGA_OVERLAY_ROWS : 0;
+    unsigned y0 = PS3_VGA_BOOT_H - PS3_VGA_OVERLAY_ROWS * 16;
+    unsigned i;
+
+    for (i = 0; i < PS3_VGA_BOOT_H - y0; i++) {
+        memset(&s->boot_fb[(y0 + i) * PS3_VGA_BOOT_W],
+               PS3_VGA_BG, PS3_VGA_BOOT_W * 4);
+    }
+
+    for (i = 0; first + i < s->lines; i++) {
+        ps3_vga_row_at(s, first + i, y0 + i * 16);
+    }
+}
+
+static void ps3_vga_dump_screen(PS3VGAState *s)
+{
+    FILE *f;
+    size_t i;
+
+    if (!s->dump) {
+        return;
+    }
+
+    f = fopen(s->dump, "wb");
+    if (!f) {
+        return;
+    }
+
+    fprintf(f, "P6\n%d %d\n255\n", PS3_VGA_BOOT_W, PS3_VGA_BOOT_H);
+    for (i = 0; i < PS3_VGA_BOOT_W * PS3_VGA_BOOT_H; i++) {
+        uint8_t rgb[3] = { s->boot_fb[i] >> 16, s->boot_fb[i] >> 8,
+                           s->boot_fb[i] };
+
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+}
+
+/* Copy the guest's surface into our own buffer, so the text can sit on top. */
+static void ps3_vga_compose(PS3VGAState *s)
+{
+    hwaddr linesize, size, mapsize;
+    void *map;
+    const uint8_t *p;
+    unsigned rows, cols, x, y;
+
+    if (s->guest_w < 16 || s->guest_w > PS3_VGA_MAX_WIDTH ||
+        s->guest_h < 16 || s->guest_h > PS3_VGA_MAX_HEIGHT ||
+        !s->guest_base) {
+        return;
+    }
+
+    linesize = (hwaddr)s->guest_w * 4;
+    if (!s->guest_stride) {
+        s->guest_stride = linesize;
+    }
+    if (s->guest_stride < linesize) {
+        return;
+    }
+
+    size = (hwaddr)s->guest_stride * (s->guest_h - 1) + linesize;
+    mapsize = size;
+    map = physical_memory_map(s->guest_base, &mapsize, false);
+    if (!map || mapsize != size) {
+        if (map) {
+            physical_memory_unmap(map, mapsize, 0, 0);
+        }
+        return;
+    }
+
+    p = map;
+
+    if (s->guest_w <= PS3_VGA_BOOT_W && s->guest_h <= PS3_VGA_BOOT_H) {
+        rows = s->guest_h;
+        cols = s->guest_w;
+        for (y = 0; y < rows; y++) {
+            memcpy(&s->boot_fb[y * PS3_VGA_BOOT_W],
+                   p + (size_t)y * s->guest_stride, cols * 4);
+        }
+    } else {
+        /*
+         * The VSH renders at 720p or 1080p and this surface is 1024x768, so
+         * the whole guest frame is scaled down instead of being cropped.  The
+         * text overlay is drawn on top of the result, at this surface's rows.
+         */
+        double sc = MAX((double)s->guest_w / PS3_VGA_BOOT_W,
+                        (double)s->guest_h / PS3_VGA_BOOT_H);
+        unsigned dw = MIN((unsigned)(s->guest_w / sc), PS3_VGA_BOOT_W);
+        unsigned dh = MIN((unsigned)(s->guest_h / sc), PS3_VGA_BOOT_H);
+        unsigned x0 = (PS3_VGA_BOOT_W - dw) / 2;
+        unsigned y0 = (PS3_VGA_BOOT_H - dh) / 2;
+
+        memset(s->boot_fb, 0, PS3_VGA_BOOT_W * PS3_VGA_BOOT_H * 4);
+        for (y = 0; y < dh; y++) {
+            const uint32_t *row = (const uint32_t *)
+                (p + (size_t)(y * sc) * s->guest_stride);
+
+            for (x = 0; x < dw; x++) {
+                s->boot_fb[(y0 + y) * PS3_VGA_BOOT_W + x0 + x] =
+                    row[(unsigned)(x * sc)];
+            }
+        }
+    }
+
+    physical_memory_unmap(map, mapsize, 0, 0);
+}
+
+void ps3_vga_puts(const char *line)
+{
+    PS3VGAState *s = ps3_vga_current;
+
+    if (!s || !s->boot_fb) {
+        return;
+    }
+
+    if (s->lines == PS3_VGA_TEXT_ROWS) {
+        memmove(s->text, s->text + 1,
+                sizeof(s->text) - sizeof(s->text[0]));
+        s->lines--;
+    }
+
+    pstrcpy(s->text[s->lines], sizeof(s->text[0]), line);
+    s->lines++;
+
+    if (s->guest_mode) {
+        ps3_vga_compose(s);
+        ps3_vga_text_overlay(s);
+    } else {
+        ps3_vga_row_at(s, s->lines - 1, (s->lines - 1) * 16);
+    }
+
+    if (s->dump) {
+        FILE *f = fopen(s->dump, "wb");
+
+        if (f) {
+            size_t i;
+
+            fprintf(f, "P6\n%d %d\n255\n", PS3_VGA_BOOT_W, PS3_VGA_BOOT_H);
+            for (i = 0; i < PS3_VGA_BOOT_W * PS3_VGA_BOOT_H; i++) {
+                uint8_t rgb[3] = { s->boot_fb[i] >> 16, s->boot_fb[i] >> 8,
+                                   s->boot_fb[i] };
+
+                fwrite(rgb, 1, 3, f);
+            }
+            fclose(f);
+        }
+    }
+
+    qemu_console_update_full(s->con);
+}
+
+void ps3_vga_printf(const char *fmt, ...)
+{
+    char line[PS3_VGA_TEXT_COLS + 1];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    ps3_vga_puts(line);
+}
+
+/*
+ * The surface points straight at guest memory, so a scanout sees whatever the
+ * guest wrote without a copy.  The unmap runs when the console frees the
+ * surface, which is why it is attached to the pixman image rather than done
+ * on the next register write.
+ */
+static void ps3_vga_unmap_surface(pixman_image_t *image, void *unused)
+{
+    void *data = pixman_image_get_data(image);
+    size_t size = pixman_image_get_stride(image) *
+                  pixman_image_get_height(image);
+
+    physical_memory_unmap(data, size, 0, 0);
+}
+
+static DisplaySurface *ps3_vga_surface(PS3VGAState *s)
+{
+    hwaddr linesize, size, mapsize;
+    void *data;
+    DisplaySurface *surface;
+
+    if (s->width < 16 || s->width > PS3_VGA_MAX_WIDTH ||
+        s->height < 16 || s->height > PS3_VGA_MAX_HEIGHT) {
+        return NULL;
+    }
+
+    linesize = (hwaddr)s->width * 4;
+    if (!s->stride) {
+        s->stride = linesize;
+    }
+    if (s->stride < linesize) {
+        return NULL;
+    }
+
+    size = (hwaddr)s->stride * (s->height - 1) + linesize;
+    mapsize = size;
+    data = physical_memory_map(s->base, &mapsize, false);
+    if (!data || mapsize != size) {
+        if (data) {
+            physical_memory_unmap(data, mapsize, 0, 0);
+        }
+        return NULL;
+    }
+
+    surface = qemu_create_displaysurface_from(s->width, s->height,
+                                              PIXMAN_x8r8g8b8,
+                                              s->stride, data);
+    pixman_image_set_destroy_function(surface->image,
+                                      ps3_vga_unmap_surface, NULL);
+    return surface;
+}
+
+static void ps3_vga_frame(PS3VGAState *s)
+{
+    s->vblank++;
+
+    if (!s->guest_mode) {
+        return;
+    }
+
+    ps3_vga_compose(s);
+    ps3_vga_text_overlay(s);
+    qemu_console_update_full(s->con);
+}
+
+static bool ps3_vga_gfx_update(void *opaque)
+{
+    ps3_vga_frame(opaque);
+    return true;
+}
+
+static void ps3_vga_tick(void *opaque)
+{
+    PS3VGAState *s = opaque;
+
+    ps3_vga_frame(s);
+    timer_mod(s->refresh, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          PS3_VGA_REFRESH_NS);
+}
+
+static const GraphicHwOps ps3_vga_ops = {
+    .gfx_update = ps3_vga_gfx_update,
+};
+
+static uint64_t ps3_vga_read(void *opaque, hwaddr offset, unsigned size)
+{
+    PS3VGAState *s = opaque;
+
+    if (offset >= PS3_VGA_REG_EDID && offset < PS3_VGA_REG_EDID + 256) {
+        return ps3_vga_edid[offset - PS3_VGA_REG_EDID];
+    }
+
+    switch (offset) {
+    case PS3_VGA_REG_ID:
+        return PS3_VGA_ID;
+    case PS3_VGA_REG_SINK:
+        return 1;                       /* the console's HDMI sink */
+    case PS3_VGA_REG_MAX_W:
+        return PS3_VGA_MAX_WIDTH;
+    case PS3_VGA_REG_MAX_H:
+        return PS3_VGA_MAX_HEIGHT;
+    case PS3_VGA_REG_WIDTH:
+        return s->width;
+    case PS3_VGA_REG_HEIGHT:
+        return s->height;
+    case PS3_VGA_REG_STRIDE:
+        return s->stride;
+    case PS3_VGA_REG_BASE:
+        return s->base;
+    case PS3_VGA_REG_ENABLE:
+        return s->enable;
+    case PS3_VGA_REG_VBLANK:
+        return s->vblank;
+    default:
+        return 0;
+    }
+}
+
+static void ps3_vga_write(void *opaque, hwaddr offset, uint64_t value,
+                          unsigned size)
+{
+    PS3VGAState *s = opaque;
+
+    switch (offset) {
+    case PS3_VGA_REG_WIDTH:
+        s->width = value;
+        s->stride = 0;
+        break;
+    case PS3_VGA_REG_HEIGHT:
+        s->height = value;
+        break;
+    case PS3_VGA_REG_STRIDE:
+        s->stride = value;
+        break;
+    case PS3_VGA_REG_BASE:
+        s->base = value;
+        break;
+    case PS3_VGA_REG_ENABLE:
+        s->enable = !!value;
+        s->guest_mode = s->enable;
+        s->guest_base = s->base;
+        s->guest_w = s->width;
+        s->guest_h = s->height;
+        s->guest_stride = s->stride;
+        break;
+    default:
+        return;
+    }
+
+    if (!s->guest_mode) {
+        /* Back to the boot screen when the guest disables the scanout. */
+        memset(s->boot_fb, 0, sizeof(uint32_t) * PS3_VGA_BOOT_W *
+               PS3_VGA_BOOT_H);
+        {
+            size_t i;
+
+            for (i = 0; i < PS3_VGA_BOOT_W * PS3_VGA_BOOT_H; i++) {
+                s->boot_fb[i] = PS3_VGA_BG;
+            }
+        }
+        ps3_vga_text_top(s);
+        qemu_console_update_full(s->con);
+        return;
+    }
+
+    if (!s->reported) {
+        s->reported = true;
+        info_report("ps3-vga: guest scanout %ux%u from 0x%X, stride %u; "
+                    "console text stays on top",
+                    s->width, s->height, s->base, s->stride);
+    }
+
+    ps3_vga_compose(s);
+    ps3_vga_text_overlay(s);
+    qemu_console_update_full(s->con);
+}
+
+static const MemoryRegionOps ps3_vga_regs_ops = {
+    .read = ps3_vga_read,
+    .write = ps3_vga_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+static void ps3_vga_realize(DeviceState *dev, Error **errp)
+{
+    PS3VGAState *s = PS3_VGA(dev);
+
+    s->con = qemu_graphic_console_create(dev, 0, &ps3_vga_ops, s);
+
+    /*
+     * The boot screen comes up before the guest has a scanout, so the chain's
+     * progress is visible from the first instruction of the mask ROM.
+     */
+    s->boot_fb = g_new(uint32_t, PS3_VGA_BOOT_W * PS3_VGA_BOOT_H);
+    memset(s->boot_fb, 0, sizeof(uint32_t) * PS3_VGA_BOOT_W *
+           PS3_VGA_BOOT_H);
+    {
+        size_t i;
+
+        for (i = 0; i < PS3_VGA_BOOT_W * PS3_VGA_BOOT_H; i++) {
+            s->boot_fb[i] = PS3_VGA_BG;
+        }
+    }
+    s->boot_surface = qemu_create_displaysurface_from(PS3_VGA_BOOT_W,
+                                                      PS3_VGA_BOOT_H,
+                                                      PIXMAN_x8r8g8b8,
+                                                      PS3_VGA_BOOT_W * 4,
+                                                      (uint8_t *)s->boot_fb);
+    qemu_console_set_surface(s->con, s->boot_surface);
+    s->boot_surface = NULL;     /* the console owns it now */
+
+    ps3_vga_current = s;
+    ps3_vga_printf("PS3 BOOT");
+
+    if (s->bench) {
+        static const uint32_t modes[2][2] = { { 1280, 720 },
+                                              { 1920, 1080 } };
+        unsigned m;
+
+        s->guest_base = 0x100000;
+        s->guest_mode = true;
+
+        for (m = 0; m < 2; m++) {
+            int64_t t0, t1;
+            unsigned i;
+
+            s->guest_w = modes[m][0];
+            s->guest_h = modes[m][1];
+            s->guest_stride = modes[m][0] * 4;
+
+            t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            for (i = 0; i < 300; i++) {
+                ps3_vga_compose(s);
+                ps3_vga_text_overlay(s);
+            }
+            t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+            info_report("ps3-vga: %ux%u compose benchmark: %" PRIu64
+                        " ns/frame (%.1f fps), %s", modes[m][0], modes[m][1],
+                        (uint64_t)((t1 - t0) / 300), 300.0e9 / (double)(t1 - t0),
+                        ps3_vga_accel() ? "hardware accel" : "TCG");
+        }
+    }
+
+    if (s->demo) {
+        s->guest_base = 0x100000;
+        s->guest_w = 640;
+        s->guest_h = 480;
+        s->guest_stride = 640 * 4;
+        s->guest_mode = true;
+        ps3_vga_compose(s);
+        ps3_vga_text_overlay(s);
+        qemu_console_update_full(s->con);
+        ps3_vga_dump_screen(s);
+    }
+
+    s->refresh = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_vga_tick, s);
+    timer_mod(s->refresh, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          PS3_VGA_REFRESH_NS);
+
+    memory_region_init_io(&s->regs, OBJECT(dev), &ps3_vga_regs_ops, s,
+                          TYPE_PS3_VGA ".regs", PS3_VGA_REG_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->regs);
+
+    s->width = 640;
+    s->height = 480;
+
+    if (s->av_test) {
+        uint8_t edid[256];
+        unsigned n, i;
+        uint8_t base = 0, ext = 0;
+
+        const char *name = "?";
+        unsigned oui = 0;
+
+        n = ps3_vga_hdmi_edid(edid, sizeof(edid));
+        for (i = 0; i < 128; i++) {
+            base += edid[i];
+        }
+        for (i = 128; i < 256; i++) {
+            ext += edid[i];
+        }
+        for (i = 54; i + 17 < 126; i += 18) {
+            if (!edid[i] && !edid[i + 1] && !edid[i + 2] &&
+                edid[i + 3] == 0xFC) {
+                name = (const char *)&edid[i + 5];
+            }
+        }
+        for (i = 132; i + 2 < 256; i++) {
+            if (edid[i] == 0x03 && edid[i + 1] == 0x0C &&
+                edid[i + 2] == 0x00) {
+                oui = 0x000C03;
+            }
+        }
+        info_report("ps3-vga: av selftest: EDID %u bytes, header "
+                    "%02x%02x%02x%02x, base checksum 0x%02x, extension "
+                    "checksum 0x%02x, HDMI OUI %s, name '%.13s'",
+                    n, edid[0], edid[1], edid[2], edid[3], base, ext,
+                    oui ? "000C03" : "missing", name);
+
+        /* What lv2's av calls do: read the EDID, then own the scanout. */
+        ps3_vga_guest_scanout(0x100000, 1280, 720, 1280 * 4);
+        ps3_vga_guest_scanout(0x100000, 1920, 1080, 1920 * 4);
+        ps3_vga_puts("AV: HDMI EDID 256 BYTES, 1080P OFFERED");
+        ps3_vga_puts("AV: GUEST OWNS THE SCANOUT, 1920X1080");
+        ps3_vga_dump_screen(s);
+    }
+
+    info_report("ps3-vga: display ready (XRGB8888 linear framebuffer, "
+                "%ux%u until the guest sets a mode)", s->width, s->height);
+}
+
+/* The AV path the guest uses to own the scanout and read the sink's EDID. */
+void ps3_vga_guest_scanout(uint32_t base, uint32_t w, uint32_t h,
+                           uint32_t stride)
+{
+    PS3VGAState *s = ps3_vga_current;
+
+    if (!s || w < 16 || w > PS3_VGA_MAX_WIDTH ||
+        h < 16 || h > PS3_VGA_MAX_HEIGHT) {
+        return;
+    }
+
+    s->guest_base = base;
+    s->guest_w = w;
+    s->guest_h = h;
+    s->guest_stride = stride;
+    s->guest_mode = true;
+
+    ps3_vga_compose(s);
+    ps3_vga_text_overlay(s);
+    qemu_console_update_full(s->con);
+
+    info_report("ps3-vga: guest owns the scanout: %ux%u from 0x%X", w, h,
+                base);
+}
+
+/* cellVideoOutConfigure's result: the guest picked a mode for the sink. */
+void ps3_vga_set_mode(uint32_t w, uint32_t h)
+{
+    PS3VGAState *s = ps3_vga_current;
+
+    if (!s || w < 16 || w > PS3_VGA_MAX_WIDTH ||
+        h < 16 || h > PS3_VGA_MAX_HEIGHT) {
+        return;
+    }
+
+    s->width = w;
+    s->height = h;
+    s->stride = 0;
+
+    info_report("ps3-vga: av selects %ux%u (EDID offers 720p/1080p)", w, h);
+
+    if (s->guest_mode && s->guest_base) {
+        ps3_vga_guest_scanout(s->guest_base, w, h, 0);
+    }
+}
+
+unsigned ps3_vga_hdmi_edid(uint8_t *out, unsigned cap)
+{
+    unsigned n = MIN(cap, (unsigned)sizeof(ps3_vga_edid));
+
+    if (out && n) {
+        memcpy(out, ps3_vga_edid, n);
+    }
+    return n;
+}
+
+static const Property ps3_vga_properties[] = {
+    DEFINE_PROP_STRING("dump", PS3VGAState, dump),
+    DEFINE_PROP_BOOL("demo", PS3VGAState, demo, false),
+    DEFINE_PROP_BOOL("allow-highres", PS3VGAState, allow_highres, false),
+    DEFINE_PROP_BOOL("av-test", PS3VGAState, av_test, false),
+    DEFINE_PROP_BOOL("bench", PS3VGAState, bench, false),
+};
+
+static void ps3_vga_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = ps3_vga_realize;
+    dc->desc = "PS3 linear framebuffer display";
+    device_class_set_props(dc, ps3_vga_properties);
+    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+}
+
+static const TypeInfo ps3_vga_info = {
+    .name = TYPE_PS3_VGA,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(PS3VGAState),
+    .class_init = ps3_vga_class_init,
+};
+
+static void ps3_vga_register_types(void)
+{
+    type_register_static(&ps3_vga_info);
+}
+
+type_init(ps3_vga_register_types)

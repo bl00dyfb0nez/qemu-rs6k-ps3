@@ -77,6 +77,9 @@ ppc_ss.add(when: 'CONFIG_RS6000_PS3', if_true: files(
   'rs6000_ps3.c',
   'ps3_spu.c',
   'ps3_self.c',
+  'ps3_vga.c',
+  'ps3_aes/aes.c',
+  'ps3_aes/ps3_aes.c',
 ))
 # OldWorld PowerMac
 ppc_ss.add(when: 'CONFIG_MAC_OLDWORLD', if_true: files('mac_oldworld.c'))

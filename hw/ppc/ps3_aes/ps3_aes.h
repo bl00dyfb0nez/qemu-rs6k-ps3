@@ -1,0 +1,71 @@
+/*
+ * PS3 AES primitives
+ *
+ * Copyright (c) 2026
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * The block cipher the boot ROM's container opener carries, plus the AES-256
+ * CBC key ladder and the XTS-AES the console's HDD is encrypted with.  The
+ * cipher itself is PolarSSL's (aes.c, GPLv2); this file is the PS3-specific
+ * layer over it so the board model holds the device, not the maths.
+ */
+
+#ifndef PS3_AES_H
+#define PS3_AES_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * AES-128 in the shape the container opener uses: an expanded key is 176
+ * bytes, and the CTR block is a 32-bit counter followed by twelve bytes of
+ * the header (the ROM's own counter block layout).
+ */
+void ps3_aes_expand_key(const uint8_t key[16], uint8_t rk[176]);
+void ps3_aes_encrypt(const uint8_t rk[176], const uint8_t in[16],
+                     uint8_t out[16]);
+void ps3_aes_ctr_block(const uint8_t rk[176], uint32_t counter,
+                       const uint8_t suffix[12], uint8_t out[16]);
+
+/*
+ * AES-256-CBC both ways: the key ladder metldr runs (encrypt) and the
+ * unwrapping of what the ladder sealed (decrypt), which is how the console's
+ * HDD key sector and the wrapped per-console ERK are read back.
+ */
+void ps3_aes_cbc256_encrypt(const uint8_t key[32], const uint8_t iv[16],
+                            const uint8_t *in, uint8_t *out, size_t len);
+void ps3_aes_cbc256_decrypt(const uint8_t key[32], const uint8_t iv[16],
+                            const uint8_t *in, uint8_t *out, size_t len);
+
+/*
+ * The console's ATA data and tweak keys, derived from its 48-byte EID root
+ * key (PCK1: 32 bytes of key, then the 16-byte IV) with the static
+ * "SB indiv" seeds.  PCK1 itself never encrypts disk data: these two keys do,
+ * through XTS, which is what makes a console with its PCK1 able to read its
+ * HDD however often it was reformatted.
+ */
+void ps3_ata_keys(const uint8_t erk[48], uint8_t data_key[32],
+                  uint8_t tweak_key[32]);
+
+/*
+ * XTS-AES over one sector with the ATA keys: 256-bit data and tweak keys,
+ * the sizes naehrwert's ps3_decrypt_tools derive and the order the consoles'
+ * ATA controllers use.  `sector` is the sector number; `len` must be a
+ * multiple of 16 and no larger than a sector (512 bytes).
+ */
+void ps3_xts_crypt_sector(const uint8_t data_key[32],
+                          const uint8_t tweak_key[32], uint64_t sector,
+                          uint8_t *buf, size_t len, bool encrypt);
+
+/*
+ * Known-answer check over the AES-256 CBC and XTS paths: the AES-256-CBC
+ * vector is FIPS-197's key schedule over a fixed block, and the XTS one is
+ * the ATA derivation of a test ERK followed by a sector encryption, both
+ * cross-checked against an independent implementation.  Returns false and
+ * fills `why` when a step disagrees.
+ */
+bool ps3_aes_selftest(char *why, size_t why_len);
+
+#endif /* PS3_AES_H */

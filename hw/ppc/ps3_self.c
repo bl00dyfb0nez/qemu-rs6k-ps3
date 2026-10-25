@@ -580,6 +580,61 @@ bool ps3_self_decrypt_app(uint8_t *img, size_t len, char *why, size_t why_len)
                                (unsigned)ARRAY_SIZE(self_app_keys), why, why_len);
 }
 
+static void bytes_to_hex(const uint8_t *in, size_t n, char *out)
+{
+    static const char digits[] = "0123456789ABCDEF";
+
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2] = digits[in[i] >> 4];
+        out[i * 2 + 1] = digits[in[i] & 15];
+    }
+    out[n * 2] = 0;
+}
+
+/*
+ * The .2 loaders do not hold their ERK in the clear: the 32-byte value is the
+ * ERK wrapped under the console's per-console root key 2 (PCK2), the same
+ * AES-256-CBC shape the HDD key sector uses.  Unwrap it and the following SELF
+ * stages have the real per-console ERK they expect.
+ */
+void ps3_self_unwrap_erk(const uint8_t wrapped[32], const uint8_t pck2[48],
+                         uint8_t erk[32])
+{
+    aes256_cbc_decrypt(pck2, pck2 + 32, wrapped, erk, 32);
+}
+
+bool ps3_self_decrypt_pck2(uint8_t *img, size_t len, const uint8_t pck2[48],
+                           char *why, size_t why_len)
+{
+    unsigned count = ps3_self_key_count();
+    unsigned first = count > 2 ? count - 2 : 0;   /* the .2 keysets */
+
+    for (unsigned k = first; k < count; k++) {
+        uint8_t wrapped[32], erk[32];
+        char erk_hex[65], sub[160];
+        struct SelfKey key;
+
+        if (!hex_to_bytes(self_keys[k].erk, wrapped, sizeof(wrapped))) {
+            continue;
+        }
+
+        ps3_self_unwrap_erk(wrapped, pck2, erk);
+        bytes_to_hex(erk, sizeof(erk), erk_hex);
+        key.erk = erk_hex;
+        key.riv = self_keys[k].riv;
+
+        if (self_decrypt_tables(img, len, &key, 1, sub, sizeof(sub))) {
+            snprintf(why, why_len, "opened with the ERK unwrapped under "
+                     "PCK2 (%s)", sub);
+            return true;
+        }
+    }
+
+    snprintf(why, why_len, "the ERK unwrapped under PCK2 opened no .2 "
+             "keyset");
+    return false;
+}
+
 bool ps3_self_decrypt_key(uint8_t *img, size_t len, const char *erk,
                           const char *riv, char *why, size_t why_len)
 {

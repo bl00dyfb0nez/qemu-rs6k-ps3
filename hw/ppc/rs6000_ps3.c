@@ -63,6 +63,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -78,15 +79,27 @@
 #include "qom/object.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
+#include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
 #include "system/blockdev.h"
+#include "qobject/qdict.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "system/kvm.h"
+#ifdef CONFIG_HVF
+#include "system/hvf.h"
+#endif
+#ifdef CONFIG_WHPX
+#include "system/whpx.h"
+#endif
 #include "ui/console.h"
+#include "ui/input.h"
 
 #include "ps3_spu.h"
 #include "ps3_self.h"
+#include "ps3_vga.h"
+#include "ps3_aes/ps3_aes.h"
 
 #include <zlib.h>
 
@@ -97,140 +110,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(PS3MICState, PS3_MIC)
 OBJECT_DECLARE_SIMPLE_TYPE(PS3BootROMState, PS3_BOOT_ROM)
 
 #define TYPE_RS6000_PS3_MACHINE MACHINE_TYPE_NAME("rs6000-ps3")
-
-/* ---------------------------------------------------------------------- */
-/* AES-128, encryption direction only: the boot ROM only ever encrypts.    */
-
-static const uint8_t ps3_aes_sbox[256] = {
-    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
-    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
-    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
-    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
-    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
-    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
-    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
-    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
-    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
-    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
-    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
-    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
-    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
-    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
-    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
-    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
-};
-
-static const uint8_t ps3_aes_rcon[11] = {
-    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36,
-};
-
-static void ps3_aes_xtime(uint8_t *b)
-{
-    uint8_t hi = *b & 0x80;
-    *b <<= 1;
-
-    if (hi) {
-        *b ^= 0x1B;
-    }
-}
-
-static void ps3_aes_expand_key(const uint8_t key[16], uint8_t rk[176])
-{
-    int i;
-    uint8_t t[4];
-
-    memcpy(rk, key, 16);
-
-    for (i = 4; i < 44; i++) {
-        memcpy(t, rk + (i - 1) * 4, 4);
-
-        if ((i % 4) == 0) {
-            uint8_t first = t[0];
-
-            t[0] = ps3_aes_sbox[t[1]];
-            t[1] = ps3_aes_sbox[t[2]];
-            t[2] = ps3_aes_sbox[t[3]];
-            t[3] = ps3_aes_sbox[first];
-            t[0] ^= ps3_aes_rcon[i / 4];
-        }
-
-        rk[i * 4 + 0] = rk[(i - 4) * 4 + 0] ^ t[0];
-        rk[i * 4 + 1] = rk[(i - 4) * 4 + 1] ^ t[1];
-        rk[i * 4 + 2] = rk[(i - 4) * 4 + 2] ^ t[2];
-        rk[i * 4 + 3] = rk[(i - 4) * 4 + 3] ^ t[3];
-    }
-}
-
-static void ps3_aes_encrypt(const uint8_t rk[176], const uint8_t in[16],
-                            uint8_t out[16])
-{
-    uint8_t state[16];
-    int round, i;
-
-    memcpy(state, in, 16);
-
-    for (i = 0; i < 16; i++) {
-        state[i] ^= rk[i];
-    }
-
-    for (round = 1; round <= 10; round++) {
-        uint8_t tmp[16];
-
-        /* SubBytes and ShiftRows (row r rotates left by r).  The state is
-         * column-major, so the flat index of (row r, column c) is 4*c + r. */
-        for (i = 0; i < 16; i++) {
-            int row = i % 4;
-            int col = i / 4;
-
-            tmp[i] = ps3_aes_sbox[state[((col + row) % 4) * 4 + row]];
-        }
-
-        if (round != 10) {
-            /* MixColumns. */
-            for (i = 0; i < 4; i++) {
-                uint8_t a0 = tmp[i * 4 + 0];
-                uint8_t a1 = tmp[i * 4 + 1];
-                uint8_t a2 = tmp[i * 4 + 2];
-                uint8_t a3 = tmp[i * 4 + 3];
-                uint8_t x0 = a0, x1 = a1, x2 = a2, x3 = a3;
-                uint8_t m0, m1, m2, m3;
-
-                ps3_aes_xtime(&x0);
-                ps3_aes_xtime(&x1);
-                ps3_aes_xtime(&x2);
-                ps3_aes_xtime(&x3);
-
-                m0 = x0 ^ x1 ^ a1 ^ a2 ^ a3;
-                m1 = a0 ^ x1 ^ x2 ^ a2 ^ a3;
-                m2 = a0 ^ a1 ^ x2 ^ x3 ^ a3;
-                m3 = x0 ^ a0 ^ a1 ^ a2 ^ x3;
-                tmp[i * 4 + 0] = m0;
-                tmp[i * 4 + 1] = m1;
-                tmp[i * 4 + 2] = m2;
-                tmp[i * 4 + 3] = m3;
-            }
-        }
-
-        for (i = 0; i < 16; i++) {
-            state[i] = tmp[i] ^ rk[round * 16 + i];
-        }
-    }
-
-    memcpy(out, state, 16);
-}
-
-static void ps3_aes_ctr_block(const uint8_t rk[176], uint32_t counter,
-                              const uint8_t suffix[12], uint8_t out[16])
-{
-    uint8_t block[16];
-
-    block[0] = counter >> 24;
-    block[1] = counter >> 16;
-    block[2] = counter >> 8;
-    block[3] = counter;
-    memcpy(block + 4, suffix, 12);
-    ps3_aes_encrypt(rk, block, out);
-}
 
 /* ---------------------------------------------------------------------- */
 /* The Cell memory interface controller.                                   */
@@ -569,6 +448,10 @@ typedef struct PS3Lv2Module {
     bool started;
 } PS3Lv2Module;
 
+/* Guest file handles: small integers, handed out in order. */
+#define PS3_LV2_FD_MAX  32
+#define PS3_LV2_SECTOR  512
+
 struct PS3BootROMState {
     SysBusDevice parent_obj;
 
@@ -643,7 +526,21 @@ struct PS3BootROMState {
     char *vsh_erk;
     char *vsh_riv;
     char *dev_flash;
+    char *dev_flash2;
     char *dev_flash3;
+    /*
+     * The USB storage the guest sees as dev_usb000: a directory on the host,
+     * which is what an attached FAT32 stick's contents are.  There is no USB
+     * stack and no block layer in the model, so sys_fs serves its files.
+     */
+    char *usb_dir;
+    /*
+     * What the guest sees as dev_hdd0.  A fresh image has no PS3 filesystem,
+     * which is exactly the new-HDD case: the VSH's recovery offers to format,
+     * and this directory is where the format and the system files land.
+     */
+    char *hdd_dir;
+    char *hdd1_dir;              /* dev_hdd1: a title's data area */
     bool vsh_run;
     uint32_t vsh_entry;
     uint32_t vsh_toc;
@@ -665,6 +562,43 @@ struct PS3BootROMState {
     int32_t lv2_exit_status;
     uint8_t lv2_fan_policy;         /* 0 auto, 1 manual, 2 full */
     uint8_t lv2_fan_duty;
+    bool lv2_usleep_reported;       /* the idle loop's sleep was reported */
+    bool lv2_btsetting_reported;    /* sys_btsetting_if's first call */
+    bool lv2_av_reported;           /* the guest read the sink's EDID */
+    bool lv2_video_reported;        /* cellVideoOut configured a mode */
+    bool lv2_time_reported;         /* sys_time_get_current_time's first call */
+    uint8_t lv2_video_res;          /* the mode the guest selected */
+    /* Host keyboard, as the pad's digital buttons the guest reads. */
+    uint16_t kbd_buttons;
+    QemuInputHandlerState *kbd;
+    bool kbd_reported;
+    /* The console's auto-off: one hour without input and it powers down. */
+    QEMUTimer *idle_timer;
+    uint32_t idle_off_seconds;
+    bool idle_off_reported;
+    int lv2_fd[PS3_LV2_FD_MAX];     /* guest handle -> host descriptor */
+    bool lv2_fd_open[PS3_LV2_FD_MAX];
+
+    /*
+     * The HDD: one raw image, the size a superslim ships with.  Its sectors
+     * are XTS-AES with keys metldr derives from the console's EID root key
+     * (PCK1), so the image is the same disk whatever the host filesystem is.
+     */
+    char *hdd_file;
+    uint64_t hdd_size;
+    BlockBackend *hdd;
+    bool hdd_created;
+    char *erk_prop;                 /* the EID root key, hex */
+    char *erk_file;                 /* or a 48-byte file */
+    uint8_t erk[48];                /* 32 bytes of key, 16 of IV */
+    bool has_erk;
+    char *pck2_prop;                /* per-console root key 2, hex */
+    char *pck2_file;                /* or a 48-byte file */
+    uint8_t pck2[48];
+    bool has_pck2;
+    uint8_t hdd_data_key[32];
+    uint8_t hdd_tweak_key[32];
+    bool hdd_keyed;
 
     /*
      * The console's gamepad ports (sys_io/cellPad) and its front LED
@@ -781,7 +715,15 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
 #define PS3_LV2_ENOMEM  ((int32_t)0x80010004)
 #define PS3_LV2_ESRCH   ((int32_t)0x80010005)
 #define PS3_LV2_ENOENT  ((int32_t)0x80010006)
+#define PS3_LV2_EPERM   ((int32_t)0x80010009)
 #define PS3_LV2_EFAULT  ((int32_t)0x8001000D)
+#define PS3_LV2_EISDIR  ((int32_t)0x80010012)
+#define PS3_LV2_EEXIST  ((int32_t)0x80010014)
+#define PS3_LV2_EACCES  ((int32_t)0x80010029)
+#define PS3_LV2_EIO     ((int32_t)0x8001002B)
+#define PS3_LV2_ENOTDIR ((int32_t)0x8001002E)
+#define PS3_LV2_ENOTMOUNTED ((int32_t)0x8001003A)
+
 
 /*
  * The mask ROM is stored with each 32-bit word byte reversed (the dump's
@@ -1023,6 +965,12 @@ static void ps3_rom_set_status(PS3BootROMState *s, uint32_t status,
         info_report("ps3-boot-rom: %s", why);
         break;
     }
+
+    if (status == PS3_BOOT_OK) {
+        ps3_vga_printf("LV0LDR.2 CONTAINER VERIFIED: %u BYTES", s->bytes);
+    } else {
+        ps3_vga_printf("BOOT STOP 0x%X: %s", status, why);
+    }
 }
 
 /*
@@ -1130,6 +1078,9 @@ static void ps3_rom_boot(PS3BootROMState *s)
                         " MFC gets, %" PRIu64 " puts)",
                         s->spu_why, s->spu_insns, ps3_spu_mfc_gets(s->spu),
                         ps3_spu_mfc_puts(s->spu));
+
+            ps3_vga_printf("SPU PAYLOAD: %" PRIu64 " INSTRUCTIONS",
+                           s->spu_insns);
 
             if (ps3_spu_mfc_puts(s->spu)) {
                 info_report("ps3-spu: last put 0x%X bytes to EA 0x%X",
@@ -1581,6 +1532,9 @@ static void ps3_uart_flush(PS3BootROMState *s)
     if (s->uart_len) {
         s->uart_line[s->uart_len] = 0;
         info_report("ps3-ppu console: %s", s->uart_line);
+
+        /* The guest's own output goes to the display as well as the log. */
+        ps3_vga_puts(s->uart_line);
         s->uart_len = 0;
     }
 }
@@ -1693,9 +1647,30 @@ static gchar *ps3_lv2_host_path(PS3BootROMState *s, const char *guest)
     if (!strncmp(guest, "/dev_flash/", 11)) {
         root = s->dev_flash;
         rest = guest + 11;
+    } else if (!strncmp(guest, "/dev_flash2/", 12)) {
+        root = s->dev_flash2;
+        rest = guest + 12;
     } else if (!strncmp(guest, "/dev_flash3/", 12)) {
         root = s->dev_flash3;
         rest = guest + 12;
+    } else if (!strncmp(guest, "/dev_hdd0/", 10)) {
+        root = s->hdd_dir;
+        rest = guest + 10;
+    } else if (!strcmp(guest, "/dev_hdd0")) {
+        root = s->hdd_dir;
+        rest = "";
+    } else if (!strncmp(guest, "/dev_hdd1/", 10)) {
+        root = s->hdd1_dir;
+        rest = guest + 10;
+    } else if (!strcmp(guest, "/dev_hdd1")) {
+        root = s->hdd1_dir;
+        rest = "";
+    } else if (!strncmp(guest, "/dev_usb000/", 12)) {
+        root = s->usb_dir;
+        rest = guest + 12;
+    } else if (!strcmp(guest, "/dev_usb000")) {
+        root = s->usb_dir;
+        rest = "";
     } else {
         root = s->dev_flash;
         rest = guest[0] == '/' ? guest + 1 : guest;
@@ -1943,6 +1918,8 @@ static bool ps3_lv2_slot_pending(const uint8_t *ram, uint64_t ram_size,
  * in r11, and the trap returns -1, which is what an unimplemented lv2 service
  * answers with.  The run continues and the work list says what was missing.
  */
+static const char *ps3_video_out_name(uint32_t nid);
+
 static uint32_t ps3_lv2_stub(PS3BootROMState *s, uint8_t *ram,
                              uint64_t ram_size, const char *lib,
                              uint32_t nid)
@@ -1961,6 +1938,11 @@ static uint32_t ps3_lv2_stub(PS3BootROMState *s, uint8_t *ram,
 
     s->lv2_stub_next = at + PS3_LV2_STUB_STRIDE;
     memset(ram + at, 0, PS3_LV2_STUB_STRIDE);
+
+    if (ps3_video_out_name(nid)) {
+        info_report("ps3-ppu: %s imports %s:0x%08X (the AV handler "
+                    "answers it)", lib, ps3_video_out_name(nid), nid);
+    }
 
     if (s->lv2_stub_records < PS3_LV2_STUB_RECORDS) {
         PS3Lv2Stub *rec = &s->lv2_stub_record[s->lv2_stub_records++];
@@ -2901,6 +2883,77 @@ static unsigned ps3_pad_connect(const PS3BootROMState *s)
 }
 
 /* A CellPadData word, in place: the length is four bytes, then the words. */
+/*
+ * The host's keyboard, delivered as the pad buttons the recovery menu and the
+ * VSH already read: arrows are the d-pad, Enter is cross, Escape is circle,
+ * Backspace is square, Space is start and Tab is select.  QEMU hands the events
+ * to us whenever the machine's display has focus.
+ */
+static void ps3_input_kick(PS3BootROMState *s)
+{
+    if (s->idle_timer && s->idle_off_seconds) {
+        timer_mod(s->idle_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)s->idle_off_seconds * 1000000000LL);
+    }
+}
+
+static void ps3_idle_off(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+
+    if (!s->idle_off_reported) {
+        s->idle_off_reported = true;
+        info_report("ps3: no input for %u seconds: the console's auto-off "
+                    "powers it down", s->idle_off_seconds);
+    }
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+}
+
+static void ps3_kbd_event(DeviceState *dev, QemuConsole *src,
+                          QemuInputEvent *evt)
+{
+    PS3BootROMState *s = PS3_BOOT_ROM(dev);
+    uint16_t bit = 0;
+
+    ps3_input_kick(s);
+
+    if (evt->type != INPUT_EVENT_KIND_KEY) {
+        return;
+    }
+
+    switch (qemu_input_linux_to_qcode(evt->key.key)) {
+    case Q_KEY_CODE_UP:       bit = 0x0010; break;
+    case Q_KEY_CODE_RIGHT:    bit = 0x0020; break;
+    case Q_KEY_CODE_DOWN:     bit = 0x0040; break;
+    case Q_KEY_CODE_LEFT:     bit = 0x0080; break;
+    case Q_KEY_CODE_RET:      bit = 0x4000; break;   /* cross */
+    case Q_KEY_CODE_ESC:      bit = 0x2000; break;   /* circle */
+    case Q_KEY_CODE_BACKSPACE: bit = 0x8000; break;  /* square */
+    case Q_KEY_CODE_SPC:      bit = 0x0008; break;   /* start */
+    case Q_KEY_CODE_TAB:      bit = 0x0001; break;   /* select */
+    default:
+        return;
+    }
+
+    if (evt->key.down) {
+        s->kbd_buttons |= bit;
+        if (!s->kbd_reported) {
+            s->kbd_reported = true;
+            info_report("ps3-ppu: keyboard: host keys drive the pad "
+                        "(arrows, Enter cross, Escape circle, Backspace "
+                        "square, Space start, Tab select)");
+        }
+    } else {
+        s->kbd_buttons &= ~bit;
+    }
+}
+
+static const QemuInputHandler ps3_kbd_handler = {
+    .name = "ps3 keyboard",
+    .mask = INPUT_EVENT_MASK_KEY,
+    .event = ps3_kbd_event,
+};
+
 static void ps3_pad_put_word(uint8_t *p, unsigned word, uint16_t v)
 {
     p[4 + 2 * word] = v >> 8;
@@ -2933,6 +2986,9 @@ static void ps3_pad_data(const PS3BootROMState *s, unsigned port, uint8_t *d,
     ps3_put_be32(d, len);
     /* Word 0 is reserved; word 1 holds the length in halfwords. */
     ps3_pad_put_word(d, 1, (0x7 << 4) | MIN(len / 2, 15));
+    /* The host keyboard, if the window has focus, presses these. */
+    ps3_pad_put_word(d, PS3_PAD_W_DIGITAL1, s->kbd_buttons & 0xFF);
+    ps3_pad_put_word(d, PS3_PAD_W_DIGITAL2, s->kbd_buttons >> 8);
     ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RX, 128);
     ps3_pad_put_word(d, PS3_PAD_W_ANALOG_RY, 128);
     ps3_pad_put_word(d, PS3_PAD_W_ANALOG_LX, 128);
@@ -3059,6 +3115,182 @@ static void ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
  *
  * Returns true when the NID is one of ours, with the result in *ret.
  */
+/*
+ * cellVideoOut: the VSH's AV layer reads the sink, picks a mode and configures
+ * it.  The NIDs are lv2's name-hash values, so imports of this library land
+ * here instead of on a placeholder stub.  ps3-vga is the sink: it answers with
+ * the HDMI EDID and its 720p/1080p modes, and takes the selected mode.
+ */
+#define PS3_NID_VIDEO_OUT_GET_NUM_DEVICES   0x75BBB672u
+#define PS3_NID_VIDEO_OUT_GET_STATE         0x887572D5u
+#define PS3_NID_VIDEO_OUT_GET_RESOLUTION    0xE558748Du
+#define PS3_NID_VIDEO_OUT_RES_AVAILABILITY  0xA322DB75u
+#define PS3_NID_VIDEO_OUT_GET_DEVICE_INFO   0x1E930EEFu
+#define PS3_NID_VIDEO_OUT_CONFIGURE         0x0BAE8772u
+#define PS3_NID_VIDEO_OUT_GET_CONFIG        0x15B0B0CDu
+#define PS3_NID_VIDEO_OUT_SET_CONVERT_MODE  0xE8AB2C69u
+#define PS3_NID_VIDEO_OUT_GET_CONVERT_MODE  0x7C4B0260u
+
+#define PS3_VIDEO_OUT_DEVICE_INFO_SIZE      456
+
+static const char *ps3_video_out_name(uint32_t nid)
+{
+    switch (nid) {
+    case PS3_NID_VIDEO_OUT_GET_NUM_DEVICES:  return "cellVideoOutGetNumberOfDevice";
+    case PS3_NID_VIDEO_OUT_GET_STATE:        return "cellVideoOutGetState";
+    case PS3_NID_VIDEO_OUT_GET_RESOLUTION:   return "cellVideoOutGetResolution";
+    case PS3_NID_VIDEO_OUT_RES_AVAILABILITY: return "cellVideoOutGetResolutionAvailability";
+    case PS3_NID_VIDEO_OUT_GET_DEVICE_INFO:  return "cellVideoOutGetDeviceInfo";
+    case PS3_NID_VIDEO_OUT_CONFIGURE:        return "cellVideoOutConfigure";
+    case PS3_NID_VIDEO_OUT_GET_CONFIG:       return "cellVideoOutGetConfiguration";
+    case PS3_NID_VIDEO_OUT_SET_CONVERT_MODE: return "cellVideoOutSetConvertMode";
+    case PS3_NID_VIDEO_OUT_GET_CONVERT_MODE: return "cellVideoOutGetConvertMode";
+    default:                                 return NULL;
+    }
+}
+
+/* resolutionId 1 is 1080, 2 is 720 - the two modes the sink offers. */
+static bool ps3_video_out_resolution(uint8_t id, uint32_t *w, uint32_t *h)
+{
+    switch (id) {
+    case 0x01: *w = 1920; *h = 1080; return true;   /* CELL_..._1080 */
+    case 0x02: *w = 1280; *h = 720;  return true;   /* CELL_..._720 */
+    case 0x04: *w = 720;  *h = 480;  return true;
+    case 0x05: *w = 720;  *h = 576;  return true;
+    default:   return false;
+    }
+}
+
+static bool ps3_lv2_video_out(PS3BootROMState *s, CPUPPCState *env,
+                              uint8_t *ram, uint64_t ram_size,
+                              uint32_t nid, int32_t *ret)
+{
+    uint32_t a0 = env->gpr[3];
+    uint32_t a1 = env->gpr[4];
+    uint32_t a2 = env->gpr[5];
+    uint32_t w, h;
+    const char *name = ps3_video_out_name(nid);
+
+    if (!name) {
+        return false;
+    }
+
+    if (s->ppu_trace) {
+        info_report("ps3-ppu: cellVideoOut: %s(0x%X, 0x%X, 0x%X)",
+                    name, a0, a1, a2);
+    }
+
+    switch (nid) {
+    case PS3_NID_VIDEO_OUT_GET_NUM_DEVICES:
+        *ret = 1;
+        break;
+    case PS3_NID_VIDEO_OUT_GET_STATE: {   /* videoOut, device, state* */
+        uint8_t *p;
+
+        if ((uint64_t)a2 + 16 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            break;
+        }
+        p = ram + a2;
+        memset(p, 0, 16);
+        p[0] = 1;                     /* CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED */
+        p[1] = 1;                     /* RGB */
+        p[8] = 1;                     /* resolutionId: 1080 */
+        p[9] = 0;                     /* scanMode */
+        p[10] = 0;                    /* conversion */
+        p[11] = 0;                    /* aspect: 16:9 */
+        p[15] = 1;                    /* refreshRates: 60 Hz */
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_VIDEO_OUT_GET_RESOLUTION: /* resolutionId, resolution* */
+        if (!ps3_video_out_resolution((uint8_t)a0, &w, &h)) {
+            *ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if ((uint64_t)a1 + 4 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a1, (w << 16) | h);
+        *ret = 0;
+        break;
+    case PS3_NID_VIDEO_OUT_RES_AVAILABILITY: /* videoOut, id, aspect, opt */
+        *ret = ps3_video_out_resolution((uint8_t)a1, &w, &h) ? 1 : 0;
+        break;
+    case PS3_NID_VIDEO_OUT_GET_DEVICE_INFO: { /* videoOut, device, info* */
+        uint8_t *p;
+
+        if (!a2 || (uint64_t)a2 + PS3_VIDEO_OUT_DEVICE_INFO_SIZE > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            break;
+        }
+        p = ram + a2;
+        memset(p, 0, PS3_VIDEO_OUT_DEVICE_INFO_SIZE);
+        p[0] = 1;                     /* portType: HDMI */
+        p[1] = 1;                     /* colorSpace: RGB */
+        p[4] = 2;                     /* availableModeCount */
+        p[5] = 1;                     /* state: enabled */
+        p[6] = 1;                     /* rgbOutputRange: full */
+        /* availableModes start at 32; each is 8 bytes. */
+        p[32] = 0x01; p[39] = 1;      /* 1080, 60 Hz */
+        p[40] = 0x02; p[47] = 1;      /* 720, 60 Hz */
+        if (!s->lv2_video_reported) {
+            s->lv2_video_reported = true;
+            info_report("ps3-ppu: cellVideoOut: device info: HDMI sink, "
+                        "modes 1080 and 720 available");
+        }
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_VIDEO_OUT_CONFIGURE: {  /* videoOut, config*, option*, wait */
+        uint8_t id, aspect;
+
+        if (!a1 || (uint64_t)a1 + 16 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            break;
+        }
+        id = ram[a1];
+        aspect = ram[a1 + 2];
+        if (!ps3_video_out_resolution(id, &w, &h)) {
+            *ret = PS3_LV2_EINVAL;
+            break;
+        }
+        s->lv2_video_res = id;
+        ps3_vga_set_mode(w, h);
+        if (!s->lv2_video_reported) {
+            s->lv2_video_reported = true;
+            info_report("ps3-ppu: cellVideoOut: configured %ux%u "
+                        "(aspect %u, pitch 0x%X)", w, h, aspect,
+                        ps3_be32(ram + a1 + 12));
+        }
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_VIDEO_OUT_GET_CONFIG: { /* videoOut, config*, option* */
+        if (!a1 || (uint64_t)a1 + 16 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            break;
+        }
+        memset(ram + a1, 0, 16);
+        ram[a1] = s->lv2_video_res ?: 1;
+        *ret = 0;
+        break;
+    }
+    case PS3_NID_VIDEO_OUT_SET_CONVERT_MODE:
+        *ret = 0;
+        break;
+    case PS3_NID_VIDEO_OUT_GET_CONVERT_MODE:
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, 0);
+        }
+        *ret = 0;
+        break;
+    }
+
+    return true;
+}
+
 static bool ps3_lv2_sys_io(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
                            uint64_t ram_size, uint32_t nid, int32_t *ret)
 {
@@ -3440,6 +3672,93 @@ static bool ps3_pad_defaults(PS3BootROMState *s, Error **errp)
     return true;
 }
 
+/* ---------------------------------------------------------------------- */
+/* lv2's file services: the VSH keeps its own files under /dev_flash2 and   */
+/* /dev_hdd0, and without sys_fs it cannot even create a directory.  A guest */
+/* path is mapped onto the host firmware tree (or the HDD image) and the   */
+/* call runs against the host, so the guest sees the same tree it would on  */
+/* the console.                                                            */
+
+static int32_t ps3_lv2_fs_error(int err)
+{
+    switch (err) {
+    case 0:
+        return 0;
+    case ENOENT:
+        return PS3_LV2_ENOENT;
+    case EEXIST:
+        return PS3_LV2_EEXIST;
+    case EISDIR:
+        return PS3_LV2_EISDIR;
+    case ENOTDIR:
+        return PS3_LV2_ENOTDIR;
+    case EACCES:
+    case EPERM:
+        return PS3_LV2_EACCES;
+    default:
+        return PS3_LV2_EIO;
+    }
+}
+
+/* Read a guest path and map it onto the firmware tree; NULL when unmapped. */
+static gchar *ps3_lv2_path(PS3BootROMState *s, uint8_t *ram,
+                           uint64_t ram_size, uint32_t addr)
+{
+    char guest[512];
+
+    if (!addr ||
+        !ps3_lv2_guest_string(ram, ram_size, addr, guest, sizeof(guest))) {
+        return NULL;
+    }
+
+    return ps3_lv2_host_path(s, guest);
+}
+
+static int ps3_lv2_fd_alloc(PS3BootROMState *s, int host)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_LV2_FD_MAX; i++) {
+        if (!s->lv2_fd_open[i]) {
+            s->lv2_fd_open[i] = true;
+            s->lv2_fd[i] = host;
+            return (int)i + 3;
+        }
+    }
+
+    return -1;
+}
+
+static int ps3_lv2_fd_host(PS3BootROMState *s, uint32_t guest)
+{
+    unsigned i;
+
+    if (guest < 3) {
+        return -1;
+    }
+
+    i = guest - 3;
+    if (i >= PS3_LV2_FD_MAX || !s->lv2_fd_open[i]) {
+        return -1;
+    }
+
+    return s->lv2_fd[i];
+}
+
+/* CellFsStat is 0x34 bytes: mode/uid/gid, then 8-byte times and sizes. */
+static void ps3_lv2_stat(uint8_t *out, bool is_dir, int64_t atime,
+                         int64_t mtime, int64_t ctime, int64_t size)
+{
+    ps3_put_be32(out + 0x00, is_dir ? 0040755 : 0100644);
+    ps3_put_be32(out + 0x04, 0);
+    ps3_put_be32(out + 0x08, 0);
+    ps3_put_be64(out + 0x0C, atime);
+    ps3_put_be64(out + 0x14, mtime);
+    ps3_put_be64(out + 0x1C, ctime);
+    ps3_put_be64(out + 0x24, size);
+    ps3_put_be64(out + 0x2C, 4096);
+}
+
 /*
  * The lv2 services vsh-run answers, in the order the VSH asks for them.
  *
@@ -3588,6 +3907,10 @@ static void ps3_lv2_service(PS3BootROMState *s)
 
         /* sys_io and the helpers libpad's threading needs come first. */
         if (ps3_lv2_sys_io(s, &cpu->env, ram, ram_size, nid, &ret)) {
+            break;
+        }
+        /* The AV layer: this is how the VSH reads the sink and picks a mode. */
+        if (ps3_lv2_video_out(s, &cpu->env, ram, ram_size, nid, &ret)) {
             break;
         }
 
@@ -3851,9 +4174,66 @@ static void ps3_lv2_service(PS3BootROMState *s)
     case 0x1E6:                 /* _sys_prx_register_library(param*) */
         ret = 0;
         break;
+    case 0x090: {               /* sys_time_get_timezone(int*, int*) */
+        GDateTime *now = g_date_time_new_now_local();
+        int offset = now ? (int)(g_date_time_get_utc_offset(now) /
+                                 G_TIME_SPAN_MINUTE) : 0;
+
+        if (now) {
+            g_date_time_unref(now);
+        }
+        if (a0 && (uint64_t)a0 + 4 <= ram_size) {
+            ps3_put_be32(ram + a0, offset);
+        }
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, 0);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x091: {               /* sys_time_get_current_time(sec*, nsec*) */
+        gint64 usec = g_get_real_time();
+
+        if (a0 && (uint64_t)a0 + 8 <= ram_size) {
+            ps3_put_be64(ram + a0, (uint64_t)(usec / 1000000));
+        }
+        if (a1 && (uint64_t)a1 + 8 <= ram_size) {
+            ps3_put_be64(ram + a1, (uint64_t)(usec % 1000000) * 1000);
+        }
+        if (!s->lv2_time_reported) {
+            s->lv2_time_reported = true;
+            info_report("ps3-ppu: lv2: sys_time_get_current_time: host UTC, "
+                        "%" PRId64 " s", usec / 1000000);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x092:                 /* sys_time_set_current_time(sec, nsec) */
+        info_report("ps3-ppu: lv2: sys_time_set_current_time(%" PRIu64
+                    ", %" PRIu64 "): the host clock is authoritative",
+                    (uint64_t)cpu->env.gpr[3], (uint64_t)cpu->env.gpr[4]);
+        ret = 0;
+        break;
     case 0x093:                 /* sys_time_get_timebase_frequency */
         ret = 79800000;
         break;
+    case 0x08D: {               /* sys_timer_usleep(sleep_time) */
+        /*
+         * The VSH sleeps 100 ms between polls while it initialises and while
+         * it idles.  This model has no scheduler and no guest wall clock, and
+         * the PPU runs in TCG, so a sleep that really waited would stall the
+         * whole machine; answering at once lets the guest's next poll move
+         * the boot on.
+         */
+        if (!s->lv2_usleep_reported) {
+            s->lv2_usleep_reported = true;
+            info_report("ps3-ppu: lv2: sys_timer_usleep(%" PRIu64 " us): the "
+                        "model does not wait",
+                        (uint64_t)cpu->env.gpr[3]);
+        }
+        ret = 0;
+        break;
+    }
     case 0x15C:                 /* sys_memory_allocate(size, flags, addr*) */
         ret = ps3_lv2_alloc(s, ram, ram_size, a0, a2);
         break;
@@ -4061,6 +4441,387 @@ static void ps3_lv2_service(PS3BootROMState *s)
     case 0x20A:                 /* sys_config_unregister_service */
         ret = 0;
         break;
+    case 0x27B:                 /* sys_btsetting_if(cmd, msg) */
+        /*
+         * libbtsetting's whole lv2 interface is this call: initialise, then
+         * read and write the adapter's address and the paired-device table.
+         * There is no Bluetooth hardware here, so every command is
+         * acknowledged.  Answering -ENOSYS made btsetting_initialize() fail
+         * with CELL_ENOSYS (0x80010003) and the VSH printed that on the
+         * console.
+         */
+        if (!s->lv2_btsetting_reported) {
+            s->lv2_btsetting_reported = true;
+            info_report("ps3-ppu: lv2: sys_btsetting_if(cmd 0x%" PRIx64 "): no "
+                        "Bluetooth hardware, acknowledged",
+                        (uint64_t)cpu->env.gpr[3]);
+        }
+        ret = 0;
+        break;
+    /*
+     * lv2's AV service: the console's display layer asks it what the sink is
+     * before it selects a mode, then hands over the framebuffer it rendered
+     * into.  ps3-vga is that sink here, so the calls go straight to it: the
+     * guest reads the HDMI EDID (720p/1080p modes included) and then owns the
+     * scanout, which the overlay still composes its console lines over.
+     */
+    case 0x2A0: {               /* av: read the sink's EDID */
+        uint8_t edid[256];
+        unsigned n;
+
+        if (!a0 || (uint64_t)a0 + a1 > ram_size || !a1) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        n = ps3_vga_hdmi_edid(edid, MIN(a1, (uint32_t)sizeof(edid)));
+        memcpy(ram + a0, edid, n);
+        if (!s->lv2_av_reported) {
+            s->lv2_av_reported = true;
+            info_report("ps3-ppu: lv2: av: guest read the HDMI EDID "
+                        "(%u bytes): sink 1, up to 1920x1080", n);
+        }
+        ret = n;
+        break;
+    }
+    case 0x2A1:                 /* av: guest gives us its framebuffer */
+        ps3_vga_guest_scanout(a0, a1, a2, a3);
+        ret = 0;
+        break;
+    case 0x345: {               /* sys_fs_mount(dev, fs, path, ...) */
+        char dev[128];
+
+        ret = 0;
+        if (ps3_lv2_guest_string(ram, ram_size, a0, dev, sizeof(dev))) {
+            info_report("ps3-ppu: lv2: sys_fs_mount(%s)", dev);
+        }
+        break;
+    }
+    case 0x346:                 /* sys_fs_unmount(dev) */
+    case 0x347:                 /* sys_fs_sync */
+    case 0x348: {               /* sys_fs_disk_free(path, free*, avail*) */
+        uint64_t total = s->hdd_size ?: (20 * GiB);
+
+        if (a1 && (uint64_t)a1 + 8 <= ram_size) {
+            ps3_put_be64(ram + a1, total);
+        }
+        if (a2 && (uint64_t)a2 + 8 <= ram_size) {
+            ps3_put_be64(ram + a2, total);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x320:                 /* sys_fs_test(dev, ...) */
+    case 0x32F:                 /* sys_fs_utime(path, time*) */
+    case 0x331:                 /* sys_fs_fcntl(fd, op, arg, size) */
+    case 0x333:                 /* sys_fs_fdatasync(fd) */
+    case 0x334:                 /* sys_fs_fsync(fd) */
+    case 0x342:                 /* sys_fs_chmod(path, mode) */
+    case 0x343:                 /* sys_fs_chown(path, uid, gid) */
+    case 0x344:                 /* sys_fs_newfs(dev, ...) */
+        ret = 0;
+        break;
+    case 0x321: {               /* sys_fs_open(path, flags, fd*, mode, arg) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
+        int host_flags, hfd, gfd;
+
+        if (!host) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        if (!a2 || (uint64_t)a2 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+
+        switch (a1 & 3) {
+        case 0:
+            host_flags = O_RDONLY;
+            break;
+        case 1:
+            host_flags = O_WRONLY;
+            break;
+        default:
+            host_flags = O_RDWR;
+            break;
+        }
+        if (a1 & 0100) {
+            host_flags |= O_CREAT;
+        }
+        if (a1 & 0200) {
+            host_flags |= O_EXCL;
+        }
+        if (a1 & 01000) {
+            host_flags |= O_TRUNC;
+        }
+        if (a1 & 02000) {
+            host_flags |= O_APPEND;
+        }
+
+        hfd = g_open(host, host_flags, a3 ? a3 : 0644);
+        if (hfd < 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+
+        gfd = ps3_lv2_fd_alloc(s, hfd);
+        if (gfd < 0) {
+            close(hfd);
+            ret = PS3_LV2_EIO;
+            break;
+        }
+
+        ps3_put_be32(ram + a2, gfd);
+        ret = 0;
+        break;
+    }
+    case 0x322: {               /* sys_fs_read(fd, buf, nbytes, nread*) */
+        int hfd = ps3_lv2_fd_host(s, a0);
+        uint64_t n = cpu->env.gpr[5];
+        ssize_t got;
+
+        if (hfd < 0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (!a1 || a1 >= ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        n = MIN(n, ram_size - a1);
+        got = read(hfd, ram + a1, n);
+        if (got < 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        if (a3 && (uint64_t)a3 + 8 <= ram_size) {
+            ps3_put_be64(ram + a3, got);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x323: {               /* sys_fs_write(fd, buf, nbytes, nwrite*) */
+        int hfd = ps3_lv2_fd_host(s, a0);
+        uint64_t n = cpu->env.gpr[5];
+        ssize_t put;
+
+        if (hfd < 0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (!a1 || a1 >= ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        n = MIN(n, ram_size - a1);
+        put = write(hfd, ram + a1, n);
+        if (put < 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        if (a3 && (uint64_t)a3 + 8 <= ram_size) {
+            ps3_put_be64(ram + a3, put);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x324: {               /* sys_fs_close(fd) */
+        int hfd = ps3_lv2_fd_host(s, a0);
+
+        if (hfd < 0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        s->lv2_fd_open[a0 - 3] = false;
+        close(hfd);
+        ret = 0;
+        break;
+    }
+    case 0x328: {               /* sys_fs_stat(path, stat*) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
+        GStatBuf st;
+
+        if (!host) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 0x34 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (g_stat(host, &st) != 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        ps3_lv2_stat(ram + a1, S_ISDIR(st.st_mode), st.st_atime,
+                     st.st_mtime, st.st_ctime, st.st_size);
+        ret = 0;
+        break;
+    }
+    case 0x329: {               /* sys_fs_fstat(fd, stat*) */
+        int hfd = ps3_lv2_fd_host(s, a0);
+        struct stat st;
+
+        if (hfd < 0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 0x34 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (fstat(hfd, &st) != 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        ps3_lv2_stat(ram + a1, S_ISDIR(st.st_mode), st.st_atime,
+                     st.st_mtime, st.st_ctime, st.st_size);
+        ret = 0;
+        break;
+    }
+    case 0x32B: {               /* sys_fs_mkdir(path, mode) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
+
+        if (!host) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        if (g_mkdir(host, 0755) != 0) {
+            /* A MakePath that walks an existing tree must not fail on it. */
+            if (errno == EEXIST && g_file_test(host, G_FILE_TEST_IS_DIR)) {
+                ret = 0;
+                break;
+            }
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        ret = 0;
+        break;
+    }
+    case 0x32C: {               /* sys_fs_rename(from, to) */
+        g_autofree gchar *from = ps3_lv2_path(s, ram, ram_size, a0);
+        g_autofree gchar *to = ps3_lv2_path(s, ram, ram_size, a1);
+
+        if (!from || !to) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        if (g_rename(from, to) != 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        ret = 0;
+        break;
+    }
+    case 0x32D: {               /* sys_fs_rmdir(path) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
+
+        if (!host) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        if (g_rmdir(host) != 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        ret = 0;
+        break;
+    }
+    case 0x32E: {               /* sys_fs_unlink(path) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
+
+        if (!host) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        if (g_unlink(host) != 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        ret = 0;
+        break;
+    }
+    case 0x330: {               /* sys_fs_access(path, mode) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
+
+        if (!host || !g_file_test(host, G_FILE_TEST_EXISTS)) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        ret = 0;
+        break;
+    }
+    case 0x332: {               /* sys_fs_lseek(fd, offset, whence, pos*) */
+        int hfd = ps3_lv2_fd_host(s, a0);
+        off_t pos;
+
+        if (hfd < 0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        pos = lseek(hfd, (off_t)cpu->env.gpr[4], a3);
+        if (pos < 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        if (cpu->env.gpr[7] &&
+            (uint64_t)cpu->env.gpr[7] + 8 <= ram_size) {
+            ps3_put_be64(ram + cpu->env.gpr[7], pos);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x335:                 /* sys_fs_fget_block_size(fd, sector*, block*,
+                                 * arg4*, flags*) */
+    case 0x336: {               /* sys_fs_get_block_size(path, sector*, block*,
+                                 * arg4*) */
+        uint64_t values[3] = { PS3_LV2_SECTOR, 4096, 0 };
+        uint32_t addrs[3] = { a1, a2, a3 };
+        unsigned n;
+
+        for (n = 0; n < 3; n++) {
+            if (addrs[n] && (uint64_t)addrs[n] + 8 <= ram_size) {
+                ps3_put_be64(ram + addrs[n], values[n]);
+            }
+        }
+        ret = 0;
+        break;
+    }
+    case 0x33F: {               /* sys_fs_truncate(path, size) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
+        int hfd;
+
+        if (!host) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        hfd = g_open(host, O_WRONLY, 0);
+        if (hfd < 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        if (ftruncate(hfd, (off_t)cpu->env.gpr[4]) != 0) {
+            ret = ps3_lv2_fs_error(errno);
+            close(hfd);
+            break;
+        }
+        close(hfd);
+        ret = 0;
+        break;
+    }
+    case 0x340: {               /* sys_fs_ftruncate(fd, size) */
+        int hfd = ps3_lv2_fd_host(s, a0);
+
+        if (hfd < 0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (ftruncate(hfd, (off_t)cpu->env.gpr[4]) != 0) {
+            ret = ps3_lv2_fs_error(errno);
+            break;
+        }
+        ret = 0;
+        break;
+    }
     default:
         if (s->ppu_trace) {
             info_report("ps3-ppu: lv2 syscall 0x%X is not modelled", nr);
@@ -4071,12 +4832,333 @@ static void ps3_lv2_service(PS3BootROMState *s)
     ps3_put_be32(ram + PS3_LV2_SCRATCH, (uint32_t)ret);
 }
 
+static void rs6000_ps3_lv2_page(MemoryRegion *sysmem, MemoryRegion *ram);
+
+/*
+ * The HDD: one raw image of the size a superslim ships with.  A console's
+ * disk is not encrypted with PCK1 itself - PCK1 is the root - but with the
+ * ATA data and tweak keys derived from it (lv1ldr runs the AES-256-CBC
+ * ladder over the two SB seeds; the seeds are at 0x1B5C0 and 0x1B600 in the
+ * 4.93 lv1ldr ELF, which is why they are in that loader and not in
+ * sb_iso_spu_module.self).  The keys are also kept on the disk itself: sector
+ * 0 holds them wrapped under PCK1, so a console with its EID root key can
+ * read any disk it ever wrote.
+ *
+ * The model therefore stores the image exactly as a console's disk is stored:
+ * sector 0 AES-256-CBC under the EID root key, every other sector XTS-AES
+ * under the ATA keys.  Nothing in this file carries a console's key - the
+ * root key comes from `erk' or `erk-file', i.e. from the user's own dump.
+ */
+
+#define PS3_HDD_KEY_SECTOR  0
+
+/* Sector 0, once unwrapped under PCK1: magic, data key, tweak key, zeros. */
+static const uint8_t ps3_hdd_key_magic[8] = {
+    'P', 'S', '3', 'A', 'T', 'A', '0', '1',
+};
+
+static void ps3_hdd_key_sector_build(PS3BootROMState *s, uint8_t *plain)
+{
+    memset(plain, 0, PS3_LV2_SECTOR);
+    memcpy(plain, ps3_hdd_key_magic, sizeof(ps3_hdd_key_magic));
+    memcpy(plain + 0x08, s->hdd_data_key, 32);
+    memcpy(plain + 0x28, s->hdd_tweak_key, 32);
+}
+
+/*
+ * Sector 0 is the one sector PCK1 encrypts directly, which is what makes the
+ * rest of the disk readable: decrypt it, and the ATA keys are there.
+ */
+static bool ps3_hdd_key_sector_read(PS3BootROMState *s, uint8_t *plain)
+{
+    uint8_t raw[PS3_LV2_SECTOR];
+
+    if (!s->hdd || !s->has_erk) {
+        return false;
+    }
+
+    if (blk_pread(s->hdd, 0, sizeof(raw), raw, 0) < 0) {
+        return false;
+    }
+
+    ps3_aes_cbc256_decrypt(s->erk, s->erk + 32, raw, plain, sizeof(raw));
+
+    return !memcmp(plain, ps3_hdd_key_magic, sizeof(ps3_hdd_key_magic));
+}
+
+static bool ps3_hdd_key_sector_write(PS3BootROMState *s)
+{
+    uint8_t plain[PS3_LV2_SECTOR], raw[PS3_LV2_SECTOR];
+
+    if (!s->hdd || !s->has_erk) {
+        return false;
+    }
+
+    ps3_hdd_key_sector_build(s, plain);
+    ps3_aes_cbc256_encrypt(s->erk, s->erk + 32, plain, raw, sizeof(raw));
+
+    return blk_pwrite(s->hdd, 0, sizeof(raw), raw, 0) == 0;
+}
+
+/*
+ * Sectors the guest reads and writes.  A read is decrypted on the way out and
+ * a write is re-encrypted before it reaches the image, so the file on the
+ * host stays the byte-for-byte disk the console wrote.
+ */
+static bool ps3_hdd_read(PS3BootROMState *s, uint64_t sector, void *buf,
+                         size_t sectors)
+{
+    uint8_t *p = buf;
+    size_t i;
+
+    if (!s->hdd || sector == PS3_HDD_KEY_SECTOR || !sectors) {
+        return false;
+    }
+
+    if (blk_pread(s->hdd, sector * PS3_LV2_SECTOR,
+                  sectors * PS3_LV2_SECTOR, buf, 0) < 0) {
+        return false;
+    }
+
+    if (!s->hdd_keyed) {
+        return true;
+    }
+
+    for (i = 0; i < sectors; i++) {
+        ps3_xts_crypt_sector(s->hdd_data_key, s->hdd_tweak_key,
+                             sector + i, p + i * PS3_LV2_SECTOR,
+                             PS3_LV2_SECTOR, false);
+    }
+
+    return true;
+}
+
+static bool ps3_hdd_write(PS3BootROMState *s, uint64_t sector, void *buf,
+                          size_t sectors)
+{
+    uint8_t *p = buf;
+    size_t i;
+
+    if (!s->hdd || sector == PS3_HDD_KEY_SECTOR || !sectors) {
+        return false;
+    }
+
+    if (s->hdd_keyed) {
+        for (i = 0; i < sectors; i++) {
+            ps3_xts_crypt_sector(s->hdd_data_key, s->hdd_tweak_key,
+                                 sector + i, p + i * PS3_LV2_SECTOR,
+                                 PS3_LV2_SECTOR, true);
+        }
+    }
+
+    if (blk_pwrite(s->hdd, sector * PS3_LV2_SECTOR,
+                   sectors * PS3_LV2_SECTOR, buf, 0) < 0) {
+        return false;
+    }
+
+    if (s->hdd_keyed) {
+        for (i = 0; i < sectors; i++) {
+            ps3_xts_crypt_sector(s->hdd_data_key, s->hdd_tweak_key,
+                                 sector + i, p + i * PS3_LV2_SECTOR,
+                                 PS3_LV2_SECTOR, false);
+        }
+    }
+
+    return true;
+}
+static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
+{
+    Error *err = NULL;
+    uint8_t sector[PS3_LV2_SECTOR], plain[PS3_LV2_SECTOR];
+    QDict *opts;
+    int fd;
+
+    if (s->erk_prop) {
+        size_t len = 0;
+
+        if (!ps3_stage_parse_hex(s->erk_prop, s->erk, sizeof(s->erk),
+                                 &len) || len != sizeof(s->erk)) {
+            error_setg(errp, "ps3-boot-rom: erk must be 96 hex digits (48 "
+                       "bytes: the EID root key, PCK1)");
+            return false;
+        }
+        s->has_erk = true;
+    } else if (s->erk_file) {
+        g_autofree gchar *buf = NULL;
+        GError *gerr = NULL;
+        gsize len = 0;
+
+        if (!g_file_get_contents(s->erk_file, &buf, &len, &gerr)) {
+            error_setg(errp, "ps3-boot-rom: cannot read %s: %s", s->erk_file,
+                       gerr->message);
+            g_error_free(gerr);
+            return false;
+        }
+        if (len != sizeof(s->erk)) {
+            error_setg(errp, "ps3-boot-rom: %s is %u byte(s), the EID root "
+                       "key is 48", s->erk_file, (unsigned)len);
+            return false;
+        }
+        memcpy(s->erk, buf, sizeof(s->erk));
+        s->has_erk = true;
+    }
+
+    if (s->has_erk) {
+        ps3_ata_keys(s->erk, s->hdd_data_key, s->hdd_tweak_key);
+        s->hdd_keyed = true;
+    }
+
+    if (!s->hdd_file) {
+        if (s->has_erk) {
+            info_report("ps3-boot-rom: EID root key (PCK1) read; ATA data "
+                        "and tweak keys derived, no HDD image to key");
+        }
+        return true;
+    }
+
+    if (!g_file_test(s->hdd_file, G_FILE_TEST_EXISTS)) {
+        fd = qemu_open_old(s->hdd_file,
+                           O_RDWR | O_CREAT | O_EXCL | O_BINARY, 0600);
+        if (fd < 0) {
+            error_setg_errno(errp, errno, "ps3-boot-rom: cannot create %s",
+                             s->hdd_file);
+            return false;
+        }
+        if (ftruncate(fd, s->hdd_size) < 0) {
+            error_setg_errno(errp, errno, "ps3-boot-rom: cannot size %s to "
+                             "%" PRIu64 " bytes", s->hdd_file, s->hdd_size);
+            close(fd);
+            return false;
+        }
+        close(fd);
+        s->hdd_created = true;
+    }
+
+    opts = qdict_new();
+    qdict_put_str(opts, "driver", "raw");
+    s->hdd = blk_new_open(s->hdd_file, NULL, opts, BDRV_O_RDWR, &err);
+    if (!s->hdd) {
+        error_setg(errp, "ps3-boot-rom: cannot open HDD image %s: %s",
+                   s->hdd_file,
+                   err ? error_get_pretty(err) : "unknown error");
+        error_free(err);
+        return false;
+    }
+
+    info_report("ps3-boot-rom: HDD: %s, %" PRIu64 " GiB raw%s%s",
+                s->hdd_file, s->hdd_size / GiB,
+                s->hdd_created ? " (created)" : "",
+                s->hdd_keyed ? ", ATA keys from the EID root key" : ", unkeyed");
+
+    if (s->hdd_keyed) {
+        ps3_vga_printf("HDD: %" PRIu64 " GIB RAW, ATA KEYS FROM EID ROOT KEY",
+                       s->hdd_size / GiB);
+    }
+
+    if (!s->hdd_keyed) {
+        return true;
+    }
+
+    /*
+     * Read the disk's own copy of the ATA keys first: sector 0 is wrapped
+     * under this console's EID root key, so a disk written by this console opens and
+     * a disk written by another one does not.  A fresh image has no key
+     * sector yet, so the derived keys are written there, encrypted, before
+     * any data sector is touched.
+     */
+    if (ps3_hdd_key_sector_read(s, plain)) {
+        uint8_t derived_data[32], derived_tweak[32];
+        bool same;
+
+        memcpy(s->hdd_data_key, plain + 0x08, 32);
+        memcpy(s->hdd_tweak_key, plain + 0x28, 32);
+
+        ps3_ata_keys(s->erk, derived_data, derived_tweak);
+        same = !memcmp(derived_data, s->hdd_data_key, 32) &&
+               !memcmp(derived_tweak, s->hdd_tweak_key, 32);
+
+        info_report("ps3-boot-rom: HDD key sector unwrapped under the EID "
+                    "root key; ATA keys %s the ones it derives",
+                    same ? "match" : "differ from");
+    } else if (s->hdd_created || blk_pread(s->hdd, 0, PS3_LV2_SECTOR,
+                                           plain, 0) < 0 ||
+               buffer_is_zero(plain, PS3_LV2_SECTOR)) {
+        if (!ps3_hdd_key_sector_write(s)) {
+            error_setg(errp, "ps3-boot-rom: cannot write the HDD key sector");
+            return false;
+        }
+        info_report("ps3-boot-rom: HDD key sector written, ATA keys "
+                    "re-encrypted under the EID root key");
+    } else {
+        info_report("ps3-boot-rom: HDD sector 0 does not open under this "
+                    "EID root key; using the derived ATA keys and leaving "
+                    "the image untouched");
+    }
+
+    /*
+     * Prove both directions before the guest is given the disk: read sector 1
+     * through the decryption path, write the same sector back through the
+     * re-encryption path, and check the image on the host is unchanged.  A
+     * write that does not reproduce the original ciphertext would silently
+     * corrupt every file the guest saves.
+     */
+    if (blk_pread(s->hdd, PS3_LV2_SECTOR, PS3_LV2_SECTOR, sector, 0) == 0) {
+        memcpy(plain, sector, sizeof(plain));
+
+        if (!ps3_hdd_read(s, 1, sector, 1) ||
+            !ps3_hdd_write(s, 1, sector, 1)) {
+            error_setg(errp, "ps3-boot-rom: HDD sector 1 does not round trip");
+            return false;
+        }
+
+        memset(sector, 0, sizeof(sector));
+        if (blk_pread(s->hdd, PS3_LV2_SECTOR, PS3_LV2_SECTOR, sector, 0) < 0 ||
+            memcmp(plain, sector, sizeof(plain))) {
+            error_setg(errp, "ps3-boot-rom: HDD re-encryption did not "
+                       "reproduce the image's sector 1");
+            return false;
+        }
+
+        info_report("ps3-boot-rom: HDD sector 1: decrypt and re-encrypt "
+                    "reproduce the image byte for byte");
+    }
+
+    return true;
+}
+
 static void ps3_rom_realize(DeviceState *dev, Error **errp)
 {
+    PS3BootROMState *kbd_s = PS3_BOOT_ROM(dev);
+
+    /* The console's keyboard: the window's keys are the pad's buttons. */
+    kbd_s->kbd = qemu_input_handler_register(dev, &ps3_kbd_handler);
+
+    /* One hour without input: auto-off, as the VSH's setting describes. */
+    if (kbd_s->idle_off_seconds) {
+        kbd_s->idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_idle_off,
+                                         kbd_s);
+        ps3_input_kick(kbd_s);
+    }
     PS3BootROMState *s = PS3_BOOT_ROM(dev);
     gchar *buf = NULL;
     gsize len = 0;
     GError *err = NULL;
+
+    /*
+     * The boot chain cannot start if the block cipher is wrong, and every
+     * later symptom (a bad MAC, a loader that stops at 0x30) looks like a key
+     * problem instead.  Check the AES-256 CBC ladder, the ATA derivation and
+     * XTS against fixed answers once, here, so a broken cipher is named.
+     */
+    {
+        char why[96];
+
+        if (!ps3_aes_selftest(why, sizeof(why))) {
+            error_setg(errp, "ps3-boot-rom: AES selftest failed: %s", why);
+            return;
+        }
+        info_report("ps3-boot-rom: AES-256 CBC, ATA ladder and XTS selftest ok");
+    }
 
     /*
      * Describe the gamepad ports first: lv2 hands them to the VSH during its
@@ -4086,10 +5168,64 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     if (!ps3_pad_defaults(s, errp)) {
         return;
     }
+    if (!ps3_hdd_setup(s, errp)) {
+        return;
+    }
+
+    /*
+     * PCK2 is the console's per-console root key 2: it unwraps the ERK the .2
+     * loaders carry, which is what the following SELF stages then use.  Like
+     * every other key here it comes from the caller's dump, never the model.
+     */
+    if (s->pck2_prop) {
+        size_t plen = 0;
+
+        if (!ps3_stage_parse_hex(s->pck2_prop, s->pck2, sizeof(s->pck2),
+                                 &plen) || plen != sizeof(s->pck2)) {
+            error_setg(errp, "ps3-boot-rom: pck2 must be 96 hex digits (48 "
+                       "bytes: the per-console root key 2)");
+            return;
+        }
+        s->has_pck2 = true;
+    } else if (s->pck2_file) {
+        g_autofree gchar *kbuf = NULL;
+        GError *gerr = NULL;
+        gsize klen = 0;
+
+        if (!g_file_get_contents(s->pck2_file, &kbuf, &klen, &gerr)) {
+            error_setg(errp, "ps3-boot-rom: cannot read %s: %s",
+                       s->pck2_file, gerr->message);
+            g_error_free(gerr);
+            return;
+        }
+        if (klen != sizeof(s->pck2)) {
+            error_setg(errp, "ps3-boot-rom: %s is %u byte(s), PCK2 is 48",
+                       s->pck2_file, (unsigned)klen);
+            return;
+        }
+        memcpy(s->pck2, kbuf, sizeof(s->pck2));
+        s->has_pck2 = true;
+    }
+
+    if (s->has_pck2) {
+        info_report("ps3-boot-rom: per-console root key 2 (PCK2) read; the "
+                    ".2 loaders' ERK can be unwrapped");
+    }
     snprintf(s->led_text, sizeof(s->led_text), "green on");
     qemu_console_set_status_led(s->led_text);
     info_report("ps3-boot-rom: front LED: %s (pretend; the display puts it in "
                 "its window title)", s->led_text);
+
+    /*
+     * lv2's low page belongs to the VSH run, not to the boot chain: the
+     * 0xC00 vector sits in the page lv0 loads its own trampoline into (lv0's
+     * entry is 0xC40, inside it), so installing the shim for an lv0 stage
+     * would overwrite the hypervisor's first instructions with a syscall
+     * vector and send it to 0.
+     */
+    if (s->vsh_run) {
+        rs6000_ps3_lv2_page(get_system_memory(), s->ram);
+    }
 
     memory_region_init_io(&s->regs_mr, OBJECT(s), &ps3_rom_regs_ops, s,
                           "ps3-boot-rom.regs", 0x40);
@@ -4254,6 +5390,51 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         }
     }
 
+    /*
+     * The attached storage: dev_usb000 is a host directory, so the VSH and the
+     * updater read it through sys_fs.  The update flow looks for an update file
+     * under PS3/UPDATE, so say whether the one that will be attached has it.
+     */
+    /*
+     * A new HDD: the image is blank, so the VSH boots its recovery and asks to
+     * format the disk.  The format writes into this directory, which is what
+     * dev_hdd0 resolves to, so the console comes up with its own storage.
+     */
+    if (s->hdd_dir) {
+        bool fresh = !g_file_test(s->hdd_dir, G_FILE_TEST_IS_DIR);
+
+        if (fresh) {
+            g_mkdir_with_parents(s->hdd_dir, 0755);
+        }
+        info_report("ps3-boot-rom: dev_hdd0 %s at %s%s",
+                    fresh ? "created" : "attached", s->hdd_dir,
+                    s->hdd_created ? ", new blank HDD: recovery will offer to "
+                    "format it" : "");
+    }
+
+    if (s->hdd1_dir) {
+        if (!g_file_test(s->hdd1_dir, G_FILE_TEST_IS_DIR)) {
+            g_mkdir_with_parents(s->hdd1_dir, 0755);
+        }
+        info_report("ps3-boot-rom: dev_hdd1 at %s", s->hdd1_dir);
+    }
+
+    if (s->usb_dir) {
+        g_autofree char *update = g_build_filename(s->usb_dir, "PS3", "UPDATE",
+                                                   "PS3UPDAT.PUP", NULL);
+
+        if (!g_file_test(s->usb_dir, G_FILE_TEST_IS_DIR)) {
+            info_report("ps3-boot-rom: usb-dir %s is not a directory",
+                        s->usb_dir);
+        } else if (g_file_test(update, G_FILE_TEST_EXISTS)) {
+            info_report("ps3-boot-rom: dev_usb000 attached from %s, update "
+                        "file PS3/UPDATE/PS3UPDAT.PUP present", s->usb_dir);
+        } else {
+            info_report("ps3-boot-rom: dev_usb000 attached from %s, no "
+                        "PS3/UPDATE/PS3UPDAT.PUP in it", s->usb_dir);
+        }
+    }
+
     if (s->vsh_self) {
         if (!ps3_vsh_stage(s, errp)) {
             return;
@@ -4274,6 +5455,31 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
  * Returns 0 when the stage ran without faulting, 1 when it hit an opcode or an
  * address the model does not implement, 2 when the image could not be loaded.
  */
+/*
+ * Open a stage SELF the way the chain does: with the ERK unwrapped from the
+ * caller's PCK2 when one is supplied, and with the published loader keysets
+ * otherwise.  A PCK2 that does not belong to the image falls through to the
+ * keyset search, so a wrong key is reported by the normal "no keyset opened"
+ * message rather than silently corrupting the stage.
+ */
+static bool ps3_stage_open_self(PS3BootROMState *s, uint8_t *img, size_t len,
+                                char *why, size_t why_len)
+{
+    char pck_why[160];
+
+    if (s->has_pck2) {
+        if (ps3_self_decrypt_pck2(img, len, s->pck2, pck_why,
+                                  sizeof(pck_why))) {
+            info_report("ps3-spu-stage: %s", pck_why);
+            return true;
+        }
+        info_report("ps3-spu-stage: %s; trying the loader keysets",
+                    pck_why);
+    }
+
+    return ps3_self_decrypt(img, len, why, why_len);
+}
+
 static int ps3_spu_stage(PS3BootROMState *s)
 {
     g_autoptr(GError) err = NULL;
@@ -4300,7 +5506,7 @@ static int ps3_spu_stage(PS3BootROMState *s)
      */
     if (s->stage_dump) {
         if (len >= 0x200 && !memcmp(img, "SCE\0", 4)) {
-            if (!ps3_self_decrypt(img, len, why, sizeof(why))) {
+            if (!ps3_stage_open_self(s, img, len, why, sizeof(why))) {
                 info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
                 return 1;
             }
@@ -4330,8 +5536,28 @@ static int ps3_spu_stage(PS3BootROMState *s)
     if (len >= 0x200 && !memcmp(img, "SCE\0", 4)) {
         uint32_t stage_entry = 0;
         unsigned segments = 0;
-        int opened = ps3_self_load_ls(img, len, ls, PS3_LS_SIZE, &stage_entry,
-                                      &segments, why, sizeof(why));
+        char pck_why[160];
+        int opened;
+
+        /*
+         * A .2 loader carries its ERK wrapped under the caller's PCK2.  Open
+         * it that way first; ps3_self_load_ls then sees sections that are
+         * already plaintext and loads them as they stand.  A PCK2 from a
+         * different console simply does not open the metadata, and the normal
+         * keyset search below still runs.
+         */
+        if (s->has_pck2) {
+            if (ps3_self_decrypt_pck2(img, len, s->pck2, pck_why,
+                                      sizeof(pck_why))) {
+                info_report("ps3-spu-stage: %s: %s", s->stage_elf, pck_why);
+            } else {
+                info_report("ps3-spu-stage: %s: %s; trying the loader "
+                            "keysets", s->stage_elf, pck_why);
+            }
+        }
+
+        opened = ps3_self_load_ls(img, len, ls, PS3_LS_SIZE, &stage_entry,
+                                  &segments, why, sizeof(why));
 
         if (opened) {
             info_report("ps3-spu-stage: %s: %s", s->stage_elf, why);
@@ -4451,8 +5677,8 @@ static int ps3_spu_stage(PS3BootROMState *s)
  * Returns a pointer to the ELF header inside `img' (which the caller owns),
  * or NULL with `why' set.
  */
-static const uint8_t *ps3_ppu_open(uint8_t *img, size_t len,
-                                   uint64_t *seg_shift,
+static const uint8_t *ps3_ppu_open(PS3BootROMState *s, uint8_t *img,
+                                   size_t len, uint64_t *seg_shift,
                                    char *why, size_t why_len)
 {
     const uint8_t *elf = img;
@@ -4461,7 +5687,7 @@ static const uint8_t *ps3_ppu_open(uint8_t *img, size_t len,
     *seg_shift = 0;
 
     if (len >= 4 && !memcmp(img, "SCE\0", 4)) {
-        if (!ps3_self_decrypt(img, len, why, why_len)) {
+        if (!ps3_stage_open_self(s, img, len, why, why_len)) {
             return NULL;
         }
 
@@ -4517,7 +5743,7 @@ static int ps3_ppu_dump(PS3BootROMState *s)
         return 2;
     }
 
-    elf = ps3_ppu_open(img, len, &seg_shift, why, sizeof(why));
+    elf = ps3_ppu_open(s, img, len, &seg_shift, why, sizeof(why));
     if (!elf) {
         info_report("ps3-ppu: %s: %s", s->ppu_elf, why);
         return 1;
@@ -4674,7 +5900,7 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
         return false;
     }
 
-    elf = ps3_ppu_open(img, len, &seg_shift, why, sizeof(why));
+    elf = ps3_ppu_open(s, img, len, &seg_shift, why, sizeof(why));
     if (!elf) {
         error_setg(errp, "ps3-ppu: %s: %s", s->ppu_elf, why);
         return false;
@@ -5063,6 +6289,9 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
                 loaded, bytes,
                 s->vsh_run ? ", PPU entering it" : " (load-only)");
 
+    ps3_vga_printf("VSH: %u SEGMENT(S), %" PRIu64 " BYTES MAPPED%s",
+                   loaded, bytes, s->vsh_run ? ", ENTERING" : "");
+
     if (s->vsh_run) {
         CPUState *cs = qemu_get_cpu(0);
         PowerPCCPU *cpu;
@@ -5166,7 +6395,19 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_STRING("vsh-erk", PS3BootROMState, vsh_erk),
     DEFINE_PROP_STRING("vsh-riv", PS3BootROMState, vsh_riv),
     DEFINE_PROP_STRING("dev-flash", PS3BootROMState, dev_flash),
+    DEFINE_PROP_STRING("dev-flash2", PS3BootROMState, dev_flash2),
     DEFINE_PROP_STRING("dev-flash3", PS3BootROMState, dev_flash3),
+    DEFINE_PROP_STRING("usb-dir", PS3BootROMState, usb_dir),
+    DEFINE_PROP_STRING("hdd-dir", PS3BootROMState, hdd_dir),
+    DEFINE_PROP_STRING("hdd1-dir", PS3BootROMState, hdd1_dir),
+    DEFINE_PROP_UINT32("idle-off-seconds", PS3BootROMState, idle_off_seconds,
+                       3600),
+    DEFINE_PROP_STRING("hdd-file", PS3BootROMState, hdd_file),
+    DEFINE_PROP_UINT64("hdd-size", PS3BootROMState, hdd_size, 20 * GiB),
+    DEFINE_PROP_STRING("erk", PS3BootROMState, erk_prop),
+    DEFINE_PROP_STRING("erk-file", PS3BootROMState, erk_file),
+    DEFINE_PROP_STRING("pck2", PS3BootROMState, pck2_prop),
+    DEFINE_PROP_STRING("pck2-file", PS3BootROMState, pck2_file),
     DEFINE_PROP_BOOL("vsh-run", PS3BootROMState, vsh_run, false),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
@@ -5205,6 +6446,7 @@ static const TypeInfo ps3_rom_info = {
 #define PS3_LS_BASE        0xF1000000
 #define PS3_BOOT_ROM_REGS  0xF1040000
 #define PS3_FLASH_BASE     0x20000000
+#define PS3_VGA_MMIO_BASE  0xF0200000
 
 static void rs6000_ps3_cpu_reset(void *opaque)
 {
@@ -5365,8 +6607,41 @@ static void rs6000_ps3_init(MachineState *machine)
     MemoryRegion *ram = machine->ram;
     MemoryRegion *boot = g_new(MemoryRegion, 1);
     PowerPCCPU *cpu;
-    DeviceState *mic, *rom;
+    DeviceState *mic, *rom, *vga;
     DriveInfo *dinfo;
+
+    /*
+     * Hardware acceleration runs the host's CPU, so on this target it can only
+     * run the board on a POWER host, through KVM.  HVF (macOS) and WHPX
+     * (Windows) only virtualise x86 and ARM guests, so a Cell PPU cannot use
+     * them: those hosts run TCG and there is nothing to switch on.  When KVM
+     * is in use the CPU must be the host's - a modelled 970 is a TCG CPU.
+     */
+    if (kvm_enabled()) {
+        if (!strcmp(machine->cpu_type,
+                    POWERPC_CPU_TYPE_NAME("970fx_v3.1"))) {
+            machine->cpu_type = POWERPC_CPU_TYPE_NAME("host");
+        }
+    }
+
+    {
+        const char *accel = "TCG";
+
+        if (kvm_enabled()) {
+            accel = "KVM, host CPU";
+        }
+#ifdef CONFIG_HVF
+        else if (hvf_enabled()) {
+            accel = "HVF, host CPU";
+        }
+#endif
+#ifdef CONFIG_WHPX
+        else if (whpx_enabled()) {
+            accel = "WHPX, host CPU";
+        }
+#endif
+        info_report("rs6000-ps3: acceleration: %s", accel);
+    }
 
     cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
 
@@ -5388,7 +6663,6 @@ static void rs6000_ps3_init(MachineState *machine)
     }
 
     memory_region_add_subregion(sysmem, 0, ram);
-    rs6000_ps3_lv2_page(sysmem, ram);
 
     /*
      * The PPU's reset vector lands here.  The real console's first code runs
@@ -5414,6 +6688,16 @@ static void rs6000_ps3_init(MachineState *machine)
     object_property_set_link(OBJECT(mic), "ram", OBJECT(ram), &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(mic), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(mic), 0, PS3_MIC_MMIO_BASE);
+
+    /*
+     * The display.  The RSX does not exist yet, so this is a linear
+     * framebuffer the guest can point at its own memory; it is what puts a
+     * window on screen instead of -display none.  It is created before the
+     * boot ROM device so the ROM's own progress lines land on the screen.
+     */
+    vga = qdev_new("ps3-vga");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(vga), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(vga), 0, PS3_VGA_MMIO_BASE);
 
     rom = qdev_new(TYPE_PS3_BOOT_ROM);
     object_property_set_link(OBJECT(rom), "ram", OBJECT(ram), &error_abort);

@@ -325,7 +325,7 @@ interchangeable:
 | Key | Where it lives | What it opens |
 | --- | --- | --- |
 | PCK0 (`per_console_root_key_0`) | the channel-66 efuse readout (already in this tree as the ROM readout) | `metldr` / `metldr.2` and `bootldr` / `lv0ldr.2`, i.e. the sealed `.2` stage containers |
-| PCK1 (`per_console_root_key_1`, `EID_root_key`) | derived from PCK0, held inside `metldr`, copied to HDD sector 0 by `metldr`, cleared by `isoldr` | part of the EID, and it is the root for the further per-console keys |
+| PCK1 (`per_console_root_key_1`, `EID_root_key`) - the console's EID root key 1 | derived from PCK0, held inside `metldr`, copied to HDD sector 0 by `metldr`, cleared by `isoldr` | part of the EID, and it is the root for the further per-console keys |
 | PCK2 (`per_console_root_key_2`, `EID0_key`) | AES-256-CBC over the EID0 seed with `isoldr`'s key and RIV, algorithm inside `isoldr` | the EID0 store |
 
 So the channel-66 readout this model already carries is PCK0 and stops at the
@@ -426,6 +426,7 @@ The calls the VSH asks for, in the order it first asks for them:
 | 516-522 | `0x204`-`0x20A` | `sys_config_*` | ids from the counter; no service events are queued |
 | 52 | `0x34` | `_sys_ppu_thread_create` | id, and the thread is reported but not scheduled |
 | 50/51/53 | `0x32`/`0x33`/`0x35` | thread stop/restart/start | succeed |
+| 141 | `0x8D` | `sys_timer_usleep` | succeed at once: the guest's 100 ms polls |
 
 `_sys_process_get_paramsfo` was what used to stop the boot: liblv2 asks for
 the process's PARAM.SFO, and with `-ENOSYS` it printed `liblv2 can't get
@@ -440,6 +441,17 @@ reports the idle curve, full reports `0xFF`, manual reports what was set.  The
 reads as.  Calls the model does not implement answer `-1` (or `-ENOSYS`) and
 are otherwise passed through, so a missing service does not stop the run by
 itself.
+
+With the pad and config services answering, the run gets through the VSH's
+startup handshake.  `sys_timer_usleep` is the wait its initialisation and its
+idle loop both use - 100 ms polls - and the model answers at once, because the
+PPU is TCG and a real wait would stall the machine.  That matters: while the
+call answered `-ENOSYS` the guest retried it forever at `lr=0x5DAC94`; with it
+succeeding the boot continues, creating more threads (reported, not scheduled),
+looking for `/dev_flash2/etc` and reporting `LIBBTSETTING:
+btsetting_initialize() failed! (80010003)`.  Those are the next things this
+bring-up lv2 does not have, not blockers of the handshake.  The first sleep is
+reported as `ps3-ppu: lv2: sys_timer_usleep(100000 us)`.
 
 ### The gamepad ports
 
@@ -578,25 +590,29 @@ writes ROM on purpose (`address_space_write_rom`).
 
 ### Where that run stops now
 
-With the page protected the run goes past the fill and much further: 167 lv2
-calls in 40 ticks, `libfs_utility2` and `sys_audio` loaded and linked, and the
-VSH printing its own console output:
+With the page protected and the pad, config and sleep services answering, the
+run goes past liblv2's start-up, the mutex/cond/queue set, module loading and
+`libpadconfig`.  The stub that used to assert
+(`libpadconfig_stub.cc:34 ret == CELL_OK`) now gets `CELL_OK`: `sys_io`
+answers its `cellPad` imports, `0x209` registers service `0x1030` (PADMANAGER),
+and `sys_timer_usleep` accepts the 100 ms waits.  With it answering `-ENOSYS`
+the guest retried the sleep forever at `lr=0x5DAC94`; now the boot carries on:
 
 ```
-MakePath : /dev_flash2/etc failed 8003051e
-/home/tetsu/work/sys/trunk/lv2/src/library/libpad/libpadconfig/libpadconfig_stub.cc:34 ret == CELL_OK -- assertion failed
-abort() is called from 0x00000000000acd18
-                  from 0x00000000005d46d4
-                  ...
-                  from 0x0000000000010250
-Continue... (Lv-2 is still running.)
+ps3-ppu: lv2: thread "" created (id 0xEE) but not scheduled: this model runs one thread
+ps3-ppu console: MakePath : /dev_flash2/etc failed 8003051e
+ps3-ppu console: LIBBTSETTING: btsetting_initialize() failed! (80010003)
 ```
 
-So it gets through liblv2's start-up, the mutex/cond/queue set, module loading,
-and into `libpadconfig`, where a stub asserts because a `cellPad` import is one
-of the 194 trapped ones and answers -1.  The last unmodelled service it asks
-for is `0x209`; `_sys_ppu_thread_create` (`0x34`) is not reached in this run.
-That assertion, not the `0xC00` vector, is now where the boot stops.
+What is left at the end of the run is therefore not a trapped import: it is
+`/dev_flash2` (only `dev-flash` and `dev-flash3` are mounted) and libbtsetting's
+`sys_btsetting_*` calls.  Those are the next services to model.
+
+The lv2 low page is installed **only for `vsh-run`**.  `0xC00` is inside the
+page lv0 loads its own trampoline into (its entry is `0xC40`), so installing
+the shim for a `ppu-elf` lv0 stage overwrote the hypervisor's first
+instructions and sent it to `0` (`program interrupt at pc 0x700, srr0=0`).
+Gating it on `vsh-run` puts lv0 back on its documented path to `0x800C5C0`.
 
 ## Using it with the low-level boot chain
 
@@ -614,7 +630,19 @@ The chain this model follows, in order:
 Steps 1-3 are one command. Step 4 has no automatic hand-off: each loader is
 handed its work through the local store (wait flag at `0x3E000`, arguments at
 `0x3E800`) and through channels the PPU-side code drives, and this machine does
-not yet play that part. `stage-elf` is how a loader is inspected on its own.
+not yet play that part. `stage-elf` is how a loader is inspected on its own,
+and the hand-off can be faked with:
+
+* `stage-wait=0x...` writes the 8-byte wait flag at LS `0x3E000`;
+* `stage-args=@file` (or hex bytes) copies up to `0x800` bytes to LS `0x3E800`
+  and points the loader's `$3` at that block;
+* `stage-version=0x...` answers channel 73 with the version the loader asks
+  for (isoldr's `stop 0x30` is the version check).
+
+The preload is reported as `ps3-spu-stage: preloaded wait=..., N argument
+byte(s) at LS 0x3E800, version=...`.  It is a mechanism, not a solved hand-off:
+with zeros preloaded the loaders still stop where they did without it, because
+the block the previous stage would build holds real pointers and counts.
 
 ### Inputs
 
@@ -729,6 +757,26 @@ have plaintext ELF headers but still-encrypted segments - loading one faults on
 its first word (`unimplemented SPU opcode`) - while the SELF opener decrypts the
 same image correctly.
 
+### A top-to-bottom check
+
+Run in this order, the stages cover the whole chain; each line is what the
+build in this tree prints today (inputs from the ps3tools tree):
+
+| Step | Command | Observed |
+| --- | --- | --- |
+| 1-3 | `-bios .tmp/rom/rom.bin -drive if=pflash,...,file=.tmp/pctool_flash.bin -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin -global ps3-boot-rom.ls-dump=ls.bin` | `container verified, 191152 bytes of payload`; the ROM opens it in the SPU interpreter too (`42765 instructions`); `selftest passed`; the payload runs to the `67108864`-instruction limit at `0x1F0BC`, 1 MFC get / 13 puts, last put `0xFFF318` |
+| 4a | `stage-elf=lv1ldr.self` | entry `0x12C00`, 3 segments, `stop 48` at `0x13D8C` after 450 instructions |
+| 4b | `stage-elf=lv2ldr.self` | entry `0x12C00`, 3 segments, `stop 48` at `0x12E18` after 530 instructions |
+| 4c | `stage-elf=appldr.self` | entry `0x12C00`, 3 segments, `stop 48` at `0x13078` after 1252 instructions |
+| 4d | `stage-elf=isoldr.self` | entry `0x25B50`, 2 segments, spins at `0x25990`/`0x25998`, no MFC traffic (needs channel 73) |
+| 5 | `ppu-elf=lv0.elf ppu-entry=0xc40 ppu-ticks=5` (or the `lv0_493.self` carve) | segments `0x0`/`0xC70` and `0x8000000`/`0xCBD50`; runs to `0x800C5C0`, printing `send_and_receive: write_init_msg fail -8` (the syscon UART is unanswered) |
+| 6 | `dev-flash=... dev-flash3=... ps3-boot-rom.vsh-run=on` | `vsh.self` entry `0x6D5AC8` -> code `0x10230`, TOC `0x6F5558`; libfs_utility2 and sys_audio load and link; PADMANAGER registers; the run reaches `/dev_flash2` and libbtsetting |
+
+Steps 1-3 and 6 run the guest's own code from start to finish; step 5 runs lv0
+until its first hardware handshake.  Step 4 is inspected loader by loader -
+the hand-off between steps 3/4/5/6 is still driven by hand, in the order above,
+which is why each stage is a separate command.
+
 ### Recovering a readout
 
 It cannot be derived from the container. On a console, the SPU probe
@@ -760,7 +808,9 @@ Three ways in, because the key is whatever that console has:
 * `--readout` is the 32 bytes the mask ROM reads from channel 66, in its order.
   The container key is `Kp = AES-ENC(K_hi, hdr[0x20:0x30] XOR K_lo)`; both
   orderings of the same readout are tried.
-* `--erk` is the console's 48-byte EID root key.  It derives eid0's
+* `--erk` is the console's 48-byte EID root key 1 - `PCK1`, the value
+  `metldr` derives from PCK0 and copies to HDD sector 0, not the channel-66
+  `PCK0` readout that opens the `.2` containers.  It derives eid0's
   "individuals" blob (`AES-256-CBC` over the published seed, both directions),
   and every key that blob can hand a container is swept; the ERK's halves are
   swept directly too.  `--eid0` is optional and only adds the eid0 CMAC check.

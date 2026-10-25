@@ -20,8 +20,14 @@ if not introspect:
     # Nothing to install into: meson did not hand us its introspect command
     # (Windows reconfigure), and the bundle is only used by `make install`.
     sys.exit(0)
-out = subprocess.run([*shlex.split(introspect), '--installed'],
-                     stdout=subprocess.PIPE, check=True).stdout
+try:
+    out = subprocess.run([*shlex.split(introspect), '--installed'],
+                         stdout=subprocess.PIPE, check=True).stdout
+except (OSError, subprocess.CalledProcessError):
+    # The command meson handed over may not be runnable (on Windows the
+    # venv's entry point is meson.exe, not bin/meson).  The bundle only
+    # exists for `make install`, so a local build tree can skip it.
+    sys.exit(0)
 for source, dest in json.loads(out).items():
     bundle_dest = destdir_join('qemu-bundle', dest)
     path = os.path.dirname(bundle_dest)
@@ -33,6 +39,10 @@ for source, dest in json.loads(out).items():
     try:
         os.symlink(source, bundle_dest)
     except OSError as e:
+        # A bundle entry that is already there is the normal result of
+        # reconfiguring an existing build tree, not a failure.
+        if getattr(e, 'winerror', 0) == 183 or e.errno == errno.EEXIST:
+            continue
         # Windows refuses symlinks without Developer Mode; a copy is
         # equivalent for a local build tree.
         if getattr(e, 'winerror', 0) == 1314 or e.errno in (errno.EPERM, errno.EACCES):
