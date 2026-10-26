@@ -701,8 +701,12 @@ static void ps3_vga_frame(PS3VGAState *s)
     s->vblank++;
 
     if (!s->guest_mode) {
-        /* The boot screen has to reach the GL scanout once it is up. */
-        if (s->gl_active) {
+        /*
+         * The boot screen has to reach the GL scanout once it is up.  The
+         * first tick is also where the context is created, so present even
+         * before gl_active is set.
+         */
+        if (s->gl_active || (s->gl && !s->gl_checked)) {
             ps3_vga_present(s);
         }
         return;

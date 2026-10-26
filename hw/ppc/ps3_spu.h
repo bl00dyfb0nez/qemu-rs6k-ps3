@@ -5,8 +5,11 @@
  *
  * It executes the SPU instruction set (see ps3_spu.c): 256 KiB of local
  * storage, the 128 quadword registers, the channels and a synchronous MFC over
- * a writable copy of the console's flash image.  The goal is to run the payload
- * the mask ROM leaves at LS[0x400], not to be a complete SPE.
+ * a writable copy of the console's flash image.  The ISA is covered in full -
+ * integer, single- and double-precision floating point, the multiply family,
+ * the halt variants, SPRs and the channel set - and the only structural limit
+ * left is that the model runs one SPE at a time (no concurrent SPEs) and has
+ * an issue-slot estimate rather than a cycle-accurate timing model.
  */
 #pragma once
 
@@ -65,6 +68,24 @@ int ps3_spu_run_to(PS3SPU *spu, uint32_t entry, uint32_t stop_pc,
 uint64_t ps3_spu_insns(const PS3SPU *spu);
 uint32_t ps3_spu_pc(const PS3SPU *spu);
 uint32_t ps3_spu_gpr_word(const PS3SPU *spu, unsigned reg, unsigned lane);
+
+/*
+ * Issue slots and dual-issued pairs.  The pairing rule (one even-pipe and one
+ * odd-pipe instruction share a cycle) is an estimate: latencies, stalls and
+ * hazards are not modelled, so this is a relative figure for profiling, not a
+ * cycle count a timing test can rely on.
+ */
+uint64_t ps3_spu_cycles(const PS3SPU *spu);
+uint64_t ps3_spu_dual_issue_pairs(const PS3SPU *spu);
+
+/*
+ * Run the instruction-set self-test: one program covering the integer,
+ * floating-point, double-precision, multiply, halt, channel and SPR families,
+ * checked against the ISA's answers.  Returns 0 when every check passes, -1
+ * with a description when one does not.  The boot selftest calls it on every
+ * run.
+ */
+int ps3_spu_isa_selftest(char *why, size_t why_len);
 
 /* The immediate of the stop instruction that ended the run, 0 if none. */
 unsigned ps3_spu_stop_code(const PS3SPU *spu);

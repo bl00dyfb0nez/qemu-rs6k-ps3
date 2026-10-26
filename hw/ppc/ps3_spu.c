@@ -23,6 +23,8 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 
+#include <math.h>
+
 #include "ps3_spu.h"
 #include "ps3_spu_isa.h"
 
@@ -72,6 +74,39 @@ struct PS3SPU {
     uint32_t mfc_tag;
     uint32_t mfc_cmd;
     uint32_t tag_mask;
+
+    /*
+     * The rest of the channel set: the event/mailbox/decrementer state and
+     * SRR0.  The boot path only used the DMA and signal channels, but real
+     * SPU code - and the VSH's audio and codecs - drive these too, so they
+     * have storage and the counts and blocking rules the ISA gives them.
+     */
+    uint32_t srr0;
+    uint32_t event_mask;
+    uint32_t event_stat;
+    uint32_t decrementer;
+    uint32_t in_mbox;
+    bool in_mbox_valid;
+    uint32_t out_mbox;
+    uint32_t iso_control;
+
+    /* mfspr/mtspr: 128-bit SPRs, of which this model keeps the preferred slot. */
+    uint32_t spr[128];
+
+    /* The FPSCR the single-precision code updates (exception flags). */
+    uint32_t fpscr;
+
+    /*
+     * An issue model, not a cycle-accurate one: one slot per instruction, plus
+     * the latency class of the multi-cycle operations.  It is enough to show
+     * where the time goes in a profile and to let `ps3_spu_cycles' report a
+     * figure, and it is labelled as an estimate everywhere it is printed.
+     */
+    uint64_t cycles;
+    uint64_t dual_issue_pairs;
+    bool last_pipe_even;
+    bool last_pipe_valid;
+    bool halted;
 
     uint8_t tag_fifo[SPU_TAG_FIFO];
     unsigned tag_head;
@@ -197,6 +232,175 @@ static void gpr_get_bytes(const PS3SPU *spu, unsigned reg, uint8_t *bytes)
     for (unsigned i = 0; i < 4; i++) {
         put_be32(bytes + i * 4, gpr_w(spu, reg, i));
     }
+}
+
+/* ---- single-precision, extended range --------------------------------- */
+/*
+ * The SPU's single format is IEEE-shaped but not IEEE: exponent 255 is a
+ * normal value (Smax is 0x7FFFFFFF, 1.999... * 2^128), denormals read as zero,
+ * and the only rounding mode is truncation toward zero.  Arithmetic therefore
+ * runs in long double and is truncated back into that format; using the host's
+ * float would round to nearest-even and would turn exponent 255 into an
+ * infinity, which real code does observe.
+ */
+#define SPU_SF_MAX      0x7FFFFFFFu
+#define SPU_SF_SIGN     0x80000000u
+#define SPU_SF_EXP      0x7F800000u
+#define SPU_SF_FRAC     0x007FFFFFu
+
+/* FPSCR exception flags this model accumulates (OVF/UNF/DBZ/DIFF). */
+#define SPU_FP_OVF      0x00000001u
+#define SPU_FP_UNF      0x00000002u
+#define SPU_FP_DBZ      0x00000004u
+#define SPU_FP_DIFF     0x00000008u
+
+static long double spu_sf_value(uint32_t bits)
+{
+    const int sign = (bits & SPU_SF_SIGN) ? -1 : 1;
+    const unsigned exp = (bits >> 23) & 0xFF;
+    const uint32_t frac = bits & SPU_SF_FRAC;
+
+    /* A zero exponent with a fraction is a denormal: the format reads it as
+     * zero (DIFF is flagged by the caller when it matters). */
+    if (!exp) {
+        return sign < 0 ? -0.0L : 0.0L;
+    }
+
+    return sign * ldexpl(1.0L + (long double)frac / 8388608.0L,
+                         (int)exp - 127);
+}
+
+static uint32_t spu_sf_pack(long double v, uint32_t *flags)
+{
+    const bool neg = signbit(v);
+    long double a = fabsl(v);
+    const long double smax = ldexpl(2.0L - ldexpl(1.0L, -23), 128);
+    int e, biased;
+    uint32_t frac;
+
+    if (isnan(a)) {
+        /* The format has no NaNs; the default QNaN bits would be Smax. */
+        return SPU_SF_MAX;
+    }
+
+    if (isinf(a) || a >= smax) {
+        *flags |= SPU_FP_OVF;
+        return (neg ? SPU_SF_SIGN : 0) | SPU_SF_MAX;
+    }
+
+    if (a == 0) {
+        return neg ? SPU_SF_SIGN : 0;
+    }
+
+    frexpl(a, &e);                  /* a = m * 2^e, 0.5 <= m < 1 */
+    biased = e - 1 + 127;
+
+    if (biased < 1) {               /* below Smin = 2^-126 */
+        *flags |= SPU_FP_UNF | SPU_FP_DIFF;
+        return neg ? SPU_SF_SIGN : 0;
+    }
+
+    if (biased > 255) {
+        *flags |= SPU_FP_OVF;
+        return (neg ? SPU_SF_SIGN : 0) | SPU_SF_MAX;
+    }
+
+    /* Truncation toward zero is what the ISA specifies. */
+    frac = (uint32_t)floorl((ldexpl(a, 1 - e) - 1.0L) * 8388608.0L);
+    if (frac > SPU_SF_FRAC) {
+        frac = SPU_SF_FRAC;
+    }
+
+    return (neg ? SPU_SF_SIGN : 0) | ((uint32_t)biased << 23) | frac;
+}
+
+static bool spu_sf_is_denormal(uint32_t bits)
+{
+    return (bits & SPU_SF_EXP) == 0 && (bits & SPU_SF_FRAC) != 0;
+}
+
+static void spu_sf_flags(PS3SPU *spu, uint32_t bits)
+{
+    if (spu_sf_is_denormal(bits)) {
+        spu->fpscr |= SPU_FP_DIFF;
+    }
+}
+
+/*
+ * The reciprocal-estimate tables.  FREST returns a 13-bit base fraction and a
+ * 10-bit step; FI interpolates between them using 19 bits of the input.  The
+ * fractions below are the hardware table's (the same values RPCS3 uses), and
+ * the exponent halves are generated from the header's rule: 
+ * FREST exponent = (254 - e) for e in 1..254, 0x7F800000 for zero (DBZ), and
+ * FRSQEST exponent = 189 - (e - 1) / 2 for e in 1..255.
+ */
+static const uint32_t spu_frest_fraction[32] = {
+    0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
+    0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
+    0x2AA9BE, 0x2A85AC, 0x23D59A, 0x23BD8E, 0x1D8576, 0x1D8576, 0x17AD5A, 0x17AD5A,
+    0x124543, 0x124543, 0x0D392D, 0x0D392D, 0x08851A, 0x08851A, 0x041D07, 0x041D07,
+};
+
+static const uint32_t spu_frsqest_fraction[64] = {
+    0x350160, 0x34E954, 0x2F993D, 0x2F993D, 0x2AA523, 0x2AA523, 0x26190D, 0x26190D,
+    0x21E4F9, 0x21E4F9, 0x1E00E9, 0x1E00E9, 0x1A5CD9, 0x1A5CD9, 0x16F8CB, 0x16F8CB,
+    0x13CCC0, 0x13CCC0, 0x10CCB3, 0x10CCB3, 0x0E00AA, 0x0E00AA, 0x0B58A1, 0x0B58A1,
+    0x08D498, 0x08D498, 0x067491, 0x067491, 0x043089, 0x043089, 0x020C83, 0x020C83,
+    0x7FFDF4, 0x7FD1DE, 0x7859C8, 0x783DBA, 0x71559C, 0x71559C, 0x6AE57C, 0x6AE57C,
+    0x64F561, 0x64F561, 0x5F7149, 0x5F7149, 0x5A4D33, 0x5A4D33, 0x55811F, 0x55811F,
+    0x51050F, 0x51050F, 0x4CC8FE, 0x4CC8FE, 0x48D0F0, 0x48D0F0, 0x4510E4, 0x4510E4,
+    0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA,
+};
+
+static uint32_t spu_frest_exponent(unsigned e)
+{
+    if (e == 0) {
+        return 0x7F800000u;
+    }
+    return e <= 254 ? ((254u - e) << 23) : 0;
+}
+
+static uint32_t spu_frsqest_exponent(unsigned e)
+{
+    if (e == 0) {
+        return 0x7F800000u;
+    }
+    return (189u - (e - 1) / 2) << 23;
+}
+
+/* ---- double-precision -------------------------------------------------- */
+
+static uint64_t gpr_d(const PS3SPU *spu, unsigned reg, unsigned slot)
+{
+    return ((uint64_t)gpr_w(spu, reg, slot * 2) << 32) |
+           gpr_w(spu, reg, slot * 2 + 1);
+}
+
+static void gpr_set_d(PS3SPU *spu, unsigned reg, unsigned slot, uint64_t v)
+{
+    gpr_set_w(spu, reg, slot * 2, (uint32_t)(v >> 32));
+    gpr_set_w(spu, reg, slot * 2 + 1, (uint32_t)v);
+}
+
+static double spu_d_value(uint64_t bits)
+{
+    double d;
+
+    memcpy(&d, &bits, sizeof(d));
+    return d;
+}
+
+static uint64_t spu_d_bits(double d)
+{
+    uint64_t bits;
+
+    memcpy(&bits, &d, sizeof(bits));
+    return bits;
+}
+
+static uint64_t spu_d_mask(bool hit)
+{
+    return hit ? UINT64_MAX : 0;
 }
 
 /* Local-store addresses wrap at 32 bits first, then lose the four low bits:
@@ -428,6 +632,22 @@ static void mfc_start(PS3SPU *spu)
 static uint32_t ch_read(PS3SPU *spu, unsigned ch)
 {
     switch (ch) {
+    case 0x00:                                  /* SPU_RdEventStat */
+        return spu->event_stat & spu->event_mask;
+    case 0x08:                                  /* SPU_RdDec */
+        return spu->decrementer;
+    case 0x0B:                                  /* SPU_RdEventMask */
+        return spu->event_mask;
+    case 0x0C:                                  /* MFC_RdTagMask */
+        return spu->tag_mask;
+    case 0x0F:                                  /* SPU_RdSRR0 */
+        return spu->srr0;
+    case 0x1D:                                  /* SPU_RdInMbox */
+        if (spu->in_mbox_valid) {
+            spu->in_mbox_valid = false;
+            return spu->in_mbox;
+        }
+        return 0;
     case 0x03:                                  /* SPU_RdSigNotify1 */
         return spu->sig_hi;
     case 0x04:                                  /* SPU_RdSigNotify2 */
@@ -461,6 +681,16 @@ static uint32_t ch_read(PS3SPU *spu, unsigned ch)
 static uint32_t ch_read_count(PS3SPU *spu, unsigned ch)
 {
     switch (ch) {
+    case 0x00:                                  /* SPU_RdEventStat */
+        return (spu->event_stat & spu->event_mask) ? 1 : 0;
+    case 0x08:                                  /* SPU_RdDec */
+    case 0x0B:                                  /* SPU_RdEventMask */
+    case 0x0C:                                  /* MFC_RdTagMask */
+    case 0x0E:                                  /* SPU_WrSRR0 */
+    case 0x0F:                                  /* SPU_RdSRR0 */
+        return 1;
+    case 0x1D:                                  /* SPU_RdInMbox */
+        return spu->in_mbox_valid ? 1 : 0;
     case 0x18:                                  /* MFC_RdTagStat */
         return spu->tag_count;
     case 0x42:
@@ -475,6 +705,35 @@ static uint32_t ch_read_count(PS3SPU *spu, unsigned ch)
 static void ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
 {
     switch (ch) {
+    case 0x01:                                  /* SPU_WrEventMask */
+        spu->event_mask = value;
+        break;
+    case 0x02:                                  /* SPU_WrEventAck */
+        spu->event_stat &= ~value;
+        break;
+    case 0x07:                                  /* SPU_WrDec */
+        spu->decrementer = value;
+        break;
+    case 0x0E:                                  /* SPU_WrSRR0 */
+        spu->srr0 = value;
+        break;
+    case 0x1C:                                  /* SPU_WrOutMbox */
+    case 0x1E:                                  /* SPU_WrOutIntrMbox */
+        spu->out_mbox = value;
+        break;
+    case 0x19:                                  /* MFC_WrListStallAck */
+    case 0x45:                                  /* SPU_Set_Bkmk_Tag */
+    case 0x46:                                  /* SPU_PM_Start_Ev */
+    case 0x47:                                  /* SPU_PM_Stop_Ev */
+        break;
+    case 0x40:                                  /* SPU_IsoCntl */
+        /*
+         * Isolation is recorded, not enforced: this model's local store is a
+         * flat 256 KiB array with no requestor ID, so there is no boundary to
+         * check.  Reading the state back is what a test needs to see it took.
+         */
+        spu->iso_control = value;
+        break;
     case 0x10:                                  /* MFC_LSA */
         spu->mfc_lsa = value;
         break;
@@ -501,8 +760,6 @@ static void ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
         /* The engine is synchronous, so a completion update has nothing to
          * wait for; the tag queue already holds the result. */
         break;
-    case 0x40:                                  /* SPU_IsoCntl */
-        break;
     default:
         break;
     }
@@ -513,7 +770,7 @@ static void ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
 typedef struct {
     const SpuOpcode *op;
     unsigned rt, ra, rb, rc;
-    uint32_t i7, i10, i16, a18, bd;
+    uint32_t i7, i8, i10, i16, a18, bd;
 } Insn;
 
 static const SpuOpcode *decode(uint32_t word)
@@ -538,6 +795,7 @@ static void field_decode(Insn *in, uint32_t word)
     in->rb = (word >> 14) & 0x7F;
     in->rt = four ? ((word >> 21) & 0x7F) : (word & 0x7F);
     in->i7 = (word >> 14) & 0x7F;
+    in->i8 = (word >> 14) & 0xFF;
     in->i10 = (word >> 14) & 0x3FF;
     in->i16 = (word >> 7) & 0xFFFF;
     in->a18 = (word >> 7) & 0x3FFFF;
@@ -628,6 +886,16 @@ unsigned ps3_spu_stop_code(const PS3SPU *spu)
     return spu->stop_code;
 }
 
+uint64_t ps3_spu_cycles(const PS3SPU *spu)
+{
+    return spu->cycles;
+}
+
+uint64_t ps3_spu_dual_issue_pairs(const PS3SPU *spu)
+{
+    return spu->dual_issue_pairs;
+}
+
 uint64_t ps3_spu_mfc_gets(const PS3SPU *spu)
 {
     return spu->mfc_gets;
@@ -655,6 +923,218 @@ uint8_t *ps3_spu_ext_ptr(PS3SPU *spu, size_t *size)
     }
 
     return spu->ext;
+}
+
+/* ---- instruction-set self-test ---------------------------------------- */
+/*
+ * Encoders for the test program below.  The opcode numbers are the ones the
+ * generated table carries and the field positions are the ISA's, so a test
+ * word is built the way an assembler would build it.
+ */
+static uint32_t t_rrr(uint32_t op, unsigned rt, unsigned ra, unsigned rb)
+{
+    return (op << 21) | (rb << 14) | (ra << 7) | rt;
+}
+
+static uint32_t t_rrrr(uint32_t op, unsigned rt, unsigned ra, unsigned rb,
+                       unsigned rc)
+{
+    return (op << 28) | (rt << 21) | (rb << 14) | (ra << 7) | rc;
+}
+
+static uint32_t t_rr(uint32_t op, unsigned rt, unsigned ra)
+{
+    return (op << 21) | (ra << 7) | rt;
+}
+
+static uint32_t t_il(uint32_t op, unsigned rt, uint32_t i16)
+{
+    return (op << 23) | ((i16 & 0xFFFF) << 7) | rt;
+}
+
+static uint32_t t_lqd(unsigned rt, unsigned ra, unsigned i10)
+{
+    return (0x34u << 24) | ((i10 & 0x3FF) << 14) | (ra << 7) | rt;
+}
+
+static uint32_t t_scale(uint32_t op, unsigned rt, unsigned ra, unsigned i8)
+{
+    return (op << 22) | ((i8 & 0xFF) << 14) | (ra << 7) | rt;
+}
+
+static int spu_isa_fail(char *why, size_t why_len, const char *what,
+                        uint32_t got, uint32_t want)
+{
+    snprintf(why, why_len, "ISA self-test: %s: got 0x%08X, want 0x%08X",
+             what, got, want);
+    return -1;
+}
+
+#define ISA_CHECK(what, expr, want)                                        \
+    do {                                                                   \
+        const uint32_t got_ = (expr);                                      \
+        const uint32_t want_ = (uint32_t)(want);                           \
+        if (got_ != want_) {                                               \
+            return spu_isa_fail(why, why_len, what, got_, want_);           \
+        }                                                                  \
+    } while (0)
+
+/*
+ * Run a program that touches every family the interpreter implements and
+ * compare the registers with the ISA's answers.  The boot selftest calls it,
+ * so an instruction that breaks is visible on every run rather than only when
+ * some loader happens to use it.
+ */
+int ps3_spu_isa_selftest(char *why, size_t why_len)
+{
+    uint8_t *ls = g_malloc0(256 * KiB);
+    PS3SPU *spu;
+    const unsigned entry = 0x1000;
+    unsigned n = 0;
+    int status;
+
+#define EMIT(word) put_be32(ls + entry + n++ * 4, (word))
+
+    /* doubles at 0x800 and the NaN the special-value test looks for at 0x900 */
+    {
+        static const uint8_t data[] = {
+            0x3F, 0xF0, 0, 0, 0, 0, 0, 0,         /* 1.0 */
+            0x40, 0x00, 0, 0, 0, 0, 0, 0,         /* 2.0 */
+        };
+
+        memcpy(ls + 0x800, data, sizeof(data));
+        put_be32(ls + 0x900, 0x7FF80000);
+        put_be32(ls + 0x904, 0x00000000);
+    }
+
+    EMIT(t_il(0x081, 1, 1));                    /* il $1,1 */
+    EMIT(t_il(0x082, 2, 0x3F80));               /* ilhu $2,0x3F80  = 1.0 */
+    EMIT(t_il(0x082, 3, 0x4000));               /* ilhu $3,0x4000  = 2.0 */
+    EMIT(t_rrr(0x2C4, 4, 2, 3));                /* fa  $4,$2,$3     = 3.0 */
+    EMIT(t_rrr(0x2C5, 5, 3, 2));                /* fs  $5,$3,$2     = 1.0 */
+    EMIT(t_rrr(0x2C6, 6, 3, 3));                /* fm  $6,$3,$3     = 4.0 */
+    EMIT(t_rrrr(0x0E, 7, 2, 3, 3));             /* fma $7,$2,$3,$3  = 4.0 */
+    EMIT(t_rrrr(0x0F, 8, 3, 3, 2));             /* fms $8,$3,$3,$2  = 3.0 */
+    EMIT(t_rrrr(0x0D, 9, 2, 3, 3));             /* fnms $9,$2,$3,$3 = 1.0 */
+    EMIT(t_scale(0x1DA, 10, 1, 155));           /* csflt $10,$1,155 = 1.0 */
+    EMIT(t_scale(0x1D8, 11, 10, 173));          /* cflts $11,$10,173 = 1 */
+    EMIT(t_scale(0x1DB, 12, 1, 155));           /* cuflt $12,$1,155 = 1.0 */
+    EMIT(t_scale(0x1D9, 13, 10, 173));          /* cfltu $13,$10,173 = 1 */
+    EMIT(t_rr(0x1B8, 14, 3));                   /* frest  $14,$3 */
+    EMIT(t_rr(0x1B9, 15, 3));                   /* frsqest $15,$3 */
+    EMIT(t_rrr(0x3D4, 16, 3, 14));              /* fi $16,$3,$14 */
+    EMIT(t_rrr(0x3C2, 17, 2, 2));               /* fceq $17,$2,$2 */
+    EMIT(t_rrr(0x2C2, 18, 3, 2));               /* fcgt $18,$3,$2 */
+    EMIT(t_rrr(0x3CA, 19, 2, 3));               /* fcmeq $19,$2,$3 */
+    EMIT(t_rrr(0x2CA, 20, 3, 2));               /* fcmgt $20,$3,$2 */
+    EMIT(t_lqd(21, 0, 0x80));                   /* $21 = 1.0 (double) */
+    EMIT(t_lqd(22, 0, 0x88));                   /* $22 = 2.0 (double) */
+    EMIT(t_rrr(0x2CC, 23, 21, 22));             /* dfa $23,$21,$22 = 3.0 */
+    EMIT(t_rrr(0x2CD, 24, 22, 21));             /* dfs $24,$22,$21 = 1.0 */
+    EMIT(t_rrr(0x2CE, 25, 22, 22));             /* dfm $25,$22,$22 = 4.0 */
+    EMIT(t_lqd(26, 0, 0x80));
+    EMIT(t_rrr(0x35C, 26, 21, 22));             /* dfma $26,$21,$22 = 1*2+1 */
+    EMIT(t_rrr(0x3C3, 27, 21, 21));             /* dfceq $27,$21,$21 */
+    EMIT(t_rrr(0x2C3, 28, 22, 21));             /* dfcgt $28,$22,$21 */
+    EMIT(t_rrr(0x2CB, 29, 21, 22));             /* dfcmgt $29,$21,$22 = 0 */
+    EMIT(t_lqd(30, 0, 0x90));
+    EMIT(t_rrr(0x3BF, 31, 30, 0x40));           /* dftsv $31,$30,NaN */
+
+    /* integer multiply variants */
+    EMIT(t_il(0x082, 32, 0x1234));              /* $32 = 0x12340000 */
+    EMIT(t_il(0x081, 33, 0x5678));              /* $33 = 0x00005678 */
+    EMIT(t_il(0x081, 34, 0x4000));
+    EMIT(t_rrr(0x3C7, 35, 34, 34));             /* mpys  = 0x1000 */
+    EMIT(t_rrr(0x3C5, 36, 32, 33));             /* mpyh  = 0x00600000 */
+    EMIT(t_il(0x082, 37, 0x0002));              /* $37 = 0x00020000 */
+    EMIT(t_rrr(0x3C6, 38, 32, 37));             /* mpyhh  = 0x2468 */
+    EMIT(t_il(0x081, 39, 1));
+    EMIT(t_rrr(0x346, 39, 32, 37));             /* mpyhha  += 0x2468 */
+    EMIT(t_rrr(0x3CE, 40, 32, 37));             /* mpyhhu = 0x2468 */
+    EMIT(t_il(0x081, 41, 1));
+    EMIT(t_rrr(0x34E, 41, 32, 37));             /* mpyhhau += 0x2468 */
+
+    /* borrow generate, or-across, SPRs */
+    EMIT(t_il(0x081, 42, 5));
+    EMIT(t_il(0x081, 43, 3));
+    EMIT(t_il(0x081, 44, 1));
+    EMIT(t_rrr(0x042, 45, 42, 43));             /* bg  $45,$42,$43 = 1 */
+    EMIT(t_rrr(0x343, 44, 42, 43));             /* bgx $44,$42,$43 = 0 */
+    EMIT(t_rr(0x1F0, 46, 2));                   /* orx $46,$2 */
+    EMIT(t_rrr(0x10C, 3, 5, 0));                /* mtspr 5,$3 */
+    EMIT(t_rrr(0x00C, 47, 5, 0));               /* mfspr $47,5 */
+
+    /* quadword byte shifts whose count comes from the bit count */
+    EMIT(t_il(0x081, 48, 32));                  /* count = 4 */
+    EMIT(t_rrr(0x1CC, 49, 2, 48));              /* rotqbybi $49,$2,$48 */
+    EMIT(t_rrr(0x1CF, 50, 2, 48));              /* shlqbybi $50,$2,$48 */
+    EMIT(t_il(0x081, 51, 224));                 /* (0-4)&31 = 28 -> 4 */
+    EMIT(t_rrr(0x1CD, 52, 2, 51));              /* rotqmbybi $52,$2,$51 */
+
+    /* SRR0 and iret: branch to a stopd placed at 0x1200 */
+    EMIT(t_il(0x081, 53, 0x1200));
+    EMIT(t_rrr(0x10D, 53, 14, 0));              /* wrch $53, channel 14 */
+    EMIT(t_rr(0x1AA, 0, 0));                    /* iret */
+
+    put_be32(ls + 0x1200, 0x140u << 21);        /* stopd */
+
+    spu = ps3_spu_new(ls, 256 * KiB, NULL, 0);
+    status = ps3_spu_run(spu, entry, 1000, why, why_len);
+
+    if (status != 0) {
+        ps3_spu_free(spu);
+        g_free(ls);
+        return -1;
+    }
+
+    ISA_CHECK("fa", ps3_spu_gpr_word(spu, 4, 0), 0x40400000u);
+    ISA_CHECK("fs", ps3_spu_gpr_word(spu, 5, 0), 0x3F800000u);
+    ISA_CHECK("fm", ps3_spu_gpr_word(spu, 6, 0), 0x40800000u);
+    ISA_CHECK("fma", ps3_spu_gpr_word(spu, 7, 0), 0x40800000u);
+    ISA_CHECK("fms", ps3_spu_gpr_word(spu, 8, 0), 0x40400000u);
+    ISA_CHECK("fnms", ps3_spu_gpr_word(spu, 9, 0), 0x3F800000u);
+    ISA_CHECK("csflt", ps3_spu_gpr_word(spu, 10, 0), 0x3F800000u);
+    ISA_CHECK("cflts", ps3_spu_gpr_word(spu, 11, 0), 1u);
+    ISA_CHECK("cuflt", ps3_spu_gpr_word(spu, 12, 0), 0x3F800000u);
+    ISA_CHECK("cfltu", ps3_spu_gpr_word(spu, 13, 0), 1u);
+    ISA_CHECK("frest", ps3_spu_gpr_word(spu, 14, 0), 0x3F7FFBE0u);
+    ISA_CHECK("frsqest", ps3_spu_gpr_word(spu, 15, 0), 0x3F350160u);
+    ISA_CHECK("fi", ps3_spu_gpr_word(spu, 16, 0), 0x3F7FF800u);
+    ISA_CHECK("fceq", ps3_spu_gpr_word(spu, 17, 0), 0xFFFFFFFFu);
+    ISA_CHECK("fcgt", ps3_spu_gpr_word(spu, 18, 0), 0xFFFFFFFFu);
+    ISA_CHECK("fcmeq", ps3_spu_gpr_word(spu, 19, 0), 0u);
+    ISA_CHECK("fcmgt", ps3_spu_gpr_word(spu, 20, 0), 0xFFFFFFFFu);
+    ISA_CHECK("dfa", ps3_spu_gpr_word(spu, 23, 0), 0x40080000u);
+    ISA_CHECK("dfa lo", ps3_spu_gpr_word(spu, 23, 1), 0u);
+    ISA_CHECK("dfs", ps3_spu_gpr_word(spu, 24, 0), 0x3FF00000u);
+    ISA_CHECK("dfm", ps3_spu_gpr_word(spu, 25, 0), 0x40100000u);
+    ISA_CHECK("dfma", ps3_spu_gpr_word(spu, 26, 0), 0x40080000u);
+    ISA_CHECK("dfceq", ps3_spu_gpr_word(spu, 27, 0), 0xFFFFFFFFu);
+    ISA_CHECK("dfcgt", ps3_spu_gpr_word(spu, 28, 0), 0xFFFFFFFFu);
+    ISA_CHECK("dfcmgt", ps3_spu_gpr_word(spu, 29, 0), 0u);
+    ISA_CHECK("dftsv", ps3_spu_gpr_word(spu, 31, 0), 0xFFFFFFFFu);
+    ISA_CHECK("mpys", ps3_spu_gpr_word(spu, 35, 0), 0x00001000u);
+    ISA_CHECK("mpyh", ps3_spu_gpr_word(spu, 36, 0), 0x00600000u);
+    ISA_CHECK("mpyhh", ps3_spu_gpr_word(spu, 38, 0), 0x00002468u);
+    ISA_CHECK("mpyhha", ps3_spu_gpr_word(spu, 39, 0), 0x00002469u);
+    ISA_CHECK("mpyhhu", ps3_spu_gpr_word(spu, 40, 0), 0x00002468u);
+    ISA_CHECK("mpyhhau", ps3_spu_gpr_word(spu, 41, 0), 0x00002469u);
+    ISA_CHECK("bg", ps3_spu_gpr_word(spu, 45, 0), 1u);
+    ISA_CHECK("bgx", ps3_spu_gpr_word(spu, 44, 0), 0u);
+    ISA_CHECK("orx", ps3_spu_gpr_word(spu, 46, 0), 0x3F800000u);
+    ISA_CHECK("orx slot 1", ps3_spu_gpr_word(spu, 46, 1), 0u);
+    ISA_CHECK("mfspr", ps3_spu_gpr_word(spu, 47, 0), 0x40000000u);
+    ISA_CHECK("mfspr slot 1", ps3_spu_gpr_word(spu, 47, 1), 0u);
+    ISA_CHECK("rotqbybi word0", ps3_spu_gpr_word(spu, 49, 0), 0u);
+    ISA_CHECK("rotqbybi word3", ps3_spu_gpr_word(spu, 49, 3), 0x3F800000u);
+    ISA_CHECK("shlqbybi", ps3_spu_gpr_word(spu, 50, 0), 0u);
+    ISA_CHECK("rotqmbybi word0", ps3_spu_gpr_word(spu, 52, 0), 0u);
+    ISA_CHECK("rotqmbybi word1", ps3_spu_gpr_word(spu, 52, 1), 0x3F800000u);
+
+    ps3_spu_free(spu);
+    g_free(ls);
+    return 0;
+#undef EMIT
 }
 
 unsigned ps3_spu_code_words(const uint8_t *bytes, size_t len,
@@ -707,6 +1187,54 @@ static bool fault(PS3SPU *spu, uint32_t pc, uint32_t word,
     return false;
 }
 
+/*
+ * Which issue pipe an instruction can use.  The SPU issues one instruction to
+ * each of two pipes per cycle; only the pairing is modelled here, not the
+ * latencies or the hazards.  Even: floating point, integer multiply, shifts,
+ * rotates, byte control and compares.  Odd: ALU, loads/stores, branches,
+ * channels and the rest.
+ */
+static bool kind_even_pipe(unsigned kind)
+{
+    switch (kind) {
+    case K_FA: case K_FS: case K_FM: case K_FMA: case K_FMS: case K_FNMS:
+    case K_FREST: case K_FRSQEST: case K_FI: case K_FESD: case K_FRDS:
+    case K_CSFLT: case K_CUFLT: case K_CFLTS: case K_CFLTU:
+    case K_FCEQ: case K_FCGT: case K_FCMEQ: case K_FCMGT:
+    case K_DFA: case K_DFS: case K_DFM: case K_DFMA: case K_DFMS:
+    case K_DFNMS: case K_DFNMA: case K_DFCEQ: case K_DFCGT:
+    case K_DFCMEQ: case K_DFCMGT: case K_DFTSV:
+    case K_MPY: case K_MPYU: case K_MPYI: case K_MPYUI: case K_MPYA:
+    case K_MPYS: case K_MPYH: case K_MPYHH: case K_MPYHHA:
+    case K_MPYHHU: case K_MPYHHAU:
+    case K_SHL: case K_SHLH: case K_SHLI: case K_SHLHI:
+    case K_ROT: case K_ROTH: case K_ROTI: case K_ROTHI:
+    case K_ROTM: case K_ROTHM: case K_ROTMI: case K_ROTHMI:
+    case K_ROTMA: case K_ROTMAH: case K_ROTMAI: case K_ROTMAHI:
+    case K_SHUFB: case K_SELB: case K_CBD: case K_CBX: case K_CHD:
+    case K_CHX: case K_CWD: case K_CWX: case K_CDD: case K_CDX:
+    case K_FSM: case K_FSMH: case K_FSMB: case K_CEQ: case K_CEQH:
+    case K_CEQB: case K_CGT: case K_CGTH: case K_CGTB: case K_CLGT:
+    case K_CLGTH: case K_CLGTB: case K_CLZ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool kind_is_branch(unsigned kind)
+{
+    switch (kind) {
+    case K_BR: case K_BRA: case K_BRSL: case K_BRASL: case K_BRZ:
+    case K_BRNZ: case K_BRHZ: case K_BRHNZ: case K_BI: case K_BISL:
+    case K_BISLED: case K_BIZ: case K_BINZ: case K_BIHZ: case K_BIHNZ:
+    case K_BG: case K_BGX: case K_IRET:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
 {
     uint8_t a[16], b[16], c[16], out[16];
@@ -755,8 +1283,22 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
     /* ---- control ---------------------------------------------------- */
     case K_HALT:
         spu->stop_code = word & 0x3FFF;
+        spu->halted = true;
         snprintf(why, why_len, "stop %u at 0x%X", spu->stop_code, pc);
         return false;
+
+    case K_STOPD:
+        /* Same PC update as stop, no signal value: a breakpoint that keeps
+         * the instruction timing of the instruction it replaces. */
+        spu->halted = true;
+        spu->stop_code = 0x3FFF;
+        snprintf(why, why_len, "stopd at 0x%X", pc);
+        return false;
+
+    case K_IRET:
+        /* Back to the address the interrupt saved.  RA is ignored. */
+        next = spu->srr0;
+        break;
 
     case K_NONE:                  /* nop, lnop, sync, dsync, branch hints */
         break;
@@ -799,6 +1341,12 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
         }
         break;
     }
+
+    case K_BISLED:
+        /* The external-data condition comes from outside the SPU (a signal on
+         * its data interface); with no such source it is false, so this is a
+         * fall-through.  The link register is only written when taken. */
+        break;
 
     case K_BI:
         next = scw(spu, in.ra);
@@ -1664,16 +2212,421 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
         gpr_fill(spu, in.rt, ch_read_count(spu, in.ra));
         break;
 
+    /* ---- multiply variants ------------------------------------------ */
+    case K_MPYS:
+        /* Low halfwords, signed; the high half of the 32-bit product, sign
+         * extended into the word. */
+        for (unsigned i = 0; i < 4; i++) {
+            const int32_t p = (int32_t)(int16_t)(gpr_w(spu, in.ra, i) & 0xFFFF) *
+                              (int32_t)(int16_t)(gpr_w(spu, in.rb, i) & 0xFFFF);
+
+            gpr_set_w(spu, in.rt, i,
+                      (uint32_t)(int32_t)(p >> 16));
+        }
+        break;
+
+    case K_MPYH:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t x = gpr_w(spu, in.ra, i) >> 16;
+            const uint32_t y = gpr_w(spu, in.rb, i) & 0xFFFF;
+
+            gpr_set_w(spu, in.rt, i, (x * y) << 16);
+        }
+        break;
+
+    case K_MPYHH:
+    case K_MPYHHU:
+    case K_MPYHHA:
+    case K_MPYHHAU:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t x = gpr_w(spu, in.ra, i) >> 16;
+            const uint32_t y = gpr_w(spu, in.rb, i) >> 16;
+            uint32_t p;
+
+            if (in.op->kind == K_MPYHH) {
+                p = (uint32_t)((int32_t)(int16_t)x * (int32_t)(int16_t)y);
+            } else if (in.op->kind == K_MPYHHU) {
+                p = (uint32_t)(x * y);
+            } else if (in.op->kind == K_MPYHHA) {
+                p = (uint32_t)((int32_t)(int16_t)x * (int32_t)(int16_t)y) +
+                    gpr_w(spu, in.rt, i);
+            } else {
+                p = (uint32_t)(x * y) + gpr_w(spu, in.rt, i);
+            }
+            gpr_set_w(spu, in.rt, i, p);
+        }
+        break;
+
+    /* ---- borrow/link in the preferred slot -------------------------- */
+    case K_BG:
+    case K_BGX:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t x = gpr_w(spu, in.ra, i);
+            const uint32_t y = gpr_w(spu, in.rb, i);
+            const uint32_t cin = (in.op->kind == K_BGX)
+                ? ((gpr_w(spu, in.rt, i) & 1) ? 0 : 1) : 0;
+            uint32_t r;
+
+            if (in.op->kind == K_BG) {
+                /* 1 unless RB is strictly greater than RA (unsigned). */
+                r = (y > x) ? 0 : 1;
+            } else {
+                const uint64_t sum = (uint64_t)y + cin;
+
+                r = (sum < x) ? 0 : 1;
+            }
+            gpr_set_w(spu, in.rt, i, r);
+        }
+        break;
+
+    case K_ORX: {
+        const uint32_t v = gpr_w(spu, in.ra, 0) | gpr_w(spu, in.ra, 1) |
+                           gpr_w(spu, in.ra, 2) | gpr_w(spu, in.ra, 3);
+
+        gpr_set_w(spu, in.rt, 0, v);
+        gpr_set_w(spu, in.rt, 1, 0);
+        gpr_set_w(spu, in.rt, 2, 0);
+        gpr_set_w(spu, in.rt, 3, 0);
+        break;
+    }
+
+    /* ---- bit-count driven quadword shifts --------------------------- */
+    case K_ROTQBYBI:
+    case K_SHLQBYBI:
+    case K_ROTMQBYBI: {
+        const unsigned count = (scw(spu, in.rb) >> 3) & 0x1F;
+
+        gpr_get_bytes(spu, in.ra, a);
+        if (in.op->kind == K_ROTMQBYBI) {
+            qshr_bytes(out, a, (0u - count) & 0x1F);
+        } else if (in.op->kind == K_SHLQBYBI) {
+            qshl_bytes(out, a, count);
+        } else {
+            qrotl_bytes(out, a, count);
+        }
+        gpr_set_bytes(spu, in.rt, out);
+        break;
+    }
+
+    /* ---- special-purpose registers --------------------------------- */
+    case K_MFSPR:
+        /* The Cell SPRs are the local-store limit registers; this model has a
+         * flat store, so they read back what was written (zero at reset). */
+        for (unsigned i = 0; i < 4; i++) {
+            gpr_set_w(spu, in.rt, i, i == SPU_PREFERRED
+                      ? spu->spr[in.ra & 0x7F] : 0);
+        }
+        break;
+
+    case K_MTSPR:
+        spu->spr[in.ra & 0x7F] = scw(spu, in.rt);
+        break;
+
+    /* ---- single-precision floating point ---------------------------- */
+    case K_FA:
+    case K_FS:
+    case K_FM:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t xb = gpr_w(spu, in.ra, i);
+            const uint32_t yb = gpr_w(spu, in.rb, i);
+            const long double x = spu_sf_value(xb);
+            const long double y = spu_sf_value(yb);
+            long double r;
+
+            spu_sf_flags(spu, xb);
+            spu_sf_flags(spu, yb);
+
+            if (in.op->kind == K_FA) {
+                r = x + y;
+            } else if (in.op->kind == K_FS) {
+                r = x - y;
+            } else {
+                r = x * y;
+            }
+            gpr_set_w(spu, in.rt, i, spu_sf_pack(r, &spu->fpscr));
+        }
+        break;
+
+    case K_FMA:
+    case K_FMS:
+    case K_FNMS:
+        for (unsigned i = 0; i < 4; i++) {
+            const long double x = spu_sf_value(gpr_w(spu, in.ra, i));
+            const long double y = spu_sf_value(gpr_w(spu, in.rb, i));
+            const long double z = spu_sf_value(gpr_w(spu, in.rc, i));
+            long double r;
+
+            if (in.op->kind == K_FMA) {
+                r = x * y + z;
+            } else if (in.op->kind == K_FMS) {
+                r = x * y - z;
+            } else {
+                r = z - x * y;
+            }
+            gpr_set_w(spu, in.rt, i, spu_sf_pack(r, &spu->fpscr));
+        }
+        break;
+
+    case K_FREST:
+    case K_FRSQEST:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t x = gpr_w(spu, in.ra, i);
+            const unsigned exp = (x >> 23) & 0xFF;
+            const unsigned sign = x & SPU_SF_SIGN;
+            uint32_t frac, e;
+
+            if (in.op->kind == K_FREST) {
+                frac = spu_frest_fraction[(x >> 18) & 0x1F];
+                e = spu_frest_exponent(exp);
+            } else {
+                frac = spu_frsqest_fraction[(x >> 18) & 0x3F];
+                e = spu_frsqest_exponent(exp);
+            }
+            if (exp == 0) {
+                spu->fpscr |= SPU_FP_DBZ;
+            }
+            gpr_set_w(spu, in.rt, i,
+                      (in.op->kind == K_FREST ? sign : 0) | e | frac);
+        }
+        break;
+
+    case K_FI:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t rb = gpr_w(spu, in.rb, i);
+            const uint32_t ra = gpr_w(spu, in.ra, i);
+            const long double base = 1.0L +
+                (long double)((rb >> 10) & 0x1FFF) / 8192.0L;
+            const long double step =
+                (long double)(rb & 0x3FF) / 8192.0L;
+            const long double y =
+                (long double)(ra & 0x7FFFF) / 524288.0L;
+            const long double v = base - step * y;
+            uint32_t frac = (uint32_t)floorl((v - 1.0L) * 8388608.0L);
+
+            if (frac > SPU_SF_FRAC) {
+                frac = SPU_SF_FRAC;
+            }
+            gpr_set_w(spu, in.rt, i, (rb & 0xFF800000u) | frac);
+        }
+        break;
+
+    case K_FESD:
+        /* Each doubleword's left (preferred) word is extended to a double. */
+        for (unsigned i = 0; i < 2; i++) {
+            const long double v =
+                spu_sf_value(gpr_w(spu, in.ra, i * 2));
+            const uint64_t bits = spu_d_bits((double)v);
+
+            gpr_set_d(spu, in.rt, i, bits);
+        }
+        break;
+
+    case K_FRDS:
+        /* Each double is rounded to single and placed in the left word; the
+         * right word is zero. */
+        for (unsigned i = 0; i < 2; i++) {
+            const double d = spu_d_value(gpr_d(spu, in.ra, i));
+            const uint32_t s = spu_sf_pack((long double)d, &spu->fpscr);
+
+            gpr_set_w(spu, in.rt, i * 2, s);
+            gpr_set_w(spu, in.rt, i * 2 + 1, 0);
+        }
+        break;
+
+    case K_FSCRRD:
+        for (unsigned i = 0; i < 4; i++) {
+            gpr_set_w(spu, in.rt, i, i == SPU_PREFERRED ? spu->fpscr : 0);
+        }
+        break;
+
+    case K_FSCRWR:
+        spu->fpscr = scw(spu, in.ra);
+        break;
+
+    case K_CSFLT:
+    case K_CUFLT:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t x = gpr_w(spu, in.ra, i);
+            const unsigned scale = (155u - in.i8) & 0xFF;
+            long double v;
+
+            if (in.op->kind == K_CSFLT) {
+                v = (long double)(int32_t)x;
+            } else {
+                v = (long double)x;
+            }
+            v = ldexpl(v, -(int)scale);
+            gpr_set_w(spu, in.rt, i, spu_sf_pack(v, &spu->fpscr));
+        }
+        break;
+
+    case K_CFLTS:
+    case K_CFLTU:
+        for (unsigned i = 0; i < 4; i++) {
+            const long double x = spu_sf_value(gpr_w(spu, in.ra, i));
+            const unsigned scale = (173u - in.i8) & 0xFF;
+            const long double v = ldexpl(x, (int)scale);
+            uint32_t r;
+
+            if (in.op->kind == K_CFLTS) {
+                if (v > 2147483647.0L) {
+                    r = 0x7FFFFFFFu;
+                } else if (v < -2147483648.0L) {
+                    r = 0x80000000u;
+                } else {
+                    r = (uint32_t)(int32_t)v;
+                }
+            } else {
+                if (v <= 0) {
+                    r = 0;
+                } else if (v >= 4294967295.0L) {
+                    r = 0xFFFFFFFFu;
+                } else {
+                    r = (uint32_t)v;
+                }
+            }
+            gpr_set_w(spu, in.rt, i, r);
+        }
+        break;
+
+    case K_FCEQ:
+    case K_FCGT:
+    case K_FCMEQ:
+    case K_FCMGT:
+        for (unsigned i = 0; i < 4; i++) {
+            const uint32_t xb = gpr_w(spu, in.ra, i);
+            const uint32_t yb = gpr_w(spu, in.rb, i);
+            long double x = spu_sf_value(xb);
+            long double y = spu_sf_value(yb);
+            bool hit;
+
+            if (in.op->kind == K_FCMEQ || in.op->kind == K_FCMGT) {
+                x = fabsl(x);
+                y = fabsl(y);
+            }
+            if (in.op->kind == K_FCEQ || in.op->kind == K_FCMEQ) {
+                hit = x == y;
+            } else {
+                hit = x > y;
+            }
+            gpr_set_w(spu, in.rt, i, hit ? 0xFFFFFFFFu : 0);
+        }
+        break;
+
+    /* ---- double-precision floating point ---------------------------- */
+    case K_DFA:
+    case K_DFS:
+    case K_DFM:
+        for (unsigned i = 0; i < 2; i++) {
+            const double x = spu_d_value(gpr_d(spu, in.ra, i));
+            const double y = spu_d_value(gpr_d(spu, in.rb, i));
+            double r;
+
+            if (in.op->kind == K_DFA) {
+                r = x + y;
+            } else if (in.op->kind == K_DFS) {
+                r = x - y;
+            } else {
+                r = x * y;
+            }
+            gpr_set_d(spu, in.rt, i, spu_d_bits(r));
+        }
+        break;
+
+    case K_DFMA:
+    case K_DFMS:
+    case K_DFNMS:
+    case K_DFNMA:
+        for (unsigned i = 0; i < 2; i++) {
+            const double x = spu_d_value(gpr_d(spu, in.ra, i));
+            const double y = spu_d_value(gpr_d(spu, in.rb, i));
+            const double z = spu_d_value(gpr_d(spu, in.rt, i));
+            double r;
+
+            if (in.op->kind == K_DFMA) {
+                r = x * y + z;
+            } else if (in.op->kind == K_DFMS) {
+                r = x * y - z;
+            } else if (in.op->kind == K_DFNMS) {
+                r = -(x * y - z);
+            } else {
+                r = -(x * y + z);
+            }
+            gpr_set_d(spu, in.rt, i, spu_d_bits(r));
+        }
+        break;
+
+    case K_DFCEQ:
+    case K_DFCGT:
+    case K_DFCMEQ:
+    case K_DFCMGT:
+        for (unsigned i = 0; i < 2; i++) {
+            double x = spu_d_value(gpr_d(spu, in.ra, i));
+            double y = spu_d_value(gpr_d(spu, in.rb, i));
+            bool hit;
+
+            if (in.op->kind == K_DFCMEQ || in.op->kind == K_DFCMGT) {
+                x = fabs(x);
+                y = fabs(y);
+            }
+            if (in.op->kind == K_DFCEQ || in.op->kind == K_DFCMEQ) {
+                hit = x == y;
+            } else {
+                hit = x > y;
+            }
+            gpr_set_d(spu, in.rt, i, spu_d_mask(hit));
+        }
+        break;
+
+    case K_DFTSV:
+        for (unsigned i = 0; i < 2; i++) {
+            const uint64_t bits = gpr_d(spu, in.ra, i);
+            const unsigned sign = (bits >> 63) & 1;
+            const unsigned exp = (bits >> 52) & 0x7FF;
+            const uint64_t frac = bits & 0xFFFFFFFFFFFFFULL;
+            const bool nan = exp == 0x7FF && frac != 0;
+            const bool inf = exp == 0x7FF && frac == 0;
+            const bool zero = exp == 0 && frac == 0;
+            const bool denorm = exp == 0 && frac != 0;
+            bool hit = false;
+
+            if ((in.i7 & 0x40) && nan) hit = true;
+            if ((in.i7 & 0x20) && denorm && !sign) hit = true;
+            if ((in.i7 & 0x10) && inf && !sign) hit = true;
+            if ((in.i7 & 0x08) && inf && sign) hit = true;
+            if ((in.i7 & 0x04) && denorm && sign) hit = true;
+            if ((in.i7 & 0x02) && zero && !sign) hit = true;
+            if ((in.i7 & 0x01) && zero && sign) hit = true;
+
+            gpr_set_d(spu, in.rt, i, spu_d_mask(hit));
+        }
+        break;
+
     /* ---- halts on condition (debug traps) --------------------------- */
     case K_HEQI:
-    case K_HEQ: {
-        const bool eq = (in.op->kind == K_HEQI)
-            ? scw(spu, in.ra) == in.i10
-            : scw(spu, in.ra) == scw(spu, in.rb);
+    case K_HEQ:
+    case K_HGT:
+    case K_HGTI:
+    case K_HLGT:
+    case K_HLGTI: {
+        const bool imm = (in.op->kind == K_HEQI || in.op->kind == K_HGTI ||
+                          in.op->kind == K_HLGTI);
+        const uint32_t x = scw(spu, in.ra);
+        const uint32_t y = imm ? (uint32_t)sext(in.i10, 10) : scw(spu, in.rb);
+        bool hit;
 
-        if (eq) {
+        if (in.op->kind == K_HEQ || in.op->kind == K_HEQI) {
+            hit = x == y;
+        } else if (in.op->kind == K_HGT || in.op->kind == K_HGTI) {
+            hit = (int32_t)x > (int32_t)y;
+        } else {
+            hit = x > y;
+        }
+
+        if (hit) {
             spu->stop_code = 0x3FFF;
-            snprintf(why, why_len, "halt-if-equal trap at 0x%X", pc);
+            spu->halted = true;
+            snprintf(why, why_len, "conditional halt trap at 0x%X", pc);
             return false;
         }
         break;
@@ -1681,6 +2634,28 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
 
     default:
         return fault(spu, pc, word, why, why_len);
+    }
+
+    /*
+     * Issue accounting.  Two instructions that use different pipes share a
+     * cycle; a control transfer breaks the pair because the next fetch is not
+     * known when the branch issues.  This is an estimate of issue slots, not a
+     * cycle-accurate timing model (there are no stalls, hazards or latencies).
+     */
+    if (kind_is_branch(in.op->kind)) {
+        spu->cycles++;
+        spu->last_pipe_valid = false;
+    } else {
+        const bool even = kind_even_pipe(in.op->kind);
+
+        if (spu->last_pipe_valid && even != spu->last_pipe_even) {
+            spu->dual_issue_pairs++;
+            spu->last_pipe_valid = false;
+        } else {
+            spu->cycles++;
+            spu->last_pipe_valid = true;
+            spu->last_pipe_even = even;
+        }
     }
 
     spu->pc = next;
@@ -1716,6 +2691,11 @@ static void run_reset(PS3SPU *spu)
     spu->tag_head = 0;
     spu->tag_count = 0;
     spu->stop_code = 0;
+    spu->halted = false;
+    spu->cycles = 0;
+    spu->dual_issue_pairs = 0;
+    spu->last_pipe_even = false;
+    spu->last_pipe_valid = false;
     memset(spu->hot, 0, sizeof(spu->hot));
 
     for (unsigned i = 0; i < ARRAY_SIZE(spu->hist); i++) {
@@ -1742,7 +2722,7 @@ int ps3_spu_run_to(PS3SPU *spu, uint32_t entry, uint32_t stop_pc,
         spu->insns++;
 
         if (!execute(spu, pc, why, why_len)) {
-            return 2;
+            return spu->halted ? 0 : 2;
         }
     }
 
@@ -1770,13 +2750,7 @@ int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
         spu->insns++;
 
         if (!execute(spu, pc, why, why_len)) {
-            if (spu->stop_code) {
-                snprintf(why, why_len,
-                         "stop %u at 0x%X after %" PRIu64 " instructions",
-                         spu->stop_code, pc, spu->insns);
-                return 0;
-            }
-            return 2;
+            return spu->halted ? 0 : 2;
         }
     }
 

@@ -124,7 +124,12 @@ void sdl2_window_create(struct sdl2_console *scon)
         scon->winctx = SDL_GL_CreateContext(scon->real_window);
         SDL_GL_SetSwapInterval(0);
 
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_GBM)
+        /*
+         * Only the dmabuf path needs the EGL display.  With WGL (Windows)
+         * there is no EGL display and epoxy resolves the entry point to NULL,
+         * so calling it here would crash before the first frame.
+         */
         qemu_egl_display = eglGetCurrentDisplay();
 #endif
     } else {

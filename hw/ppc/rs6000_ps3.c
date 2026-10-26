@@ -1062,6 +1062,8 @@ struct PS3BootROMState {
     int thr_cur;
     bool sched_pending;
     bool sched_queued;              /* a switch is on the vCPU's work list */
+    bool all_parked_reported;       /* the all-parked dump was printed */
+    uint32_t hb_tick;               /* ticks towards the next heartbeat */
     uint32_t thr_slice;             /* ticks the current thread has had */
     QEMUTimer *sched_timer;
     bool threads_enabled;           /* opt in: run lv2's threads for real */
@@ -1818,9 +1820,20 @@ static void ps3_rom_selftest(PS3BootROMState *s)
         }
     }
 
+    {
+        char why[192];
+
+        if (ps3_spu_isa_selftest(why, sizeof(why))) {
+            s->selftest_result = 2;
+            info_report("ps3-boot-rom: selftest FAILED (SPU %s)", why);
+            return;
+        }
+    }
+
     s->selftest_result = 1;
     info_report("ps3-boot-rom: selftest passed (AES-128 KAT, sealed container "
-                "round trip, mask ROM replayed by the SPU interpreter)");
+                "round trip, mask ROM replayed by the SPU interpreter, full "
+                "SPU ISA check)");
 }
 
 static uint64_t ps3_rom_regs_read(void *opaque, hwaddr offset, unsigned size)
@@ -4917,8 +4930,29 @@ static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
         next = start;
     }
     if (next < 0) {
+        /*
+         * Nothing to run: every thread is parked.  Say who waits on what once,
+         * because an all-parked machine makes no further log line and the
+         * reason it stopped is then only visible in its contexts.
+         */
+        if (!s->all_parked_reported) {
+            s->all_parked_reported = true;
+            for (i = 0; i < PS3_THREAD_MAX; i++) {
+                if (!s->thr[i].used) {
+                    continue;
+                }
+                info_report("ps3-ppu: sched: all parked: thread 0x%X%s at 0x%"
+                            PRIX64 " eq=%d mutex=0x%X cond=0x%X sem=0x%X ticks=%d%s",
+                            s->thr[i].id, s->thr[i].dead ? " (dead)" : "",
+                            s->thr[i].nip, s->thr[i].wait_eq,
+                            s->thr[i].wait_mutex_id, s->thr[i].wait_cond_id,
+                            s->thr[i].wait_sem_id, s->thr[i].wait_ticks,
+                            s->thr[i].parked ? " parked" : "");
+            }
+        }
         return;
     }
+    s->all_parked_reported = false;
 
     s->thr_cur = next;
     s->thr_slice = 0;
@@ -5096,6 +5130,21 @@ static void ps3_sched_tick(void *opaque)
     if (cs && s->sched_pending && !s->sched_queued) {
         s->sched_queued = true;
         run_on_cpu(cs, ps3_sched_apply, RUN_ON_CPU_HOST_PTR(s));
+    }
+
+    /*
+     * Heartbeat.  A guest that spins in its own code produces no lv2 line at
+     * all, and then the run looks identical to one that is idle: say once every
+     * ten seconds which thread holds the CPU and where it is.
+     */
+    if (cs && s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
+        ++s->hb_tick >= 10000) {
+        s->hb_tick = 0;
+        info_report("ps3-ppu: sched: heartbeat: thread 0x%X at 0x%" PRIX64
+                    " (lr=0x%" PRIX64 ", sp=0x%X)",
+                    s->thr[s->thr_cur].id, s->thr[s->thr_cur].nip,
+                    s->thr[s->thr_cur].lr,
+                    (uint32_t)s->thr[s->thr_cur].gpr[1]);
     }
 
     if (s->sched_timer) {
@@ -14078,6 +14127,9 @@ static void rs6000_ps3_init(MachineState *machine)
         qdev_prop_set_bit(vga, "gl", vga_rsx_gl != 0);
         qdev_prop_set_bit(vga, "gl-required", vga_rsx_gl == 1);
         vga_interface_created = true;
+        info_report("rs6000-ps3: display: rsx (gl=%s)",
+                    vga_rsx_gl > 0 ? "on" :
+                    vga_rsx_gl < 0 ? "auto" : "off");
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(vga), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(vga), 0, PS3_VGA_MMIO_BASE);
