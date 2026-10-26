@@ -9598,7 +9598,8 @@ static PS3SPULv2Group *ps3_spu_lv2_group_new(PS3BootROMState *s, uint8_t *ram,
         }
         /* The SPEs DMA into guest RAM itself, not into a private copy. */
         ps3_spes_map_ext(g->spes, ram, ram_size);
-        g->id = 0x100u << i;
+        /* A distinct range from the PPU thread ids the model hands out. */
+        g->id = 0x0A000000u + i * 0x100u;
         g->count = count;
         g->used = true;
         *out_id = g->id;
@@ -9649,6 +9650,24 @@ static void ps3_spu_lv2_pump(PS3BootROMState *s, uint64_t budget)
                 g->exit_cause = 1;          /* group exit */
                 g->started = false;
                 info_report("ps3-ppu: spu group 0x%X: %s", g->id, why);
+                if (s->ppu_trace) {
+                    unsigned n;
+
+                    for (n = 0; n < g->count; n++) {
+                        PS3SPU *spu = ps3_spes_spu(g->spes, n);
+
+                        if (!g->thread[n]) {
+                            continue;
+                        }
+                        info_report("ps3-ppu: spu 0x%X: pc 0x%X, stop 0x%X, "
+                                    "ls 0x%X 0x%X 0x%X 0x%X", g->id | n,
+                                    ps3_spu_pc(spu), ps3_spu_stop_code(spu),
+                                    ps3_spu_ls_read32(spu, 0x100),
+                                    ps3_spu_ls_read32(spu, 0x104),
+                                    ps3_spu_ls_read32(spu, 0x108),
+                                    ps3_spu_ls_read32(spu, 0x10C));
+                    }
+                }
                 break;
             }
             if (st == PS3_SPU_FAULT) {
@@ -12284,8 +12303,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
             }
         }
         g->thread[a2] = true;
-        if (a4 && (uint64_t)a4 + 4 <= ram_size) {
-            ps3_put_be32(ram + a4, g->id | a2);
+        /* thread* is the first argument: lv2 hands back group_id | spu_num. */
+        if (a0 && (uint64_t)a0 + 4 <= ram_size) {
+            ps3_put_be32(ram + a0, g->id | a2);
         }
         ret = 0;
         break;

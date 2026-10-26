@@ -761,8 +761,19 @@ static void mfc_transfer(PS3SPU *spu, uint32_t cmd, uint32_t lsa,
     }
     size = MIN(size, MFC_MAX_TRANSFER);
 
-    lsa = (lsa & SPU_LS_MASK & ~0xFu) & spu->lslr;
+    /*
+     * The local-store address is a byte address: a 4-byte PUT at 0x10C lands
+     * at 0x10C, not at the quadword boundary below it.  Only the limit (LSLR)
+     * bounds it.
+     */
+    lsa = (lsa & SPU_LS_MASK) & spu->lslr;
     ext = dma_range(spu, ea, size, &refused);
+
+    if (!ext && spu->log_events) {
+        fprintf(stderr, "[spu] dma refused: cmd=0x%X lsa=0x%X ea=0x%" PRIX64
+                " size=%u (dma errors %" PRIu64 ")\n",
+                cmd, lsa, ea, size, spu->dma_errors);
+    }
 
     if (ext && get) {
         for (uint32_t i = 0; i < size; i++) {
@@ -1132,6 +1143,12 @@ static bool ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
         return true;
     case 0x15:                                  /* MFC_Cmd: starts the command */
         spu->mfc_cmd = value;
+        if (spu->trace) {
+            fprintf(stderr, "[spu] mfc cmd 0x%X: lsa=0x%X eah=0x%X eal=0x%X "
+                    "size=%u tag=%u at 0x%X\n", value, spu->mfc_lsa,
+                    spu->mfc_eah, spu->mfc_eal, spu->mfc_size, spu->mfc_tag,
+                    spu->pc);
+        }
         mfc_command(spu);
         return true;
     case 0x16:                                  /* MFC_WrTagMask */
@@ -1789,22 +1806,6 @@ uint32_t ps3_spu_ls_read32(const PS3SPU *spu, uint32_t lsa)
     return be32(spu->ls + (lsa & SPU_LS_MASK & ~3u));
 }
 
-uint64_t ps3_spu_ls_read64(const PS3SPU *spu, uint32_t lsa)
-{
-    return ((uint64_t)ps3_spu_ls_read32(spu, lsa) << 32) |
-           ps3_spu_ls_read32(spu, lsa + 4);
-}
-
-void ps3_spu_ls_write32(PS3SPU *spu, uint32_t lsa, uint32_t value)
-{
-    put_be32(spu->ls + (lsa & SPU_LS_MASK & ~3u), value);
-}
-
-void ps3_spu_ls_write64(PS3SPU *spu, uint32_t lsa, uint64_t value)
-{
-    ps3_spu_ls_write32(spu, lsa, (uint32_t)(value >> 32));
-    ps3_spu_ls_write32(spu, lsa + 4, (uint32_t)value);
-}
 
 uint64_t ps3_spu_cycles(const PS3SPU *spu)
 {
@@ -2590,12 +2591,21 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
     }
 
     /* ---- immediate loads -------------------------------------------- */
+    /*
+     * The immediate forms replicate their immediate into all four words, which
+     * is what the ISA specifies and what the boot ROM and the SPU runtimes rely
+     * on: `il $3,0` clears the whole register and `ilhu $3,0x3F80` gives four
+     * copies of 1.0f.
+     */
     case K_IL:
         gpr_fill(spu, in.rt, sext(in.i16, 16));
         break;
 
     case K_ILH:
-        gpr_fill(spu, in.rt, in.i16);
+        /* Every halfword slot takes the immediate, so each word reads
+         * (i16 << 16) | i16 - that is how `ilh` forms a byte or halfword
+         * constant in all four words. */
+        gpr_fill(spu, in.rt, (in.i16 << 16) | in.i16);
         break;
 
     case K_ILHU:

@@ -1627,26 +1627,62 @@ the shim for a `ppu-elf` lv0 stage overwrote the hypervisor's first
 instructions and sent it to `0` (`program interrupt at pc 0x700, srr0=0`).
 Gating it on `vsh-run` puts lv0 back on its documented path to `0x800C5C0`.
 
-### What the SPU interpreter is not
+### The SPEs: groups, local stores and lv2's sys_spu
 
-The SPE here is an instruction-level interpreter of the ISA subset the mask ROM
-and the loaders use.  It is enough to open the container and run lv0ldr, and it
-is not the SPE a game would need:
+The interpreter implements the whole SPU ISA the console's own code uses -
+integer, single- and double-precision floating point, the multiply and halt
+families, SPRs, the user-mode channel map, the MFC list and atomic forms - and
+the machine owns an eight-SPE group, each SPE with its own 256 KiB local store.
+The group is what a title reaches through lv2:
 
-| Missing | Why it is not there |
+| sys_spu call | What the model does |
 | --- | --- |
-| floating point: `fa`, `fs`, `fm`, `fma`, `fnms`, `frest`, `frsqest`, `fi`, `csflt`, `cuflt`, `cflts`, `cfltu`, the double-precision forms | the loaders do pure integer and crypto work |
-| SPR access and most channel control | only the channels the loaders touch exist (66, 73, signal notify, MFC tag and a few others); status-and-control register access beyond those is absent, so it faults |
-| memory protection | the SPU's protection/isolation instructions are not used by the early loaders |
-| halt variants | only plain `stop` is present; `stopd` and its dependency forms are not |
-| multiply variants | only `mpy`, `mpyu`, `mpyi`, `mpyui` and `mpya`; `mpys`, `mpyh`, `mpyhh` and the rest are absent |
-| miscellaneous | the rarely-used permute, interpolate and special forms: anything the mask ROM -> lv0ldr / isoldr / appldr path does not need |
-| cycle accuracy | instructions retire with no timing model at all, so nothing that measures, spins on a cycle budget or depends on dual-issue behaviour sees the real machine |
-| more than one SPE | the model has a single SPE and no concurrent execution, so code that starts a second SPE or expects two running together does not get it |
+| `_sys_spu_image_import` / `sys_spu_image_open` | parses the SPU ELF (one COPY per `PT_LOAD`, a FILL for the rest of `p_memsz`, INFO deferred), keeps the segments in the model and hands the guest a kernel image id |
+| `_sys_spu_image_get_information` / `_get_segments` / `_close` | the entry point, segment count and table the library reads before it starts a thread |
+| `sys_spu_thread_group_create` / `_destroy` | one group of 1..8 SPEs from its own id range (`0x0A000000` up), kept apart from the PPU thread ids; the low byte of a thread id is the SPE number |
+| `sys_spu_thread_initialize` / `_set_argument` | deploys the image into that SPE's local store, sets `$3..$6` to arg1..arg4 and returns `group_id | spu_num` |
+| `sys_spu_thread_group_start` / `_join` / `_terminate` / `_suspend` / `_resume` | runs the group and reports the cause (`1` group exit, `2` exception) |
+| `sys_spu_thread_read_ls` / `_write_ls`, `_write_snr`, `_write_spu_mb`, `_get/_set_spu_cfg` | the channel end of the interface: a mailbox or signal written by the PPU wakes the SPE on its next step |
+| `sys_spu_thread_get_exit_status` | the `stop` immediate the thread ended with |
+| `sys_spu_initialize`, group priority, connect/disconnect event | answered so a library's setup path runs; no exception events are raised |
 
-None of that blocks the chain: the ROM and lv0ldr use only the integer, branch
-and MFC subset that is implemented.  It does block anything that runs real SPE
-code, which is the work after the RSX path.
+The group's DMA is guest RAM itself, not a copy: a PUT an SPE makes is visible to
+the PPU's next load, and a GET reads what the PPU stored.  There are no ticks
+and no host threads - the group runs when the guest hands it work (`_start`,
+`_join`, a mailbox or signal write) and for a short slice on every lv2 call,
+which is why a group whose SPE has finished reports `all N SPEs halted` before
+the PPU's next check.
+
+What is still missing is cycle accuracy: the timing figure is an issue-slot and
+register-hazard estimate, not the Cell pipeline, and no PPE interrupt is raised
+for an SPE exception.  Raw SPEs (`sys_raw_spu_*`) and the SPU profiling calls
+are not modelled.
+
+The interface is exercised end to end by a PPU program, `.tmp/sys_spu_test.S`,
+built with the PPU toolchain and run through `vsh-run` as if it were the
+application.  Its SPU image (`.tmp/mkspuelf.py`, assembled with the tree's SPU
+assembler) puts a constant in local store 0x100 and DMAs four bytes of it to
+guest RAM with an MFC PUT; the PPU program imports it, creates a one-SPE group,
+initialises and starts it, joins, reads the local store back, reads the guest
+word the SPE wrote, checks the exit status and destroys the group.  The exit
+status is a bit mask, 0 when every check passed:
+
+```sh
+py .tmp/mkspuelf.py .tmp/spu_demo.elf
+bash /c/msys64/home/Thewoodsman/ps3shim/ppu-gcc -nostdlib -Wl,-Ttext=0x02000000 -Wl,-e,_start -o .tmp/sys_spu_test.elf .tmp/sys_spu_test.S
+build-ps3-gui/qemu-system-ppc64.exe -M rs6000-ps3 -display none -global ps3-boot-rom.vsh-self=.tmp/sys_spu_test.elf -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.ppu-trace=on
+```
+
+```
+ps3-ppu: spu group 0xA000000: 1 SPE(s), priority 0
+ps3-ppu: spu group 0xA000000: all 1 SPEs halted (13 instructions, 0 MFC gets, 1 puts, 0 protection faults)
+ps3-ppu: spu 0xA000000: pc 0x1034, stop 0x0, ls 0xBABECAFE 0xBABECAFE 0xBABECAFE 0xBABECAFE
+ps3-ppu: process exited with status 0
+```
+
+The mask ROM still runs in the same interpreter on every boot, so the container
+check in step 1 above is also a check of the SPE path: `selftest passed` includes
+the ISA program and a two-SPE concurrent run through shared memory.
 
 ## Using it with the low-level boot chain
 

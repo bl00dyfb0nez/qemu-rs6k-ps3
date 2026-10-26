@@ -101,9 +101,6 @@ void ps3_spu_fill_ls(PS3SPU *spu, uint32_t lsa, size_t len, uint32_t value);
 
 const uint8_t *ps3_spu_ls_ptr(const PS3SPU *spu, uint32_t lsa);
 uint32_t ps3_spu_ls_read32(const PS3SPU *spu, uint32_t lsa);
-uint64_t ps3_spu_ls_read64(const PS3SPU *spu, uint32_t lsa);
-void ps3_spu_ls_write32(PS3SPU *spu, uint32_t lsa, uint32_t value);
-void ps3_spu_ls_write64(PS3SPU *spu, uint32_t lsa, uint64_t value);
 
 /*
  * The SPU ABI passes a 64-bit argument in the preferred slot: the low half of
