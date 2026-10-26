@@ -856,6 +856,9 @@ typedef struct PS3Thread {
     uint32_t stack_base, stack_size;
     /* Returning here lands on `li r11,0x29; sc`, i.e. sys_ppu_thread_exit. */
     uint32_t exit_stub;
+    /* When it last had the CPU, and whether its current stall was reported. */
+    uint64_t last_run;
+    bool stall_reported;
     uint64_t gpr[32];
     uint64_t lr, ctr, xer, msr, nip;
     /*
@@ -1259,6 +1262,7 @@ struct PS3BootROMState {
     bool all_parked_reported;       /* the all-parked dump was printed */
     uint32_t hb_tick;               /* ticks towards the next heartbeat */
     uint32_t thr_slice;             /* ticks the current thread has had */
+    uint64_t sched_ticks;           /* ticks since the scheduler started */
     QEMUTimer *sched_timer;
     bool threads_enabled;           /* opt in: run lv2's threads for real */
     uint32_t hid_next_handle;       /* sys_hid_manager_open's handles */
@@ -5156,6 +5160,8 @@ static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
 
     s->thr_cur = next;
     s->thr_slice = 0;
+    s->thr[next].last_run = s->sched_ticks;
+    s->thr[next].stall_reported = false;
     ps3_thread_restore(&s->thr[next], env);
     if (s->ppu_trace) {
         info_report("ps3-ppu: sched: -> thread 0x%X at 0x%" PRIX64
@@ -5274,10 +5280,44 @@ static void ps3_sched_apply(CPUState *cs, run_on_cpu_data data)
     ps3_sched_switch(s, env);
 }
 
+/*
+ * A thread that has not had the CPU for a long time is either parked in an lv2
+ * call or starved by the threads that are polling.  Say which, once per stall:
+ * a machine that stops making progress otherwise only shows its idle loops, and
+ * the wait the block is on is then invisible.
+ */
+static void ps3_sched_stall_report(PS3BootROMState *s)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        PS3Thread *t = &s->thr[i];
+
+        if (!t->used || t->dead || t->stall_reported) {
+            continue;
+        }
+        if (s->sched_ticks - t->last_run < 512) {
+            continue;
+        }
+        t->stall_reported = true;
+        info_report("ps3-ppu: sched: thread 0x%X stalled %" PRIu64
+                    " ticks at 0x%" PRIX64 " (blocked=%d parked=%d eq=%d "
+                    "mutex=0x%X cond=0x%X sem=0x%X ticks=%d)",
+                    t->id, s->sched_ticks - t->last_run, t->nip,
+                    t->blocked, t->parked, t->wait_eq, t->wait_mutex_id,
+                    t->wait_cond_id, t->wait_sem_id, t->wait_ticks);
+    }
+}
+
 static void ps3_sched_tick(void *opaque)
 {
     PS3BootROMState *s = opaque;
     CPUState *cs = qemu_get_cpu(0);
+
+    s->sched_ticks++;
+    if (!(s->sched_ticks & 0x3F)) {
+        ps3_sched_stall_report(s);
+    }
 
     /*
      * A thread that called sys_ppu_thread_exit is parked on its trampoline's
