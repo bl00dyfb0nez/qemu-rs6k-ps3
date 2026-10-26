@@ -602,6 +602,15 @@ typedef struct PS3Thread {
     bool fault_reported;        /* it landed on a vector; said so once */
     /* Waiting inside an lv2 call: the call is finished when it is woken. */
     bool parked;
+    /*
+     * The trampoline's frame has already been folded up for the call in
+     * flight.  Both the scheduler and the wake path can reach the point where
+     * they collect r3/r0/r12 and step r1 past the trampoline, and doing that
+     * twice walks the thread's stack pointer 0x20 into its own frame - the
+     * epilogue then reads a local instead of the saved LR and returns into the
+     * stack.  The flag is cleared when a new `sc` is dispatched.
+     */
+    bool call_collected;
     int wait_eq;                /* index of the queue it waits on */
     uint32_t wait_ea;           /* guest sys_event_t the call writes to */
     int32_t wait_ticks;         /* -1 = no timeout, else ticks left */
@@ -4346,7 +4355,8 @@ static void ps3_thread_finish_call(PS3Thread *t, uint8_t *ram,
     unsigned i;
 
     t->gpr[3] = ret;
-    if ((uint64_t)sp + 0x20 <= ram_size) {
+    if (!t->call_collected && (uint64_t)sp + 0x20 <= ram_size) {
+        t->call_collected = true;
         uint32_t cr = ps3_be32(ram + sp + 0x0C);
 
         t->gpr[12] = ps3_be32(ram + sp + 0x10);
@@ -4740,8 +4750,10 @@ static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
         ps3_thread_save(&s->thr[start], env);
         if (s->ppu_trace) {
             info_report("ps3-ppu: sched: thread 0x%X yields at 0x%" PRIX64
-                        " (lr=0x%" PRIX64 ")", s->thr[start].id,
-                        s->thr[start].nip, s->thr[start].lr);
+                        " (lr=0x%" PRIX64 ", sp=0x%X, srr0=0x%" PRIX64 ")",
+                        s->thr[start].id, s->thr[start].nip,
+                        s->thr[start].lr, (uint32_t)s->thr[start].gpr[1],
+                        s->thr[start].srr0);
         }
     }
 
@@ -4817,7 +4829,23 @@ static void ps3_sched_apply(CPUState *cs, run_on_cpu_data data)
          * fact succeeded.
          */
         env->gpr[3] = ps3_be32(ram + PS3_LV2_SCRATCH);
+        if (s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
+            s->thr[s->thr_cur].call_collected) {
+            /*
+             * The wake path already folded this call up (it finishes a parked
+             * thread itself); collecting it again would step r1 past the
+             * trampoline twice.
+             */
+            s->sched_pending = false;
+            ps3_sched_switch(s, env);
+            return;
+        }
         if (ps3_be32(ram + PS3_LV2_SCRATCH + 4)) {
+            /*
+             * Parked, not finished: the wake path owns the frame, so the
+             * collected flag stays clear for it or the +0x20 that steps r1 out
+             * of the trampoline would never happen.
+             */
             env->nip = 0xC58;           /* the trampoline's halt loop */
             /*
              * A blocking call: the thread is parked here until the service
@@ -4841,6 +4869,7 @@ static void ps3_sched_apply(CPUState *cs, run_on_cpu_data data)
         env->gpr[0] = ps3_be32(ram + sp + 0x08);
         env->gpr[1] = sp + 0x20;
         env->nip = env->spr[SPR_SRR0];
+        s->thr[s->thr_cur].call_collected = true;
         /* The MSR the trampoline's rfid would load, through the same path. */
         ppc_store_msr(env, env->spr[SPR_SRR1]);
     }
@@ -7540,6 +7569,10 @@ static void ps3_lv2_service(PS3BootROMState *s)
     cpu = POWERPC_CPU(cs);
     ram = memory_region_get_ram_ptr(s->ram);
     ram_size = memory_region_size(s->ram);
+    /* A new `sc` has entered the trampoline: its frame is not folded up yet. */
+    if (s->thr_cur >= 0 && s->thr[s->thr_cur].used) {
+        s->thr[s->thr_cur].call_collected = false;
+    }
     nr = cpu->env.gpr[11];
     a0 = cpu->env.gpr[3];
     a1 = cpu->env.gpr[4];
@@ -7959,9 +7992,16 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
-    case 0x06B: {               /* sys_cond_wait(cond, mutex, timeout) */
+    case 0x06B: {               /* sys_cond_wait(cond, timeout) */
+        /*
+         * lv2 takes only the condition and the timeout here: the mutex is the
+         * one the condition was created with, and lv2 releases and retakes it
+         * around the wait.  Reading r4 as a mutex id made every wait in the
+         * VSH fail with ESRCH - the call sites pass 0 there - and the workers
+         * took their error path instead of parking.
+         */
         int c = ps3_cond_index(s, a0);
-        int m = ps3_mutex_index(s, a1);
+        int m = c >= 0 ? ps3_mutex_index(s, s->cond[c].mutex) : -1;
 
         if (c < 0 || m < 0) {
             if (s->ppu_trace) {
@@ -7979,7 +8019,8 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ps3_mutex_handoff(s, ram, ram_size, m);
         if (s->thr_cur >= 0) {
             s->thr[s->thr_cur].wait_cond_id = s->cond[c].id;
-            ps3_sync_park(s, a2);
+            s->thr[s->thr_cur].wait_mutex_id = s->cond[c].mutex;
+            ps3_sync_park(s, a1);
         }
         ret = 0;
         break;
@@ -8331,8 +8372,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
         }
 
         if (stub) {
-            info_report("ps3-ppu: lv2: unresolved import %s:0x%08X called, "
-                        "answering -1", stub->lib, stub->nid);
+            info_report("ps3-ppu: lv2: unresolved import %s:0x%08X called "
+                        "(lr=0x%" PRIX64 ", thr=%d), answering -1", stub->lib,
+                        stub->nid, (uint64_t)cpu->env.lr, s->thr_cur);
         } else {
             info_report("ps3-ppu: lv2: unresolved import NID 0x%08X called "
                         "(lr=0x%" PRIX64 "), answering -1", nid,
@@ -8407,9 +8449,30 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     case 0x057:                 /* sys_event_flag_set(id, bit) */
-    case 0x170:                 /* sys_uart_receive(buf, size, mode) */
         ret = 0;
         break;
+    case 0x170: {               /* sys_uart_receive(buf, size, mode) */
+        /*
+         * This is the console's AV receiver channel: the bytes come from
+         * outside, and this model has no AV source, so there is never one to
+         * return.  Answering success with nothing written turned the AV
+         * streaming thread into a poll loop - 7800 calls in a single run, and
+         * it eventually fell off its stack.  lv2 blocks here, so the caller is
+         * parked: it waits for input that never comes, which is what a
+         * console with nothing on the AV connector does.
+         */
+        if (!a1) {          /* size == 0 is an immediate success */
+            ret = 0;
+            break;
+        }
+        if (a0 && (uint64_t)a0 + a1 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_sync_park(s, 0);
+        ret = 0;
+        break;
+    }
     case 0x171: {               /* sys_uart_send(buf, size) */
         uint32_t n;
 
@@ -9041,7 +9104,19 @@ static void ps3_lv2_service(PS3BootROMState *s)
                 ret = -EAGAIN;
                 break;
             }
-            ps3_put_be32(ram + a0, tid);
+            /*
+             * sys_ppu_thread_t is a u64 on the console: `_sys_ppu_thread_create`
+             * takes a `u64 *` and the guest reads the whole word back.  Storing
+             * only the low half left the number in the high word and zero in
+             * the low one, so every later call that takes an id in r3 - start,
+             * join, detach, set_priority - was handed 0: the start started
+             * nothing, and the x3 worker it was meant to launch never ran.
+             */
+            if ((uint64_t)a0 + 8 <= ram_size) {
+                ps3_put_be64(ram + a0, tid);
+            } else {
+                ps3_put_be32(ram + a0, tid);
+            }
         }
         ret = 0;
         break;

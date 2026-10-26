@@ -1131,6 +1131,39 @@ yield (`0x2A`), backed by the priority, stack base and size lv2 records at
 the page size in the first word, so `page_size` read 0 and `attribute` was a
 size: the caller that sized a mapping from it walked off into nothing.
 
+### The lv2 calls the thread pool was built on
+
+Two argument conventions had the pool wrong, and both are visible in the
+logs rather than in a debugger.
+
+`sys_cond_wait` takes **two** arguments - the condition and the timeout.
+`RPCS3`'s prototype (`sys_cond_wait(ppu_thread&, u32 cond_id, u64 timeout)`)
+and the VSH's own call sites agree: the wrapper at VSH `0x548B64` does
+`li r4,0` before the `sc`, because r4 is not an argument at all.  The model
+read r4 as a mutex id, so every wait in the VSH failed with `ESRCH` and each
+worker took its error path instead of parking:
+
+```
+lv2: cond_wait: cond 0x11A ok, mutex 0x0 missing (lr=0x548B7C)
+```
+
+The mutex now comes from the condition, as lv2 records it at
+`sys_cond_create`, and the timeout from r4.
+
+`sys_ppu_thread_t` is a **u64**: `_sys_ppu_thread_create` takes a `u64 *`, and
+the guest reads the whole word back before passing it (truncated to 32 bits)
+to `sys_ppu_thread_start`, `join`, `detach` and `set_priority`.  The model
+wrote only the low half, so the number landed in the high word and the low
+word kept the guest's initial 0: every one of those calls was handed id 0,
+which matched nothing - `sys_ppu_thread_start` silently started no thread and
+the x3 worker it was meant to launch never ran.  The id is written as a
+big-endian u64 now (with the 4-byte form kept for a buffer that ends at the
+top of RAM).
+
+With both fixed the run reaches `tick 688` instead of `tick 30`: the `x3`
+workers park in `sys_cond_wait` instead of failing it, the media threads start,
+and the console is past `Registry initialization ... done`.
+
 ### Where that run stops now
 
 With the drive connected the boot goes much further: the BD enumerates,
@@ -1182,6 +1215,61 @@ frame's linkage area, and the epilogue of the next call returns into it.
 That places the next step in the PRX path (`sys_prx_load_module` /
 `start_module` option blocks, and whatever writes the `0x1083C80` descriptor),
 not in the syscall dispatcher: the run has still not reached `sys_rsx`.
+
+After the two fixes above the shape of that fault changed, which narrows it.
+The main thread now dies leaving `0x5398FC`, the instruction after the
+`sys_mutex_unlock` in the helper at VSH `0x5398D0`:
+
+```
+5398D4: 7C0802A6   mflr  r0          ; keep LR in r0 for the whole call
+5398DC: F8010010   std   r0,16(r1)
+5398E0: 39600068   li    r11,0x68      ; sys_mutex_unlock
+5398F8: 44000002   sc
+5398FC: 7C60FE70   srawi r0,r3,31    ; <- the run resumes here
+...
+539920: 7C0803A6   mtlr  r0
+539924: 4E800020   blr
+```
+
+`r0` is never reloaded from `16(r1)`, so the `blr` goes wherever the caller's
+`mflr` found - and at the fault `r0`/LR is `0x0FFFDF30`, a stack address, with
+the frame's `0x10`..`0x1F` holding `{0x0FFFDF30, 0x010A3260}` (a stack pointer
+and a heap pointer, 0x1083xxx - the VSH's module tables).  So the helper was
+entered through a **callback record whose first field is a stack address**, not
+code, and the return path simply hands it back.
+
+The record is built by the caller, so the next thing to look at is which VSH
+structure hands `x3` a `{fn, arg}` pair (the module tables at `0x1083F50` and
+`0x1083F90` are live in `r29`/`r30` at the fault) and why its first field is a
+frame pointer rather than a function descriptor.
+
+The `0x20` drift that produces most of these frames is gone.  Two code paths
+can fold up the `0xC00` trampoline's frame for the call in flight - the
+scheduler (`ps3_sched_apply`) and the wake path (`ps3_thread_finish_call`,
+which completes a parked call) - and each of them steps `r1` past the
+32-byte trampoline frame.  When both ran for the same call, `r1` ended up
+`0x20` into the thread's own frame, so the guest's epilogue read a local
+instead of the saved LR and returned into the stack.  A thread now carries a
+`call_collected` flag: cleared when a new `sc` enters the trampoline, set by
+whichever path folds the frame first, and honoured by the other (which then
+just switches threads).  A parked call deliberately does not set it - the wake
+owns the frame.
+
+With that in place the first fault in a `vsh-run` moved from `tick 11` to
+`tick 4443`, and the remaining thread that died was
+`_libavst_receiver_thread_entry` (entry `0x5DBF54`).  It was not a syscall
+fault: the thread was polling `sys_uart_receive` (`0x170`), 7798 calls in one
+run, because the model answered that call with an empty success.  The AV
+receiver channel is fed from outside the console, so with no AV source there
+is never a byte to return; lv2 blocks there.  The call now parks the caller
+for input that never arrives, and the poll loop is gone (`0x170` appears zero
+times in the next run).
+
+What still stops a `vsh-run` is the main thread returning through a null LR
+from `x3` code, and where it stops moves between runs because the scheduler
+is tick-driven - the same inputs reach `tick 714` in one run and `tick 4443`
+in another.  That nondeterminism is the next thing to remove before the fault
+can be pinned to one call site.
 
 A second, earlier fault in the same family shows up on the `x3` workers, and it
 is the one to chase first because it happens before the main thread's:
