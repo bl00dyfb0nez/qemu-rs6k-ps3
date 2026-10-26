@@ -934,6 +934,7 @@ void ps3_vga_guest_scanout(uint32_t base, uint32_t w, uint32_t h,
     ps3_vga_compose(s);
     ps3_vga_text_overlay(s);
     ps3_vga_present(s);
+    ps3_vga_dump_screen(s);
 
     info_report("ps3-vga: guest owns the scanout: %ux%u from 0x%X", w, h,
                 base);

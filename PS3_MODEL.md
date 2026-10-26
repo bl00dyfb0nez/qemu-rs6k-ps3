@@ -355,14 +355,12 @@ guest's own call - no timer advances it.
 The packet decoder covers all four packet kinds: methods (with the count in
 bits 18..28, the non-increment flag, and zero-count NOPs), new- and old-style
 jumps, calls and returns.  A jump to `get` itself is the library's idle marker:
-consumption stops there until the next doorbell.  Methods whose result is
-visible on the display are executed: `SET_SURFACE_FORMAT` (log2 width/height and
-colour format), `SET_SURFACE_PITCH_A`, `SET_SURFACE_COLOR_AOFFSET`,
-`SET_SURFACE_COLOR_TARGET`, `SET_COLOR_CLEAR_VALUE`, `CLEAR_SURFACE` and
-`SET_BEGIN_END`.  The clear fills surface A with the clear colour for the 32-bit
-formats, in local memory when the offset names it and through the io map when
-it does not, always bounds-checked.  Every other method is counted, and the
-first 24 are named under `ppu-trace`.
+consumption stops there until the next doorbell.  Methods are dispatched to the
+NV4097 handlers one at a time, in the argument order the packet carries (a
+non-incrementing packet sends every argument to the same register, which is how
+the library streams inline vertex words); the draw state and the rasterizer are
+described in the next section.  Every method the front end does not implement is
+counted, and the first 24 are named under `ppu-trace`.
 
 The display's own clock is separate from the FIFO: a 59.94 Hz timer raises the
 vblank event (`0xFED`'s job in RPCS3) and updates `lastVTime`, the second
@@ -372,11 +370,104 @@ notification, queue and user command.  Queue (`0x103`) and flip notification
 (`0xFEC`) are raised by the attribute call itself, so a thread waiting in
 `sys_event_queue_receive` wakes from that call, not from a scheduler tick.
 
-What the front end does not have is the rendering pipeline: no shader, no copy
-engine, no tiled surface decode.  A draw is counted (`rsx_draws`) but nothing is
-rasterized, and `0x600`-`0x603` are recorded rather than performed, exactly as
-RPCS3 leaves them.  Cursor packages are accepted so a library that sets a cursor
-runs; the hardware cursor is not drawn.
+### The NV4097 draw dispatch
+
+A `cellGcm` draw is not a call into a modelled function: the graphics library
+writes NV4097 methods into the FIFO, so the drawing has to come out of the same
+method stream a game produces.  The dispatch mirrors RPCS3's `nv4097` handlers
+for the entries this front end implements:
+
+| Method | What the model does |
+| --- | --- |
+| `SET_SURFACE_FORMAT`, `_PITCH_A`, `_COLOR_AOFFSET`, `_COLOR_TARGET` | the render target: log2 size, colour format, pitch, offset, target mask |
+| `SET_COLOR_CLEAR_VALUE`, `CLEAR_SURFACE` | fills surface A with the clear word in the target's channel order |
+| `SET_VERTEX_DATA_ARRAY_OFFSET` + 0..15 | array base; bit 31 selects main memory (through the context's io map), clear is local memory |
+| `SET_VERTEX_DATA_ARRAY_FORMAT` + 0..15 | type (s1, f, sf, ub, s32k, cmp, ub256), component count, stride; a size of zero disables the attribute |
+| `SET_VERTEX_DATA_BASE_OFFSET`, `_BASE_INDEX` | added to each array offset and to every vertex index, both masked as the hardware masks them (`0x0FFFFFFF`, `0xFFFFF`) |
+| `SET_INDEX_ARRAY_ADDRESS`, `_DMA` | the index array: location in bits 0..3, 16- or 32-bit width in bits 4..7; an invalid value is ignored, as RPCS3 rolls it back |
+| `SET_BEGIN_END` | opens the draw clause with a primitive type; the value zero closes it and rasterizes |
+| `DRAW_ARRAYS`, `DRAW_INDEX_ARRAY` | appends the start/count range (`start` bits 0..23, `count - 1` bits 24..31) to the clause |
+| `INLINE_ARRAY` | appends one word of push-buffer vertex data, packed per the attribute formats |
+| `SET_VIEWPORT_HORIZONTAL`/`_VERTICAL`, `SET_SCISSOR_HORIZONTAL`/`_VERTICAL` | the window transform and the inclusive clip rectangle |
+| `SET_BLEND_ENABLE`, `_FUNC_SFACTOR`, `_FUNC_DFACTOR`, `_BLEND_EQUATION`, `SET_COLOR_MASK` | per-channel blend (add, subtract, reverse subtract, min, max) and the write mask |
+
+Draw calls do not rasterize on their own.  They append vertex ranges to the open
+clause and the closing `SET_BEGIN_END(0)` walks them, which is how a triangle
+strip can span several draw calls; a new `SET_BEGIN_END(primitive)` flushes a
+clause that was left open.  The clause holds up to 1024 ranges and 16 KiB of
+inline words, and a draw is capped at a million vertices.
+
+Rasterizing then runs the vertex pipeline the model has: attribute 0 is the
+position and the first 3- or 4-component attribute among 1, 3, 2, 4 is the
+colour (`white` when none is enabled).  Positions that look like clip space -
+`|x|, |y| <= 1.5` and `0 < w <= 2` for most of the batch - go through the
+viewport (perspective divide, the y flip the surface's top-left origin needs);
+positions that are already pixel-sized are the 2D interface path and are used as
+window coordinates.  Points, lines, line loops and strips, triangles, triangle
+strips and fans, quads, quad strips and polygons are all assembled, then filled
+with an incremental edge-function rasterizer and linear colour interpolation.
+A fragment is blended and colour-masked, then written into the surface, which
+may be local memory or a main-memory range mapped by `sys_rsx_context_iomap`.
+Flips are unaffected: the scanout reads whatever the draws left in the buffer.
+
+What this is not: there is no vp40/fp40 execution, so the vertex and fragment
+programs the guest loaded are not run and the colour attribute stands in for the
+shader's output; there is no texture unit (texture state, formats and sampling),
+no depth or stencil test, no culling, no anti-aliasing, no MRT beyond target A,
+no tiled surface decode, and no copy engine.  Immediate-mode vertex elements
+(`ARRAY_ELEMENT16`/`32`) are counted and refused once, with a log line;
+`cellGcmSys` itself draws from vertex arrays.  Cursor packages are accepted so a
+library that sets a cursor runs; the hardware cursor is not drawn.
+
+#### The draw test
+
+`.tmp/sys_rsx_draw_test.S` is a PPU program that drives the RSX the way
+`cellGcmSys` does and checks the pixels.  It writes NV4097 packets into a FIFO,
+rings the doorbell, and reads the surface back:
+
+```sh
+AS=/c/msys64/usr/local/ps3dev/ppu/bin/powerpc64-ps3-elf-as.exe
+LD=/c/msys64/usr/local/ps3dev/ppu/bin/powerpc64-ps3-elf-ld.exe
+$AS -mcell -o .tmp/sys_rsx_draw_test.o .tmp/sys_rsx_draw_test.S
+$LD -Ttext=0x02000000 -e _start -o .tmp/sys_rsx_draw_test.elf \
+    .tmp/sys_rsx_draw_test.o
+./build-ps3/qemu-system-ppc64.exe -M rs6000-ps3 -display none \
+  -global ps3-boot-rom.vsh-self=.tmp/sys_rsx_draw_test.elf \
+  -global ps3-boot-rom.vsh-run=on \
+  -global ps3-boot-rom.ppu-trace=on \
+  -icount shift=6,sleep=off
+```
+
+(The `ppu-gcc` driver in this tree links through a temp file the shim does not
+handle for `-nostdlib` sources; assembling and linking directly gives the same
+ELF.)  The program makes four draws on a 256x256 A8R8G8B8 surface at local
+`0x00200000`: a triangle from three vertex arrays with per-vertex colours, the
+same triangle through a 16-bit index array, a triangle outside a 50x50 scissor,
+and a clip-space triangle through a `256x256` viewport.  It then registers
+display buffer 0 and flips it.  The exit status is a bit mask, and `0` is every
+check passing:
+
+```
+ps3-rsx: draw 3 vertices as primitive 0x5 (window space), first vertex 10.0,10.0 colour 1.00,0.00,0.00
+ps3-rsx: draw done: 1 primitive(s), 18145 pixel(s)
+ps3-rsx: draw 3 vertices as primitive 0x5 (window space), first vertex 10.0,10.0 colour 1.00,0.00,0.00
+ps3-rsx: draw done: 1 primitive(s), 18145 pixel(s)
+ps3-rsx: draw done: 1 primitive(s), 820 pixel(s)
+ps3-rsx: draw 3 vertices as primitive 0x5 (clip space), first vertex 0.0,256.0 colour 1.00,1.00,1.00
+ps3-rsx: draw done: 1 primitive(s), 32768 pixel(s)
+ps3-vga: guest owns the scanout: 256x256 from 0x40200000
+ps3-ppu: process exited with status 0
+```
+
+The pixels the checks read back are exact: the red vertex's corner reads
+`0xFFFB0200`, the green vertex's `0xFF0BF200`, the scissor and the empty part of
+the triangle stay `0x00000000`, and the clip-space triangle covers the centre of
+the viewport with `0xFFFFFFFF`.
+
+The walkthrough is not the VSH yet: an HDD boot still parks the VSH's main
+thread joining the `libavst` receiver before `cellGcmInit`, so no VSH draw
+reaches the FIFO.  The dispatch is exercised by the guest program above, with
+the method encoding `cellGcmSys` itself writes.
 
 No VSH run reaches `sys_rsx` yet: a console starts
 `/dev_flash/sys/internal/sys_init_osd.self` first, and that image's process
