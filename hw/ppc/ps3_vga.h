@@ -24,12 +24,11 @@ void ps3_vga_printf(const char *fmt, ...);
 void ps3_vga_boot_logo(const char *title, const char *caption);
 
 /*
- * The console's home screen, drawn once the chain is done: the wave, the
- * category row, the user and the host's clock.  This is the model's rendition
- * of the XMB, not Sony's artwork; the guest's scanout wins whenever vsh.self
- * programs one.  It refuses to draw once the guest has the screen.
+ * There is no host-drawn home screen: the console's own frame is vsh.self's,
+ * and it reaches this device through the RSX's display buffer (the same path
+ * cellGcmSetDisplayBuffer and cellGcmSetFlip use), so what the window shows is
+ * always something the guest rendered.
  */
-void ps3_vga_home_screen(void);
 
 /*
  * The AV path: the guest hands the device the framebuffer it rendered into,

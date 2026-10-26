@@ -1,3 +1,8 @@
+===================
+README for RS6k-PS3
+===================
+Goal is to implement a full interpretor of the boot chain and boot directly into the VSH.self/Emer_init.self for fall back for the flash region, and document it in PS3_MODEL.md
+
 ===========
 QEMU README
 ===========

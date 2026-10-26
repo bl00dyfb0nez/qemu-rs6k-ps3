@@ -499,7 +499,13 @@ typedef struct PS3Lv2Module {
  * scheduler gives them the core once and never takes it back.  The slice is
  * counted in scheduler ticks (1 ms of virtual time each).
  */
-#define PS3_THREAD_MAX 32
+/*
+ * lv2's object tables.  These are the sizes the VSH needs, not the console's:
+ * a boot creates more than thirty threads and more than sixty mutexes before
+ * its registry is up, and a table that fills makes the application see EAGAIN
+ * from create and ESRCH from every later destroy.
+ */
+#define PS3_THREAD_MAX 128
 #define PS3_SCHED_SLICE_TICKS 4
 
 /*
@@ -515,9 +521,9 @@ typedef struct PS3Lv2Module {
  * later, from the frame and SRR0/SRR1 the park recorded - by a send, or by the
  * timeout running out in the scheduler tick.
  */
-#define PS3_EQ_MAX 24
+#define PS3_EQ_MAX 64
 #define PS3_EQ_DEPTH 8
-#define PS3_EP_MAX 24
+#define PS3_EP_MAX 64
 #define PS3_EQ_EVENT_SIZE 32
 
 /*
@@ -667,8 +673,8 @@ typedef struct PS3RsxZcull {
  * to wait for a mutex or a condition is parked inside its call exactly like
  * one waiting on an event queue, so the same completion path wakes it.
  */
-#define PS3_MUTEX_MAX 64
-#define PS3_COND_MAX 32
+#define PS3_MUTEX_MAX 256
+#define PS3_COND_MAX 128
 
 typedef struct PS3Mutex {
     bool used;
@@ -758,6 +764,13 @@ typedef struct PS3Thread {
     uint32_t wait_sem_id;       /* semaphore it waits on, 0 = none */
     uint32_t id;
     uint32_t join_target;
+    /*
+     * A join in flight: the joiner is parked until the target exits, and the
+     * target's exit status goes to join_ea when it does.  lv2 writes that word
+     * when the join completes, not when it is called.
+     */
+    uint32_t join_ea;
+    uint32_t exit_status;
     /* lv2's thread attributes: the priority the creator asked for, the stack
      * it was given, and whether it can still be joined.  The VSH's x3 layer
      * asks for all three around the media threads it starts. */
@@ -1559,12 +1572,18 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
  * Two seconds of virtual time: the wordmark, then the home screen.  A real
  * console is at its home screen about five seconds after the power button,
  * and the chain above has already spent the first ones.
+ *
+ * The home screen is vsh.self's own frame, not the model's: what this machine
+ * shows is whatever the guest programs into the RSX's display buffer through
+ * cellGcmSetDisplayBuffer and cellGcmSetFlip.  Nothing is drawn on the host
+ * for it, so the screen stays on the boot text until the guest's graphics
+ * library takes the scanout.
  */
 #define PS3_HOME_DELAY_NS   (2 * NANOSECONDS_PER_SECOND)
 
 static void ps3_rom_home_tick(void *opaque)
 {
-    ps3_vga_home_screen();
+    (void)opaque;
 }
 
 static void ps3_rom_boot(PS3BootROMState *s)
@@ -1679,7 +1698,7 @@ static void ps3_rom_boot(PS3BootROMState *s)
          */
         if (!s->home_timer) {
             s->home_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                         ps3_rom_home_tick, NULL);
+                                         ps3_rom_home_tick, s);
         }
         timer_mod(s->home_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                                  PS3_HOME_DELAY_NS);
@@ -11167,12 +11186,35 @@ static void ps3_lv2_service(PS3BootROMState *s)
 
         if (idx >= 0 && s->thr[idx].used) {
             uint32_t id = s->thr[idx].id;
+            uint8_t *exit_ram = ram;
 
             s->thr[idx].dead = true;
+            s->thr[idx].exit_status = a0;
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: thread 0x%X exited with 0x%X", id,
+                            a0);
+            }
             for (i = 0; i < PS3_THREAD_MAX; i++) {
-                if (s->thr[i].used && s->thr[i].blocked &&
-                    s->thr[i].join_target == id) {
-                    s->thr[i].blocked = false;
+                PS3Thread *j = &s->thr[i];
+
+                if (!j->used || j->id == id ||
+                    j->join_target != id) {
+                    continue;
+                }
+                /*
+                 * Finish the parked join here: the joiner's frame is still in
+                 * the trampoline, and finishing it the way a wake does steps
+                 * r1 out of that frame and returns to the instruction after
+                 * its `sc'.
+                 */
+                j->join_target = 0;
+                if (j->join_ea && (uint64_t)j->join_ea + 8 <= ram_size) {
+                    ps3_put_be64(exit_ram + j->join_ea, a0);
+                }
+                if (j->parked) {
+                    ps3_thread_finish_call(s, j, exit_ram, ram_size, 0);
+                } else {
+                    j->blocked = false;
                 }
             }
             s->sched_pending = true;
@@ -11189,12 +11231,41 @@ static void ps3_lv2_service(PS3BootROMState *s)
                 break;
             }
         }
-        if (a1 && (uint64_t)a1 + 8 <= ram_size) {
-            ps3_put_be64(ram + a1, 0);
+        if (!t) {
+            ret = PS3_LV2_ESRCH;
+            break;
         }
-        if (t && !t->dead && s->thr_cur >= 0) {
-            s->thr[s->thr_cur].blocked = true;
-            s->thr[s->thr_cur].join_target = a0;
+        if (t->detached) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (t->dead) {
+            if (a1 && (uint64_t)a1 + 8 <= ram_size) {
+                ps3_put_be64(ram + a1, t->exit_status);
+            }
+            ret = 0;
+            break;
+        }
+        /*
+         * The target is still running: the caller blocks until it exits.  It
+         * has to be parked in the call, not merely flagged, or it runs on with
+         * `blocked' set and the scheduler never picks it again - which is what
+         * froze the VSH's main thread at its first join of a worker.
+         */
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: join 0x%X from thread 0x%X", a0,
+                        s->thr_cur >= 0 ? s->thr[s->thr_cur].id : 0);
+        }
+        if (s->thr_cur >= 0 && s->thr[s->thr_cur].used) {
+            PS3Thread *j = &s->thr[s->thr_cur];
+
+            j->parked = true;
+            j->blocked = true;
+            j->join_target = a0;
+            j->join_ea = a1;
+            j->wait_eq = -3;        /* a join, not a queue */
+            j->wait_ticks = -1;     /* lv2 has no timeout on a join */
+            s->lv2_park = true;
             s->sched_pending = true;
         }
         ret = 0;
@@ -11970,19 +12041,25 @@ static void ps3_lv2_service(PS3BootROMState *s)
     case 0x332: {               /* sys_fs_lseek(fd, offset, whence, pos*) */
         int hfd = ps3_lv2_fd_host(s, a0);
         off_t pos;
+        uint32_t out = cpu->env.gpr[6];
 
         if (hfd < 0) {
             ret = PS3_LV2_EINVAL;
             break;
         }
-        pos = lseek(hfd, (off_t)cpu->env.gpr[4], a3);
+        /*
+         * (`fd', `offset', `whence', `pos*'): the out pointer is the fourth
+         * argument.  Reading whence from the fifth read the pointer itself as
+         * a whence and every rewind failed with EINVAL, which the guest sees
+         * as EIO - the VSH's file loops then retried forever.
+         */
+        pos = lseek(hfd, (off_t)cpu->env.gpr[4], cpu->env.gpr[5]);
         if (pos < 0) {
             ret = ps3_lv2_fs_error(errno);
             break;
         }
-        if (cpu->env.gpr[7] &&
-            (uint64_t)cpu->env.gpr[7] + 8 <= ram_size) {
-            ps3_put_be64(ram + cpu->env.gpr[7], pos);
+        if (out && (uint64_t)out + 8 <= ram_size) {
+            ps3_put_be64(ram + out, pos);
         }
         ret = 0;
         break;
@@ -13066,6 +13143,334 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
     return true;
 }
 
+/*
+ * The disk's own file tree.
+ *
+ * A console keeps its firmware and its /dev_hdd0 files inside the disk, not
+ * beside it, so an image built by scripts/ps3_hdd_tree.py carries them: a
+ * superblock at 32 MiB, then one 4 KiB block per directory or file, with
+ * each block read through ps3_hdd_read() so the XTS layer is the same one the
+ * guest's sys_storage calls use.  When the image has this tree and the caller
+ * named no host directory for a device, the tree is what the model boots
+ * from: it is unpacked once into `<image>.tree` and the dev_flash roots point
+ * there, so the SELF files the VSH loads are the ones stored on the disk.
+ */
+#define PS3_HDD_TREE_MAGIC   "PS3HDFS1"
+/* Past the first 16 MiB, which boot-medium=hdd reads as the flash copy. */
+#define PS3_HDD_TREE_OFF     0x02000000u
+#define PS3_HDD_TREE_BLOCK   4096u
+#define PS3_HDD_TREE_NAME    48
+#define PS3_HDD_TREE_ENTRY   64
+#define PS3_HDD_TREE_SECTORS (PS3_HDD_TREE_BLOCK / PS3_LV2_SECTOR)
+#define PS3_HDD_TREE_DEPTH   12
+
+typedef struct PS3HddTreeEnt {
+    char name[PS3_HDD_TREE_NAME];
+    uint8_t type;               /* 1 directory, 2 file */
+    uint32_t size;
+    uint64_t block;
+} PS3HddTreeEnt;
+
+static bool ps3_hdd_tree_block(PS3BootROMState *s, uint64_t block, void *buf)
+{
+    uint64_t sector = PS3_HDD_TREE_OFF / PS3_LV2_SECTOR +
+                      block * PS3_HDD_TREE_SECTORS;
+
+    if ((sector + PS3_HDD_TREE_SECTORS) * PS3_LV2_SECTOR > s->hdd_size) {
+        return false;
+    }
+
+    return ps3_hdd_read(s, sector, buf, PS3_HDD_TREE_SECTORS);
+}
+
+/*
+ * A directory block starts with the block that continues it, so a directory
+ * with more entries than one block holds runs as a chain.
+ */
+#define PS3_HDD_TREE_DIR_HEAD 8
+
+static uint32_t ps3_hdd_tree_dir_next(const uint8_t *blk)
+{
+    return ps3_be32(blk);
+}
+
+/* The next entry of a directory block; `o' walks the block. */
+static bool ps3_hdd_tree_entry(const uint8_t *blk, unsigned *o,
+                               PS3HddTreeEnt *e)
+{
+    const uint8_t *p;
+    unsigned len;
+
+    if (*o < PS3_HDD_TREE_DIR_HEAD) {
+        *o = PS3_HDD_TREE_DIR_HEAD;
+    }
+    if (*o + PS3_HDD_TREE_ENTRY > PS3_HDD_TREE_BLOCK) {
+        return false;
+    }
+    p = blk + *o;
+
+    len = p[0];
+    if (!len) {
+        return false;
+    }
+    if (len >= PS3_HDD_TREE_NAME) {
+        len = PS3_HDD_TREE_NAME - 1;
+    }
+
+    memcpy(e->name, p + 16, len);
+    e->name[len] = 0;
+    e->type = p[1];
+    e->size = ps3_be32(p + 4);
+    e->block = ps3_be64(p + 8);
+
+    *o += PS3_HDD_TREE_ENTRY;
+    return true;
+}
+
+/* Walk `/dev_flash/...' from the root and return the entry it names. */
+static bool ps3_hdd_tree_lookup(PS3BootROMState *s, const char *path,
+                                PS3HddTreeEnt *out)
+{
+    g_autofree uint8_t *blk = g_malloc(PS3_HDD_TREE_BLOCK);
+    const char *p = path;
+    uint64_t block = 1;
+
+    if (!ps3_hdd_tree_block(s, 0, blk) ||
+        memcmp(blk, PS3_HDD_TREE_MAGIC, 8)) {
+        return false;
+    }
+    block = ps3_be32(blk + 8);
+    if (!block) {
+        return false;
+    }
+
+    while (*p == '/') {
+        p++;
+    }
+
+    while (*p) {
+        char part[PS3_HDD_TREE_NAME];
+        const char *slash = strchr(p, '/');
+        unsigned len = slash ? (unsigned)(slash - p) : strlen(p);
+        PS3HddTreeEnt e;
+        unsigned o = 0;
+        bool found = false;
+
+        if (len >= sizeof(part)) {
+            return false;
+        }
+        memcpy(part, p, len);
+        part[len] = 0;
+
+        while (block) {
+            if (!ps3_hdd_tree_block(s, block, blk)) {
+                return false;
+            }
+            o = 0;
+            while (ps3_hdd_tree_entry(blk, &o, &e)) {
+                if (!strcmp(e.name, part)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                break;
+            }
+            block = ps3_hdd_tree_dir_next(blk);
+        }
+        if (!found) {
+            return false;
+        }
+
+        if (!slash) {
+            if (out) {
+                *out = e;
+            }
+            return true;
+        }
+
+        if (e.type != 1) {
+            return false;
+        }
+        block = e.block;
+        p = slash;
+        while (*p == '/') {
+            p++;
+        }
+    }
+
+    return false;
+}
+
+/* Write one file from the tree, block by block, under `dest'. */
+static bool ps3_hdd_tree_extract_file(PS3BootROMState *s, const PS3HddTreeEnt *e,
+                                      const char *dest)
+{
+    g_autofree uint8_t *blk = g_malloc(PS3_HDD_TREE_BLOCK);
+    g_autoptr(GError) err = NULL;
+    uint64_t left = e->size, block = e->block;
+    g_autofree char *dir = g_path_get_dirname(dest);
+    g_autofree char *tmp = g_strconcat(dest, ".part", NULL);
+    FILE *f;
+
+    g_mkdir_with_parents(dir, 0755);
+
+    f = fopen(tmp, "wb");
+    if (!f) {
+        return false;
+    }
+
+    while (left) {
+        unsigned n = MIN(left, (uint64_t)PS3_HDD_TREE_BLOCK);
+
+        if (!ps3_hdd_tree_block(s, block, blk) ||
+            fwrite(blk, 1, n, f) != n) {
+            fclose(f);
+            g_unlink(tmp);
+            return false;
+        }
+        left -= n;
+        block++;
+    }
+
+    fclose(f);
+
+    if (g_rename(tmp, dest) < 0) {
+        g_unlink(tmp);
+        return false;
+    }
+
+    (void)err;
+    return true;
+}
+
+static bool ps3_hdd_tree_extract_dir(PS3BootROMState *s, uint64_t block,
+                                     const char *dest, unsigned depth)
+{
+    g_autofree uint8_t *blk = g_malloc(PS3_HDD_TREE_BLOCK);
+    PS3HddTreeEnt e;
+    unsigned o = 0;
+    bool any = false;
+
+    if (depth > PS3_HDD_TREE_DEPTH) {
+        return false;
+    }
+
+    while (block) {
+        if (!ps3_hdd_tree_block(s, block, blk)) {
+            return false;
+        }
+        o = 0;
+        while (ps3_hdd_tree_entry(blk, &o, &e)) {
+            g_autofree char *path = g_build_filename(dest, e.name, NULL);
+
+            any = true;
+            if (e.type == 1) {
+                g_mkdir_with_parents(path, 0755);
+                if (!ps3_hdd_tree_extract_dir(s, e.block, path, depth + 1)) {
+                    return false;
+                }
+            } else if (!ps3_hdd_tree_extract_file(s, &e, path)) {
+                return false;
+            }
+        }
+        block = ps3_hdd_tree_dir_next(blk);
+    }
+
+    (void)any;
+    return true;
+}
+
+/*
+ * Unpack the tree once per build.  The superblock carries a generation word: a
+ * new image bumps it, the stamp file records the one already unpacked, and a
+ * matching stamp skips the copy so a boot does not rewrite 187 MiB of
+ * firmware.
+ */
+static bool ps3_hdd_tree_setup(PS3BootROMState *s, Error **errp)
+{
+    g_autofree uint8_t *blk = g_malloc(PS3_HDD_TREE_BLOCK);
+    g_autofree char *tree = NULL;
+    g_autofree char *stamp = NULL;
+    g_autofree gchar *have = NULL;
+    uint32_t generation, root;
+    const char *devs[] = { "dev_flash", "dev_flash2", "dev_flash3",
+                           "dev_hdd0" };
+    char text[32];
+    gsize have_len = 0;
+    bool fresh = true;
+    unsigned i;
+
+    if (!s->hdd || !s->hdd_size) {
+        return true;
+    }
+
+    if (!ps3_hdd_tree_block(s, 0, blk) ||
+        memcmp(blk, PS3_HDD_TREE_MAGIC, 8)) {
+        return true;            /* the image has no tree of its own */
+    }
+
+    root = ps3_be32(blk + 8);
+    generation = ps3_be32(blk + 12);
+    if (!root) {
+        return true;
+    }
+
+    tree = g_strconcat(s->hdd_file, ".tree", NULL);
+    stamp = g_build_filename(tree, ".generation", NULL);
+    snprintf(text, sizeof(text), "%u\n", generation);
+
+    if (g_file_get_contents(stamp, &have, &have_len, NULL) &&
+        have_len && !strcmp(have, text)) {
+        fresh = false;
+    }
+
+    if (fresh) {
+        g_mkdir_with_parents(tree, 0755);
+        if (!ps3_hdd_tree_extract_dir(s, root, tree, 0)) {
+            error_setg(errp, "ps3-boot-rom: cannot unpack the HDD tree "
+                       "from %s into %s", s->hdd_file, tree);
+            return false;
+        }
+        if (!g_file_set_contents(stamp, text, -1, NULL)) {
+            error_setg(errp, "ps3-boot-rom: cannot write %s", stamp);
+            return false;
+        }
+        info_report("ps3-boot-rom: HDD tree generation %u unpacked from %s "
+                    "into %s", generation, s->hdd_file, tree);
+    } else {
+        info_report("ps3-boot-rom: HDD tree generation %u already unpacked "
+                    "in %s", generation, tree);
+    }
+
+    /*
+     * A caller's own directories win; when it named none, the firmware and
+     * the disk's file area are the ones stored inside the image.
+     */
+    {
+        gchar **slot[] = { &s->dev_flash, &s->dev_flash2, &s->dev_flash3,
+                           &s->hdd_dir };
+
+        for (i = 0; i < ARRAY_SIZE(devs); i++) {
+            g_autofree char *dir = g_build_filename(tree, devs[i], NULL);
+
+            if (*slot[i] || !g_file_test(dir, G_FILE_TEST_IS_DIR)) {
+                continue;
+            }
+            *slot[i] = g_strdup(dir);
+            info_report("ps3-boot-rom: %s from the HDD image (%s)", devs[i],
+                        dir);
+        }
+    }
+
+    if (!s->dev_flash) {
+        error_setg(errp, "ps3-boot-rom: the HDD tree has no dev_flash");
+        return false;
+    }
+
+    return true;
+}
+
 /* The PS3 has no interrupt controller wired to an ISA bus; the IDE line is
  * accepted and dropped, which is enough for a polled ATA driver. */
 static void ps3_isa_noop(void *opaque, int line, int level)
@@ -13232,6 +13637,9 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         }
     }
     if (!ps3_hdd_setup(s, errp)) {
+        return;
+    }
+    if (!ps3_hdd_tree_setup(s, errp)) {
         return;
     }
     if (!ps3_emmc_setup(s, errp)) {

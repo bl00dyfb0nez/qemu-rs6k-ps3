@@ -175,19 +175,19 @@ Once the container verifies, the scanout also gets the console's boot screen:
 (`-global ps3-boot-rom.boot-logo=off` disables it).  The glyphs are the console
 font scaled up; the artwork is the model's own.
 
-Two seconds after the wordmark the home screen replaces it, the way the console
-comes up to its home in about five seconds from the power button: the wave
-background, the category row with Game selected, `USER1` in the corner and the
-host's clock (the same clock `sys_ss` gives the guest).  It is a rendition of
-the XMB, not Sony's artwork and not vsh.self's rendering: the real screen needs
-the guest's own `cellGcm` frames, and until those arrive this is what the
-window shows.  Nothing is drawn unless the chain verified - a console whose
-trust chain stops shows its boot screen and stays there - and the guest's
-scanout takes the screen the moment vsh.self programs `cellVideoOut`.
+The home screen is not drawn by the model.  The XMB is vsh.self's own frame,
+and it reaches the window the way RPCS3's does: the guest's `cellGcm` calls
+program the RSX's display buffer and flip it, the RSX keeps that buffer in
+guest memory, and the scanout presents what the guest wrote there
+(`cellGcmSetDisplayBuffer` and `cellGcmSetFlip` in the board model).  Until
+vsh.self gets far enough to do that, the window shows the boot text and the
+wordmark and nothing else - there is no host-side XMB rendition to mistake for
+the console's own screen.  On the chain side, nothing but the boot screen is
+drawn unless the chain verified; the guest's scanout takes over the moment
+vsh.self programs `cellVideoOut`.
 
-`-global ps3-vga.dump=home.ppm` writes the boot surface after every line and
-once more for the home screen, so the window's contents can be inspected
-without a display:
+`-global ps3-vga.dump=home.ppm` writes the boot surface after every line, so
+the window's contents can be inspected without a display:
 
 ```sh
 $Q -M rs6000-ps3 -bios .tmp/rom/rom.bin \
@@ -1262,6 +1262,17 @@ With both fixed the run reaches `tick 688` instead of `tick 30`: the `x3`
 workers park in `sys_cond_wait` instead of failing it, the media threads start,
 and the console is past `Registry initialization ... done`.
 
+`sys_ppu_thread_join` (`0x2C`) had a matching bug of its own: a join on a
+thread that was still running set `blocked` on the caller and returned 0, so
+the caller kept running until its slice ended and then the scheduler skipped it
+for the rest of the run - the VSH's main thread froze at its first join of the
+libavst receiver and nothing after it ran.  A join now parks the caller inside
+the call (its frame is finished the way a queue wake finishes one) and
+`sys_ppu_thread_exit` completes every parked joiner with the target's exit
+status written to its `u64 *retval`.  The same run now gets as far as the
+libavst teardown, which is where the guest's own stop protocol becomes the next
+thing to model.
+
 ### The miscellany the VSH's libc and file layer need
 
 Three families of calls sat in `sysPrxForUser` and `sys_fs` with no answer,
@@ -2070,6 +2081,54 @@ $Q -M rs6000-ps3 -bios .tmp/rom/rom.bin \
 `boot-medium=hdd` runs the same container search over the first 16 MiB of the
 disk after the ATA decryption (sector 0 of a keyed disk is the wrapped key
 sector and is left out), so a chain staged on the HDD boots as well.
+
+### The console's own file tree inside the disk: `scripts/ps3_hdd_tree.py`
+
+A console keeps its firmware and its `/dev_hdd0` files inside the disk, so the
+model's image can carry them too.  `scripts/ps3_hdd_tree.py` writes
+`dev_flash`, `dev_flash2`, `dev_flash3` and `dev_hdd0` into the image at 32 MiB
+(past the flash copy the boot search uses), one 4 KiB block per directory or
+file, every block read back through the same HDD block layer - and therefore
+the same XTS keys - as the guest's `sys_storage` calls:
+
+```sh
+# a fresh 20 GiB image with the trees inside it
+py scripts/ps3_hdd_tree.py -o .tmp/hdd_fs.img --size 20G \
+   --root C:/Users/me/Documents/rs3
+
+# or add/update the tree in an image that already exists
+py scripts/ps3_hdd_tree.py .tmp/hdd_fs.img --root C:/Users/me/Documents/rs3
+
+# what is stored in it?
+py scripts/ps3_hdd_tree.py .tmp/hdd_fs.img --list
+```
+
+At startup the model reads the tree's superblock and, when the caller named no
+host directory for a device, unpacks the tree once into `<image>.tree` (a
+generation word in the superblock means a rebuilt image is unpacked again and
+an unchanged one is not) and points `dev_flash*` and `dev_hdd0` at it:
+
+```
+ps3-boot-rom: HDD tree generation 1 unpacked from .tmp/hdd_fs.img into .tmp/hdd_fs.img.tree
+ps3-boot-rom: dev_flash from the HDD image (.tmp/hdd_fs.img.tree\dev_flash)
+ps3-boot-rom: dev_flash2 from the HDD image (.tmp/hdd_fs.img.tree\dev_flash2)
+ps3-boot-rom: dev_flash3 from the HDD image (.tmp/hdd_fs.img.tree\dev_flash3)
+ps3-boot-rom: dev_hdd0 from the HDD image (.tmp/hdd_fs.img.tree\dev_hdd0)
+ps3-vsh: .tmp/hdd_fs.img.tree\dev_flash\vsh\module\vsh.self: entry=0x6D5AC8, ...
+```
+
+so a console can be brought up with nothing but its disk:
+
+```sh
+$Q -M rs6000-ps3 -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img \
+   -global ps3-boot-rom.boot-medium=hdd \
+   -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on -display sdl
+```
+
+A `-global ps3-boot-rom.dev-flash=...` still wins, which is what the
+stage-by-stage tests use.  The tool writes a plain image; a keyed one has to be
+encrypted with the console's ATA keys after the tree is written, and it says
+so instead of writing blocks the model would read as ciphertext.
 
 Observed on this build:
 
