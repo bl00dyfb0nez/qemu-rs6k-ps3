@@ -14168,6 +14168,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
         int host_flags, hfd, gfd;
 
+        if (s->ppu_trace) {
+            char path[160];
+
+            if (ps3_lv2_guest_string(ram, ram_size, a0, path, sizeof(path))) {
+                info_report("ps3-ppu: lv2: open(%s) flags 0x%08X (lr=0x%" PRIX64
+                            ")", path, (unsigned)a1, (uint64_t)cpu->env.lr);
+            }
+        }
         if (!host) {
             /* Name the path: a missing one is what a boot that stops early
              * is usually waiting on, and the guest only sees ENOENT. */
@@ -14313,6 +14321,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
         GStatBuf st;
 
+        if (s->ppu_trace) {
+            char path[160];
+
+            if (ps3_lv2_guest_string(ram, ram_size, a0, path, sizeof(path))) {
+                info_report("ps3-ppu: lv2: stat(%s) (lr=0x%" PRIX64 ")", path,
+                            (uint64_t)cpu->env.lr);
+            }
+        }
         if (!host) {
             ret = PS3_LV2_ENOENT;
             break;
