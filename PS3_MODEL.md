@@ -1241,6 +1241,50 @@ With the three families in place a `vsh-run` reports **no unresolved imports
 at all**, and the run's remaining stop is the same one as before - the main
 thread returning through an LR that is no longer an address.
 
+### Making a run stop in the same place twice
+
+Thread slices end on a 1 ms timer, and `ps3_sched_tick` counts those ticks.
+Without deterministic time that timer follows the *host's* clock: the guest
+executes however many instructions the host managed between two firings, so a
+slice ends at a different guest instruction in every run.  That is why the same
+`vsh-run` has stopped anywhere between tick 714 and tick 4443, and it is why the
+null-LR return could not be pinned to a call site - the run being examined was
+never the run before it.
+
+QEMU's answer is `-icount`, which derives virtual time from executed
+instructions (one instruction is 2^shift ns) instead of from the host clock.
+The slice timer then fires after a fixed number of guest instructions, and the
+whole scheduler becomes deterministic.  `sleep=off` keeps the guest free-running
+(`align=on` and `sleep=off` are mutually exclusive, and alignment is what ties
+the guest to real time):
+
+```sh
+$Q -M rs6000-ps3 -display none -icount shift=6,sleep=off \
+   -global ps3-boot-rom.dev-flash=C:/Users/Thewoodsman/Documents/rs3/dev_flash \
+   -global ps3-boot-rom.dev-flash2=C:/Users/Thewoodsman/Documents/rs3/dev_flash2 \
+   -global ps3-boot-rom.dev-flash3=C:/Users/Thewoodsman/Documents/rs3/dev_flash3 \
+   -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on \
+   -global ps3-boot-rom.ppu-ticks=1500 -global ps3-boot-rom.ppu-tick-ns=1000000
+```
+
+Measured: two runs of that command, filtered to the console lines, the fault
+reports and every `slice up`, are **byte-identical** (186 of 186 lines each).
+Without `-icount` the same guest does not match itself.
+
+`shift=6` makes a 1 ms slice 15,625 instructions, which is fast enough to run
+and small enough that a slice boundary still lands inside the loops the VSH
+spins in.  `vsh-run` says once when the flag is missing:
+
+```
+ps3-vsh: note: no -icount, so thread slices follow host time and this run is
+not reproducible; add -icount shift=6,sleep=off for a run that stops in the same
+place every time
+```
+
+`-icount` needs TCG; an accelerator (`-accel kvm`, `hvf`, `whpx`) cannot offer
+it, so a window run that needs the accelerator stays host-timed by nature.  A
+reproducible fault hunt is a headless, TCG, `-icount` run.
+
 ### Where that run stops now
 
 With the drive connected the boot goes much further: the BD enumerates,
@@ -1342,11 +1386,143 @@ is never a byte to return; lv2 blocks there.  The call now parks the caller
 for input that never arrives, and the poll loop is gone (`0x170` appears zero
 times in the next run).
 
-What still stops a `vsh-run` is the main thread returning through a null LR
-from `x3` code, and where it stops moves between runs because the scheduler
-is tick-driven - the same inputs reach `tick 714` in one run and `tick 4443`
-in another.  That nondeterminism is the next thing to remove before the fault
-can be pinned to one call site.
+### The null-LR return: folding a frame the trampoline already restored
+
+The main thread kept returning through a null LR out of `x3` code, and where it
+stopped moved between runs.  `-icount` made two runs comparable, and the fold
+trace (`fold: thread ... apply at ...`) named the instruction: the scheduler was
+completing the trampoline for a thread that was already inside the trampoline's
+own epilogue.
+
+`0xC28..0xC3C` are the collection - `lwz r3,0(r12)`, `lwz r0,4(r12)` and the
+exit-flag test.  From `0xC40` on the trampoline is restoring the *caller*:
+`lwz r12,16(r1)`, the CR, `lwz r0,8(r1)`, then `addi r1,r1,32` and `rfid`.  A
+tick that landed in that window made `ps3_sched_apply` fold the frame again:
+it stepped `r1` past the caller's own frame, so the caller's epilogue read a
+local - a stack pointer - as its saved LR and `blr`'d into the stack.  The
+fault report's `lr=0xFFFE200` with `0x0FFFDF30` in the linkage area is exactly
+that shape: the return target is the value the fold computed for `r1`.
+
+Two changes fix it:
+
+| change | why |
+| --- | --- |
+| `ps3_sched_apply` treats `0xC40..0xC5C` as a plain preemption point and never collects or folds there | the trampoline has already restored the frame; the epilogue is a safe point once its exception state travels with the thread |
+| `ps3_thread_save`/`ps3_thread_restore` save and restore SRR0/SRR1 | the `rfid` at `0xC54` loads them, so a thread resumed there must find its own pair, not the pair of the thread that ran in between |
+
+Verified with `-icount shift=6,sleep=off` and the 20 GiB HDD attached:
+
+- a 6000-tick `ppu-trace` run reports **no fault at all**, where the previous
+  build died inside the first few hundred ticks.  Its 2999 folds are all
+  wake-path completions (`fold: thread ... wake:`) - the scheduler's collect
+  path never fired in that run, which is why the symptom was intermittent: it
+  needs a tick to land in the four-instruction window that the fix now skips;
+- two 800-tick runs are **byte-identical** (98 lines each), so the fault hunt
+  is reproducible;
+- five slice lengths (`ppu-tick-ns` 250 us .. 2 ms, so the tick lands at a
+  different instruction each time) all reach 1200 ticks with no fault, which is
+  the case the fix is for: a boundary inside the trampoline's epilogue;
+- a long run reaches `Registry initialization start:............ done`, starts
+  the `x3` threads and then parks in the VSH's polling loop - main walks the
+  `0xB0FAC0DE`-tagged table at `0x529D80` with `sys_cond_wait` (0x6B) and
+  `sys_mutex` calls and the four workers ping-pong on one condition.
+
+What the run still does not do is reach `sys_rsx`: `0x29A`/`0x29C`/`0x29E`
+appear zero times, so `cellGcmInit` is never reached and nothing has been
+composited by the VSH itself yet.  The park loop is a *waiting* state, not a
+crash; the question it leaves is which service the VSH is waiting on before it
+opens the display.
+
+Two things the run does say about that question.  There are **no** `answering
+-1` reports in it, so nothing the VSH calls is missing from the model's import
+table - the display path is not being refused, it is not being asked for.  And
+the console now prints its own diagnostics:
+
+```
+ps3-ppu console: Registry initialization start:............ done
+```
+
+### The VSH's media eject tracker and IPC ports
+
+That line used to be preceded by a VSH-side failure, and chasing it found a
+real gap in the event service:
+
+```
+ps3-ppu console: InitializeMediaEjectTrackerCollection failed: 80031252
+```
+
+The tracker creates an event port, connects it to the peer's IPC key with
+`sys_event_port_connect_ipc` (0x8C), sends one event and treats a failed send as
+a failed collection.  The model returned **0** from the connect without
+recording anything, so the port stayed unconnected and the send came back
+`ENOTCONN` (0x80010016) - an error from a call the VSH had been told had
+succeeded.  `0x80031252` is the VSH's own code for that.
+
+Refusing the connect the way lv2 does when no queue carries the key (ESRCH,
+0x80010005, which is what RPCS3 returns) is worse here: the VSH retries the
+connect in a loop, because on a console the queue it wants belongs to a system
+process this model does not run.  The service now models the peer instead:
+
+| call | behaviour |
+| --- | --- |
+| `sys_event_port_create` | records the port's kind (`LOCAL` 1, `IPC` 3), as lv2 does |
+| `connect_local` | the queue must exist and the port must be a local one, else `EINVAL`/`ESRCH`; a second connect is `EISCONN` (0x80010015) |
+| `connect_ipc` | key 0 and a non-IPC port are `EINVAL`, a second connect is `EISCONN`; a queue with that key is bound, and **without one** the connection is accepted and the key remembered - the peer is a process the model does not run |
+| `send` | binds the queue late if the guest has created it since, and a send with no taker is accepted and discarded, which is what an event's fate is when nobody reads its queue |
+| `disconnect` | drops the binding and the key |
+
+With that, `InitializeMediaEjectTrackerCollection failed` is gone from the
+console and the run still reaches `Registry initialization start:............
+done`, still starts its 21 threads, and is still byte-identical between runs
+(97 lines, two runs).
+
+A failed `sys_fs_open` now names its path under `ppu-trace`, because that is
+the usual reason a boot stops early and the guest itself only ever sees
+`ENOENT`.  The first thing it shows is the VSH looking for two marker files
+that a console which has never been updated does not have, and handling both:
+
+```
+ps3-ppu: lv2: open(/dev_flash2/turn_hdd) -> ...: No such file or directory (lr=0x62A664)
+ps3-ppu: lv2: open(/dev_flash2/post_update) -> ...: No such file or directory (lr=0x62A664)
+```
+
+### What the VSH is still waiting for
+
+The display path is not in the run at all: no `sys_rsx` call, no `cellGcmInit`,
+no `cellVideoOut`, and only two PRX loads (`libfs_utility2`, `sys_audio`).  The
+console's own boot does not start `vsh.self` first - lv2 starts
+`/dev_flash/sys/internal/sys_init_osd.self`, which brings the video/audio output
+up and then hands the machine to `vsh.self`.  The model enters `vsh.self`
+directly, so the VSH runs without the process that owns the IPC keys it
+connects to (the `key 0x2` port above is one of them) and without whatever
+message tells it the OSD is ready.  That is the next thing to build: a first
+stage that runs `sys_init_osd` (or the part of it that brings the display up)
+before `vsh.self`, instead of entering the XMB application as process one.
+
+The first experiment says where that work starts.  `sys_init_osd.self` does
+load and enter through the same path (`vsh-self=...`): entry `0x40528`, code
+`0x1022C`, TOC `0x49CD8`, two segments totalling 0x198528 bytes.  It then dies
+**before its first syscall**:
+
+```
+ps3-ppu: program interrupt at pc 0x700 (srr0=0x700, lr=0x103a8,
+         ctr=0x39800000, r31=0x1, msr=0x8000000000001000)
+```
+
+`lr` is inside its own C-runtime start-up, so the fault is a call through an
+import thunk whose slot was never linked.  The reason is visible in what the
+run does *not* print: `vsh.self` reports `process imports: 2 of 2118
+function(s) linked over 36 libraries`, while `sys_init_osd` reports nothing,
+because `ps3_lv2_link_process` looks for PRX stub entries inside the image and
+finds none in this one.  A process's imports are resolved by lv2 through the
+`sys_process_param` structure before entry, and that path is what the next
+stage needs - the stub scan alone covers `vsh.self` and not its forerunner.
+
+A note on cost: the `-icount` runs are deterministic but slow - 300 ticks take
+45 s on this host, i.e. about 6.5 slices a second, so 1200 ticks is three
+minutes and a boot-to-XMB run would be far longer.  A fault hunt wants that
+determinism; getting further needs the guest to run faster than the model does
+today.
 
 A second, earlier fault in the same family shows up on the `x3` workers, and it
 is the one to chase first because it happens before the main thread's:

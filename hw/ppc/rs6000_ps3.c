@@ -89,6 +89,7 @@
 #include "system/runstate.h"
 #include "system/system.h"
 #include "system/kvm.h"
+#include "exec/icount.h"
 #ifdef CONFIG_HVF
 #include "system/hvf.h"
 #endif
@@ -561,9 +562,102 @@ typedef struct PS3EventQueue {
 typedef struct PS3EventPort {
     bool used;
     uint32_t id;
+    uint32_t type;              /* SYS_EVENT_PORT_LOCAL or _IPC */
     int eq;                     /* index into the queue table, -1 if none */
+    uint64_t key;               /* IPC key, when the peer is not in the model */
     uint64_t name;
 } PS3EventPort;
+
+/*
+ * The RSX.
+ *
+ * lv2's sys_rsx is the interface the console's graphics library (cellGcmSys)
+ * is built on, and every constant below is one of its contracts with that
+ * library: the layout of the driver info page lv2 hands out (RPCS3's
+ * RsxDriverInfo), the DMA control block, the report area, and the io window
+ * cellGcmSys maps its command buffer into.
+ *
+ * The FIFO is a ring of command packets in main memory.  The PPU writes them
+ * and rings the doorbell (context attribute 0x001) with the io offset of its
+ * put pointer; the RSX consumes packets until it reaches put and publishes its
+ * new get pointer.  That is the whole clock of the RSX: no tick drives it.
+ */
+#define PS3_RSX_LOCAL_BASE    0x40000000u
+#define PS3_RSX_LOCAL_SIZE    0x10000000u
+#define PS3_RSX_CONTEXT_ID    0x55555555u
+#define PS3_RSX_MEM_HANDLE    0x5A5A5A5Bu
+#define PS3_RSX_MAIN_SIZE     0x10000000u   /* 256 MiB of XDR the io window covers */
+#define PS3_RSX_IO_PAGES      512           /* io is in 1 MiB pages */
+#define PS3_RSX_TILES         15
+#define PS3_RSX_ZCULLS        8
+#define PS3_RSX_VBLANK_NS     16683300ull   /* 59.94 Hz */
+
+/* RsxDriverInfo: the page cellGcmSys reads and writes. */
+#define PS3_RSX_DI_VERSION    0x000
+#define PS3_RSX_DI_GPU        0x004
+#define PS3_RSX_DI_MEM_SIZE   0x008
+#define PS3_RSX_DI_CHANNEL    0x00C
+#define PS3_RSX_DI_NVCORE     0x010
+#define PS3_RSX_DI_MEMFREQ    0x014
+#define PS3_RSX_DI_NOTIFY     0x02C
+#define PS3_RSX_DI_REPORTS    0x030
+#define PS3_RSX_DI_REPTABLE   0x034
+#define PS3_RSX_DI_SYSMODE    0x054
+#define PS3_RSX_DI_HEAD       0x10B8
+#define PS3_RSX_DI_HEAD_STRIDE 0x40
+#define PS3_RSX_DI_HANDLERS   0x12C0
+#define PS3_RSX_DI_USERCMD    0x12CC
+#define PS3_RSX_DI_QUEUE      0x12D0
+#define PS3_RSX_DI_LASTERROR  0x12F4
+#define PS3_RSX_DI_SIZE       0x12F8
+
+#define PS3_RSX_HEAD_FLIPTIME 0x00
+#define PS3_RSX_HEAD_FLAGS    0x08
+#define PS3_RSX_HEAD_OFFSET   0x0C
+#define PS3_RSX_HEAD_FLIPID   0x10
+#define PS3_RSX_HEAD_QUEUED   0x14
+#define PS3_RSX_HEAD_VTLOW    0x1C
+#define PS3_RSX_HEAD_SECONDT  0x20
+#define PS3_RSX_HEAD_VCOUNT   0x30
+#define PS3_RSX_HEAD_VTHIGH   0x3C
+
+/* RsxDmaControl and RsxReports. */
+#define PS3_RSX_DMA_PUT       0x40
+#define PS3_RSX_DMA_GET       0x44
+#define PS3_RSX_DMA_REF       0x48
+#define PS3_RSX_REPORTS_SIZE  0x9400    /* 1024 semaphores, 64 notify, 2048 report */
+#define PS3_RSX_NOTIFY_OFF    0x1000
+#define PS3_RSX_REPORT_OFF    0x1400
+
+/* The handler bits events are filtered against, as RPCS3 names them. */
+#define PS3_RSX_EVENT_VBLANK      (1ull << 1)
+#define PS3_RSX_EVENT_FLIP_BASE   (1ull << 3)
+#define PS3_RSX_EVENT_QUEUE_BASE  (1ull << 5)
+#define PS3_RSX_EVENT_USER_CMD    (1ull << 7)
+#define PS3_RSX_EVENT_SECOND_BASE (1ull << 10)
+
+/* FIFO packet kinds (RPCS3's RSX_METHOD_* masks). */
+#define PS3_RSX_CALL_EMPTY    0x00000003u
+
+/* The two method registers the display path needs to render a clear. */
+#define PS3_RSX_SET_CLEAR     0x764       /* NV4097_SET_COLOR_CLEAR_VALUE */
+#define PS3_RSX_CLEAR_SURFACE 0x765       /* NV4097_CLEAR_SURFACE */
+#define PS3_RSX_SET_TARGET    0x088       /* NV4097_SET_SURFACE_COLOR_TARGET */
+#define PS3_RSX_SET_FORMAT    0x082       /* NV4097_SET_SURFACE_FORMAT */
+#define PS3_RSX_SET_PITCH_A   0x083       /* NV4097_SET_SURFACE_PITCH_A */
+#define PS3_RSX_SET_OFFSET_A  0x084       /* NV4097_SET_SURFACE_COLOR_AOFFSET */
+#define PS3_RSX_SET_BEGIN_END 0x602       /* NV4097_SET_BEGIN_END */
+
+typedef struct PS3RsxTile {
+    bool bound;
+    uint32_t location, offset, size, pitch, comp, base;
+} PS3RsxTile;
+
+typedef struct PS3RsxZcull {
+    bool bound;
+    uint32_t width, height, cull_start, offset;
+    uint32_t z_format, aa_format, dir, format, func, ref, mask;
+} PS3RsxZcull;
 
 /*
  * The synchronization the VSH's thread pool is built on.  A thread that has
@@ -765,16 +859,32 @@ struct PS3BootROMState {
     /*
      * The RSX.  Its local memory is real memory the guest can map with
      * sys_rsx_context_iomap, and the display buffers cellGcmSys points it at
-     * live there, which is what the scanout reads.  The FIFO front end tracks
-     * put/get exactly as RPCS3's sys_rsx does; the command pipeline behind it
-     * is a decoder, not yet a renderer.
+     * live there, which is what the scanout reads.  The device is made of the
+     * three areas lv2 hands lv2's graphics library - DMA control, driver info
+     * and reports - the io window the library maps its FIFO into, and the FIFO
+     * consumer, which runs on the doorbell rather than on a tick.
      */
     MemoryRegion rsx_local;
     bool rsx_ready;
-    uint32_t rsx_get, rsx_put;
-    uint32_t rsx_context;
+    uint32_t rsx_context;           /* 0x55555555 while a context exists */
+    uint32_t rsx_mem_handle;
+    bool rsx_mem_allocated;
+    uint32_t rsx_local_size;
+    uint32_t rsx_dma, rsx_driver, rsx_reports;
+    uint32_t rsx_event_port, rsx_event_queue;
+    uint32_t rsx_get, rsx_put;      /* io offsets from the last doorbell */
+    uint32_t rsx_iomap_ea[PS3_RSX_IO_PAGES];
+    uint8_t rsx_iomap_used[PS3_RSX_IO_PAGES];
     uint32_t rsx_db_offset[8], rsx_db_pitch[8], rsx_db_w[8], rsx_db_h[8];
-    uint32_t rsx_db_last_queued;
+    unsigned rsx_db_count;          /* highest display buffer + 1 */
+    uint32_t rsx_head_queued[2], rsx_head_flags[2];
+    bool rsx_vsync, rsx_second_vhandler;
+    uint32_t rsx_surface_format, rsx_surface_pitch, rsx_surface_offset;
+    uint32_t rsx_surface_target, rsx_clear_color, rsx_begin_end;
+    uint64_t rsx_vblanks, rsx_flips, rsx_methods, rsx_draws;
+    PS3RsxTile rsx_tiles[PS3_RSX_TILES];
+    PS3RsxZcull rsx_zculls[PS3_RSX_ZCULLS];
+    QEMUTimer *rsx_vblank_timer;
     unsigned rsx_methods_logged;
     /*
      * The container's bump pointer lives here, not at RAM 0x808.  0x808 is
@@ -1063,6 +1173,7 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
 #define PS3_LV2_EISDIR  ((int32_t)0x80010012)
 #define PS3_LV2_EEXIST  ((int32_t)0x80010014)
 #define PS3_LV2_ENOTCONN ((int32_t)0x80010016)
+#define PS3_LV2_EISCONN ((int32_t)0x80010015)
 #define PS3_LV2_EAGAIN  ((int32_t)0x80010001)
 #define PS3_LV2_ETIMEDOUT ((int32_t)0x8001000B)
 #define PS3_LV2_EACCES  ((int32_t)0x80010029)
@@ -4277,10 +4388,13 @@ static void ps3_thread_restore(const PS3Thread *t, CPUPPCState *env)
     env->ctr = t->ctr;
     env->xer = t->xer;
     /*
-     * SRR0/SRR1 are deliberately left alone: only a thread stopped inside the
-     * lv2 trampoline carries meaningful ones, and switches are held off until
-     * the call has returned (ps3_sched_tick), so they are stale by then.
+     * SRR0/SRR1 belong to the thread too.  A thread can be switched out in
+     * the trampoline's own epilogue - between the restores and the `rfid` -
+     * and that `rfid` loads SRR0/SRR1: leaving them to the thread that ran in
+     * between would return this one through another thread's exception.
      */
+    env->spr[SPR_SRR0] = t->srr0;
+    env->spr[SPR_SRR1] = t->srr1;
     memcpy(env->crf, t->crf, sizeof(t->crf));
     /*
      * Through ppc_store_msr, not a plain assignment: the core caches the MSR
@@ -4367,8 +4481,9 @@ static void ps3_event_store(uint8_t *ram, uint64_t ram_size, uint32_t ea,
  * the `sc`, which is exactly what ps3_sched_apply reconstructs for a call it
  * completes in place; this is the same epilogue on a saved context.
  */
-static void ps3_thread_finish_call(PS3Thread *t, uint8_t *ram,
-                                   uint64_t ram_size, uint32_t ret)
+static void ps3_thread_finish_call(PS3BootROMState *s, PS3Thread *t,
+                                   uint8_t *ram, uint64_t ram_size,
+                                   uint32_t ret)
 {
     uint32_t sp = (uint32_t)t->gpr[1];
     unsigned i;
@@ -4384,6 +4499,14 @@ static void ps3_thread_finish_call(PS3Thread *t, uint8_t *ram,
         }
         t->gpr[0] = ps3_be32(ram + sp + 0x08);
         t->gpr[1] = sp + 0x20;
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: fold: thread 0x%X wake: sp 0x%X -> 0x%X "
+                        "nip 0x%" PRIX64 " srr0 0x%X ret 0x%X", t->id, sp,
+                        (uint32_t)t->gpr[1], t->nip, (uint32_t)t->srr0, ret);
+        }
+    } else if (s->ppu_trace) {
+        info_report("ps3-ppu: fold: thread 0x%X wake: sp 0x%X already "
+                    "collected, ret 0x%X", t->id, sp, ret);
     }
     if (t->srr0) {
         t->nip = t->srr0;
@@ -4429,7 +4552,7 @@ static bool ps3_eq_wake(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
         t->gpr[5] = ev.data1;
         t->gpr[6] = ev.data2;
         t->gpr[7] = ev.data3;
-        ps3_thread_finish_call(t, ram, ram_size, 0);
+        ps3_thread_finish_call(s, t, ram, ram_size, 0);
         return true;
     }
     return false;
@@ -4670,7 +4793,7 @@ static void ps3_sem_handoff(PS3BootROMState *s, uint8_t *ram,
         }
         s->sem[m].count--;
         t->wait_sem_id = 0;
-        ps3_thread_finish_call(t, ram, ram_size, 0);
+        ps3_thread_finish_call(s, t, ram, ram_size, 0);
         return;
     }
 }
@@ -4693,7 +4816,7 @@ static void ps3_mutex_handoff(PS3BootROMState *s, uint8_t *ram,
         }
         s->mtx[m].owner = t->id;
         t->wait_mutex_id = 0;
-        ps3_thread_finish_call(t, ram, ram_size, 0);
+        ps3_thread_finish_call(s, t, ram, ram_size, 0);
         return;
     }
 }
@@ -4720,7 +4843,7 @@ static void ps3_cond_wake(PS3BootROMState *s, uint8_t *ram,
         m = ps3_mutex_index(s, s->cond[c].mutex);
         if (m >= 0 && !s->mtx[m].owner) {
             s->mtx[m].owner = t->id;
-            ps3_thread_finish_call(t, ram, ram_size, 0);
+            ps3_thread_finish_call(s, t, ram, ram_size, 0);
         } else if (m >= 0) {
             t->wait_mutex_id = s->mtx[m].id;
         }
@@ -4754,7 +4877,7 @@ static void ps3_eq_expire(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size)
         }
         t->gpr[4] = t->gpr[5] = t->gpr[6] = t->gpr[7] = 0;
         /* A sleep ends normally; every other wait reports the timeout. */
-        ps3_thread_finish_call(t, ram, ram_size,
+        ps3_thread_finish_call(s, t, ram, ram_size,
                                t->wait_eq == -1 ? 0 : PS3_LV2_ETIMEDOUT);
     }
 }
@@ -4832,20 +4955,34 @@ static void ps3_sched_apply(CPUState *cs, run_on_cpu_data data)
         uint8_t *ram = memory_region_get_ram_ptr(s->ram);
         uint64_t ram_size = memory_region_size(s->ram);
         uint32_t sp = env->gpr[1];
+        uint64_t from = env->nip;
         uint32_t cr;
         unsigned i;
 
         if (env->nip < 0xC28 || (uint64_t)sp + 0x14 > ram_size) {
             return;                     /* the call is still in flight */
         }
+        /*
+         * 0xC28..0xC3C are the trampoline's collection of the result; from
+         * 0xC40 on it has started restoring the caller, `addi r1' included.
+         * Folding a frame the trampoline has already restored steps r1 past
+         * the caller's own frame, whose epilogue then reads a local as the
+         * saved LR and returns into the stack - the null-LR fault.  The
+         * epilogue is safe to preempt in now that SRR0/SRR1 travel with the
+         * thread: resuming at 0xC50 finishes the `addi' and the `rfid'.
+         */
+        if (env->nip >= 0xC40) {
+            s->sched_pending = false;
+            ps3_sched_switch(s, env);
+            return;
+        }
 
         /*
-         * 0xC28..0xC3C are the trampoline's own collection of the result:
-         * r3 comes from the scratch block and the exit flag from the word
-         * after it.  Skipping them left the caller's r3 (a pointer) as the
-         * call's return value, which read as an error - the stdio lock
-         * initialiser called abort() over a sys_lwmutex_create that had in
-         * fact succeeded.
+         * The collection itself: r3 comes from the scratch block and the exit
+         * flag from the word after it.  Skipping it left the caller's r3 (a
+         * pointer) as the call's return value, which read as an error - the
+         * stdio lock initialiser called abort() over a sys_lwmutex_create
+         * that had in fact succeeded.
          */
         env->gpr[3] = ps3_be32(ram + PS3_LV2_SCRATCH);
         if (s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
@@ -4889,6 +5026,12 @@ static void ps3_sched_apply(CPUState *cs, run_on_cpu_data data)
         env->gpr[1] = sp + 0x20;
         env->nip = env->spr[SPR_SRR0];
         s->thr[s->thr_cur].call_collected = true;
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: fold: thread 0x%X apply at 0x%" PRIX64
+                        ": sp 0x%X -> 0x%X nip 0x%" PRIX64,
+                        s->thr[s->thr_cur].id, from,
+                        sp, (uint32_t)env->gpr[1], (uint64_t)env->nip);
+        }
         /* The MSR the trampoline's rfid would load, through the same path. */
         ppc_store_msr(env, env->spr[SPR_SRR1]);
     }
@@ -8522,7 +8665,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         for (j = 0; j < PS3_THREAD_MAX; j++) {
             if (s->thr[j].used && s->thr[j].parked &&
                 s->thr[j].wait_eq == q) {
-                ps3_thread_finish_call(&s->thr[j], ram, ram_size,
+                ps3_thread_finish_call(s, &s->thr[j], ram, ram_size,
                                        PS3_LV2_ESRCH);
             }
         }
@@ -8610,6 +8753,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         memset(&s->ep[idx], 0, sizeof(s->ep[idx]));
         s->ep[idx].used = true;
         s->ep[idx].id = ++s->lv2_next_id;
+        s->ep[idx].type = a1;
         s->ep[idx].eq = -1;
         s->ep[idx].name = a2;
         ps3_put_be32(ram + a0, s->ep[idx].id);
@@ -8635,6 +8779,16 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_ESRCH;
             break;
         }
+        /* lv2 checks the port's kind, as RPCS3's does: a local port can only
+         * take a local queue and an IPC port only a key. */
+        if (s->ep[p].type != 1) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (s->ep[p].eq >= 0) {
+            ret = PS3_LV2_EISCONN;
+            break;
+        }
         s->ep[p].eq = q;
         ret = 0;
         break;
@@ -8647,13 +8801,62 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_ESRCH;
             break;
         }
-        /* A queue of that name is the sending end; otherwise the peer is in
-         * another process, which this model does not have. */
+        if (!a1) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (s->ep[p].type != 3) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        if (s->ep[p].eq >= 0) {
+            ret = PS3_LV2_EISCONN;
+            break;
+        }
+        /*
+         * A queue of that key is the sending end; otherwise the peer is in
+         * another process, which this model does not have.  lv2 answers that
+         * case with ESRCH rather than pretending the port is connected - a
+         * caller that then sends gets ENOTCONN from a call it had no reason
+         * to expect failure from, which is how the VSH's media eject tracker
+         * reported its failure.
+         */
         for (j = 0; j < PS3_EQ_MAX; j++) {
             if (s->eq[j].used && s->eq[j].key == a1) {
                 s->ep[p].eq = j;
                 break;
             }
+        }
+        if (s->ep[p].eq < 0) {
+            /*
+             * The peer is a process this model does not run (sysmgr and the
+             * other system tasks own most of these keys).  Accepting the
+             * connection is what a console with those processes running looks
+             * like from here, and refusing it is worse than accepting: the
+             * VSH's media eject tracker retries a refused connect forever.
+             * The key is kept so a send can still find the queue if the guest
+             * creates it later, and a send with no taker is discarded - the
+             * same fate an event has when nobody reads its queue.
+             */
+            s->ep[p].key = a1;
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: event_port_connect_ipc: port 0x%X "
+                            "key 0x%" PRIX64 ": no peer in the model, "
+                            "sends are dropped", s->ep[p].id,
+                            (uint64_t)a1);
+            }
+        }
+        /*
+         * RPCS3's lv2 refuses the connection with ESRCH when no queue carries
+         * that key, so a caller that gets 0 from here expects its send to be
+         * delivered.  Say what was asked for and what answered, so a caller
+         * that then takes an error path can be traced to this call.
+         */
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: event_port_connect_ipc: port 0x%X "
+                        "key 0x%" PRIX64 " (%s)", s->ep[p].id,
+                        (uint64_t)a1, s->ep[p].eq >= 0 ? "queue found" :
+                        "no queue with that key");
         }
         ret = 0;
         break;
@@ -8666,6 +8869,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
         s->ep[p].eq = -1;
+        s->ep[p].key = 0;
         ret = 0;
         break;
     }
@@ -8679,7 +8883,29 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
         q = s->ep[p].eq;
+        if (q < 0 && s->ep[p].key) {
+            /* Late binding: the guest may have created the peer queue. */
+            unsigned j;
+
+            for (j = 0; j < PS3_EQ_MAX; j++) {
+                if (s->eq[j].used && s->eq[j].key == s->ep[p].key) {
+                    s->ep[p].eq = q = j;
+                    break;
+                }
+            }
+        }
         if (q < 0) {
+            if (s->ep[p].key) {
+                /* No peer, no taker: the event is accepted and discarded. */
+                ret = 0;
+                break;
+            }
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: event_port_send: port 0x%X "
+                            "(name 0x%X) is not connected, answering "
+                            "ENOTCONN (lr=0x%" PRIX64 ")", s->ep[p].id,
+                            s->ep[p].name, (uint64_t)cpu->env.lr);
+            }
             ret = PS3_LV2_ENOTCONN;
             break;
         }
@@ -8742,7 +8968,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         for (j = 0; j < PS3_THREAD_MAX; j++) {
             if (s->thr[j].used && s->thr[j].parked &&
                 s->thr[j].wait_mutex_id == a0) {
-                ps3_thread_finish_call(&s->thr[j], ram, ram_size,
+                ps3_thread_finish_call(s, &s->thr[j], ram, ram_size,
                                        PS3_LV2_ESRCH);
             }
         }
@@ -8917,7 +9143,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         for (j = 0; j < PS3_THREAD_MAX; j++) {
             if (s->thr[j].used && s->thr[j].parked &&
                 s->thr[j].wait_sem_id == a0) {
-                ps3_thread_finish_call(&s->thr[j], ram, ram_size,
+                ps3_thread_finish_call(s, &s->thr[j], ram, ram_size,
                                        PS3_LV2_ESRCH);
             }
         }
@@ -10316,6 +10542,18 @@ static void ps3_lv2_service(PS3BootROMState *s)
         int host_flags, hfd, gfd;
 
         if (!host) {
+            /* Name the path: a missing one is what a boot that stops early
+             * is usually waiting on, and the guest only sees ENOENT. */
+            if (s->ppu_trace) {
+                char path[160];
+
+                if (ps3_lv2_guest_string(ram, ram_size, a0, path,
+                                         sizeof(path))) {
+                    info_report("ps3-ppu: lv2: open(%s): no such path in "
+                                "the model (lr=0x%" PRIX64 ")", path,
+                                (uint64_t)cpu->env.lr);
+                }
+            }
             ret = PS3_LV2_ENOENT;
             break;
         }
@@ -10350,6 +10588,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
 
         hfd = g_open(host, host_flags, a3 ? a3 : 0644);
         if (hfd < 0) {
+            if (s->ppu_trace) {
+                char path[160];
+
+                ps3_lv2_guest_string(ram, ram_size, a0, path, sizeof(path));
+                info_report("ps3-ppu: lv2: open(%s) -> %s: %s (lr=0x%" PRIX64
+                            ")", path, host, strerror(errno),
+                            (uint64_t)cpu->env.lr);
+            }
             ret = ps3_lv2_fs_error(errno);
             break;
         }
@@ -12589,6 +12835,21 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
     if (s->vsh_run) {
         CPUState *cs = qemu_get_cpu(0);
         PowerPCCPU *cpu;
+
+        /*
+         * Thread slices end on a 1 ms timer, and without icount that timer
+         * follows the host's clock rather than the guest's instructions: the
+         * state a thread is preempted in then depends on how fast the host
+         * happened to run, so two runs of the same guest stop in different
+         * places.  Say so once, because a debugging run is worthless if the
+         * run before it could never have matched.
+         */
+        if (!icount_enabled()) {
+            info_report("ps3-vsh: note: no -icount, so thread slices follow "
+                        "host time and this run is not reproducible; add "
+                        "-icount shift=6,sleep=off for a run that stops in "
+                        "the same place every time");
+        }
         uint32_t code = entry, rtoc = 0;
 
         if (!cs) {
