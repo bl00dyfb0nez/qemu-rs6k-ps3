@@ -1,0 +1,155 @@
+# Build the rs6000-ps3 machine on every host the model targets.
+#
+# One job per host, two architectures each.  Every job configures the same
+# minimal tree the model is developed against - only ppc64-softmmu, TCG, SDL for
+# the guest window - builds it with ninja, and then proves the binary it produced
+# actually carries the machine and the display backend: `-M help` must list
+# rs6000-ps3 and `-display help` must list sdl.  A build that links but registers
+# nothing would pass a bare compile, so the smoke test is the last step.
+
+name: PS3 model build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-26.04
+          - arch: arm64
+            runs-on: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config python3 python3-venv \
+            libglib2.0-dev libpixman-1-dev libsdl2-dev
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          ../configure --target-list=ppc64-softmmu \
+            --enable-tcg --enable-sdl --disable-werror --disable-docs \
+            --disable-guest-agent --disable-tools --disable-tests
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Smoke test the machine and the display backend
+        run: |
+          test -x build/qemu-system-ppc64
+          ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
+          ./build/qemu-system-ppc64 -display help | grep -qw sdl
+          ./build/qemu-system-ppc64 --version
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: windows-2025
+            msystem: UCRT64
+            packages: >-
+              mingw-w64-ucrt-x86_64-gcc
+              mingw-w64-ucrt-x86_64-ninja
+              mingw-w64-ucrt-x86_64-pkgconf
+              mingw-w64-ucrt-x86_64-glib2
+              mingw-w64-ucrt-x86_64-pixman
+              mingw-w64-ucrt-x86_64-python
+              mingw-w64-ucrt-x86_64-SDL2
+          - arch: arm64
+            runs-on: windows-11-arm
+            msystem: CLANGARM64
+            packages: >-
+              mingw-w64-clang-aarch64-clang
+              mingw-w64-clang-aarch64-ninja
+              mingw-w64-clang-aarch64-pkgconf
+              mingw-w64-clang-aarch64-glib2
+              mingw-w64-clang-aarch64-pixman
+              mingw-w64-clang-aarch64-python
+              mingw-w64-clang-aarch64-SDL2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          install: ${{ matrix.packages }}
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          mkdir -p build
+          cd build
+          ../configure --target-list=ppc64-softmmu \
+            --enable-tcg --enable-sdl --disable-werror --disable-docs \
+            --disable-guest-agent --disable-tools --disable-tests
+
+      - name: Build
+        shell: msys2 {0}
+        run: ninja -C build
+
+      - name: Smoke test the machine and the display backend
+        shell: msys2 {0}
+        run: |
+          test -x build/qemu-system-ppc64.exe
+          ./build/qemu-system-ppc64.exe -M help | grep -qw rs6000-ps3
+          ./build/qemu-system-ppc64.exe -display help | grep -qw sdl
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: macos-13
+          - arch: arm64
+            runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          brew install ninja pkg-config glib pixman sdl2
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip meson
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          PATH="$PWD/../.venv/bin:$PATH" ../configure \
+            --target-list=ppc64-softmmu \
+            --enable-tcg --enable-sdl --disable-werror --disable-docs \
+            --disable-guest-agent --disable-tools --disable-tests \
+            --disable-hvf
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Smoke test the machine and the display backend
+        run: |
+          test -x build/qemu-system-ppc64
+          ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
+          ./build/qemu-system-ppc64 -display help | grep -qw sdl

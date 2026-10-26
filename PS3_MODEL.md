@@ -79,6 +79,17 @@ Sony code is carried in this tree.
 
 ## Build
 
+### CI
+
+`.github/workflows/ps3-build.yml` builds the model on every host it targets -
+Linux, Windows and macOS, each in x64 and arm64 - with the same minimal
+tree the development builds use (`ppc64-softmmu`, TCG, SDL) and then smoke-tests
+the binary: `-M help` must list `rs6000-ps3` and `-display help` must list `sdl`.
+The runners are Ubuntu 26.04 (x64 and arm64), Windows Server 2025 (MSYS2
+UCRT64) and Windows 11 arm64 (MSYS2 CLANGARM64), macOS 13 (x64) and macOS 15
+(arm64).  The workflow has only been validated locally (YAML parse and the same
+configure/ninja steps on the Windows x64 host); it runs on push.
+
 ### Windows (MSYS2, UCRT64)
 
 Packages, once:
@@ -390,6 +401,11 @@ for the entries this front end implements:
 | `INLINE_ARRAY` | appends one word of push-buffer vertex data, packed per the attribute formats |
 | `SET_VIEWPORT_HORIZONTAL`/`_VERTICAL`, `SET_SCISSOR_HORIZONTAL`/`_VERTICAL` | the window transform and the inclusive clip rectangle |
 | `SET_BLEND_ENABLE`, `_FUNC_SFACTOR`, `_FUNC_DFACTOR`, `_BLEND_EQUATION`, `SET_COLOR_MASK` | per-channel blend (add, subtract, reverse subtract, min, max) and the write mask |
+| `SET_TRANSFORM_PROGRAM_LOAD`, `SET_TRANSFORM_PROGRAM` + 0..31, `SET_TRANSFORM_PROGRAM_START` | the vp40 program buffer and its entry instruction |
+| `SET_TRANSFORM_CONSTANT_LOAD`, `SET_TRANSFORM_CONSTANT` + 0..31 | the vp40 constant bank (512 vec4) |
+| `SET_SHADER_PROGRAM` | the fp40 program's address; bits 0..1 select local or main memory |
+| `SET_SHADER_CONTROL` | the shader control word (kept; the model reads the alpha-test and flat-shading bits from it where they apply) |
+| `SET_TEXTURE_*` + 0..127 | sixteen texture units, eight methods each: offset, format, address, control0/1, filter, image rectangle, border colour |
 
 Draw calls do not rasterize on their own.  They append vertex ranges to the open
 clause and the closing `SET_BEGIN_END(0)` walks them, which is how a triangle
@@ -397,27 +413,53 @@ strip can span several draw calls; a new `SET_BEGIN_END(primitive)` flushes a
 clause that was left open.  The clause holds up to 1024 ranges and 16 KiB of
 inline words, and a draw is capped at a million vertices.
 
-Rasterizing then runs the vertex pipeline the model has: attribute 0 is the
-position and the first 3- or 4-component attribute among 1, 3, 2, 4 is the
-colour (`white` when none is enabled).  Positions that look like clip space -
-`|x|, |y| <= 1.5` and `0 < w <= 2` for most of the batch - go through the
-viewport (perspective divide, the y flip the surface's top-left origin needs);
-positions that are already pixel-sized are the 2D interface path and are used as
-window coordinates.  Points, lines, line loops and strips, triangles, triangle
-strips and fans, quads, quad strips and polygons are all assembled, then filled
-with an incremental edge-function rasterizer and linear colour interpolation.
-A fragment is blended and colour-masked, then written into the surface, which
-may be local memory or a main-memory range mapped by `sys_rsx_context_iomap`.
-Flips are unaffected: the scanout reads whatever the draws left in the buffer.
+### The shaders
 
-What this is not: there is no vp40/fp40 execution, so the vertex and fragment
-programs the guest loaded are not run and the colour attribute stands in for the
-shader's output; there is no texture unit (texture state, formats and sampling),
-no depth or stencil test, no culling, no anti-aliasing, no MRT beyond target A,
-no tiled surface decode, and no copy engine.  Immediate-mode vertex elements
+Rasterizing runs the two shader stages the guest loaded, and falls back to the
+attribute path only when no program is present.
+
+| Stage | What the model executes |
+| --- | --- |
+| vertex (vp40) | `SET_TRANSFORM_PROGRAM_LOAD`/`SET_TRANSFORM_PROGRAM` (32 methods, slotted as RPCS3 does: `load * 4 + index % 4`) and `..._START`; 512 instructions, sixteen temporaries, an address register and the 512-vec4 constant bank.  `MOV`, `MUL`, `ADD`, `MAD`, `DP3`, `DP4`, `DST`, `MIN`, `MAX`, `SLT`, `SGE`, `ARL`, `FRC`, `FLR`, `SEQ`, `SFL`, `SGT`, `SLE`, `SNE`, `STR`, `SSG`, with writemasks, `_sat`, source swizzle/abs/neg, input attributes, the constant bank and the double destination.  Output 0 is the clip-space position; output 1 is the diffuse colour |
+| fragment (fp40) | `SET_SHADER_PROGRAM` names the program (bits 0..1 select local or main memory); the model copies it out with its header and inline constants.  The interpreter is RPCS3's decoder: sixteen temporaries, source swizzle/abs/neg/scale, destination masks and `_sat`, the constant slot after an instruction, `MOV`..`SEQ`, `FRC`, `FLR`, `RCP`, `RSQ`, `EX2`, `LG2`, `LIT`, `LRP`, `STR`, `SFL`, `COS`, `SIN`, `POW`, `DP2`, `DP2A`, `NRM`, `DIV`, `DIVSQ`, `REFL`, `KIL` and the texture ops.  Register 0 is the colour; an opcode the interpreter does not have refuses the program and the attribute path takes over |
+| varyings | the fp's inputs are the vp's outputs, mapped as RPCS3's `reg_table` does: `COL0` = output 1, `COL1` = 2, `FOGC` = 5, `TEX0..7` = 7..14, `TEX8` = 15, `TEX9` = 6, `WPOS` the interpolated position and `SSA` the facing.  Interpolation is linear in window space |
+| textures | `SET_TEXTURE_OFFSET`/`_FORMAT`/`_ADDRESS`/`_CONTROL0`/`_CONTROL1`/`_FILTER`/`_IMAGE_RECT`, eight methods per unit, sixteen units.  Swizzled and linear layouts, nearest and bilinear filtering, repeat, mirrored repeat and clamp.  A8R8G8B8, D8R8G8B8, B8, G8B8, R5G6B5, R6G5B5, A1R5G5B5, A4R4G4B4, R5G5B5A1, D1R5G5B5, X16, Y16_X16, DXT1, DXT2/3 and DXT4/5 |
+
+The vertex stage runs per vertex and writes clip space, so a shaded draw always
+goes through the viewport instead of the pixel-sized heuristic the attribute
+path needs.  Without a program the attribute path is what runs: attribute 0 is
+the position and the first 3- or 4-component attribute among 1, 3, 2, 4 is the
+colour (`white` when none is enabled), and positions that are already
+pixel-sized are used as window coordinates.  Points, lines, line loops and
+strips, triangles, triangle strips and fans, quads, quad strips and polygons are
+assembled and filled with an incremental edge-function rasterizer; the fragment
+stage runs per pixel.  A fragment is blended and colour-masked, then written
+into the surface, which may be local memory or a main-memory range mapped by
+`sys_rsx_context_iomap`.  Flips are unaffected: the scanout reads whatever the
+draws left in the buffer.
+
+What this is not: no mipmap chains, no shader branches or pack/unpack
+instructions, no perspective-correct interpolation, no depth or stencil test, no
+culling, no anti-aliasing, no MRT beyond target A, no tiled surface decode, no
+fog unit and no copy engine.  Immediate-mode vertex elements
 (`ARRAY_ELEMENT16`/`32`) are counted and refused once, with a log line;
 `cellGcmSys` itself draws from vertex arrays.  Cursor packages are accepted so a
 library that sets a cursor runs; the hardware cursor is not drawn.
+
+A draw reports how many of its pixels went through the fragment program, so a
+run tells the two paths apart:
+
+```
+ps3-rsx: fragment program at 0x0F000000 (16384 bytes, local)
+ps3-rsx: draw done: 6 primitive(s), 19200 pixel(s), 19200 shaded by the fp40
+```
+
+Status: the pipeline is in the model and the draw test below still passes
+through it (with no program loaded it takes the attribute path, and reports
+`0 shaded by the fp40`).  The real VSH run has not drawn through it yet: its
+main thread still parks joining the `_libavst_receiver_thread_entry` worker
+before `cellGcmInit`, so the window keeps the boot screen rather than an XMB
+frame.  That park is the next thing to solve, and the shaders are ready for it.
 
 #### The draw test
 

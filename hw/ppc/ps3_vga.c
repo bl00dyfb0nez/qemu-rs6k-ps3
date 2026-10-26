@@ -125,6 +125,14 @@ struct PS3VGAState {
     QEMUGLContext gl_ctx;
     unsigned gl_tex;
     unsigned gl_fbo;
+    /*
+     * The host GPU the scanout runs on.  Both desktop drivers are used: a 3.2
+     * core context is asked for first and 3.0 is the fallback, and the vendor
+     * is reported so the driver in use is visible in the log.
+     */
+    char gl_vendor[64];
+    char gl_renderer[128];
+    bool gl_nvidia, gl_amd;
 };
 
 #define PS3_VGA_OVERLAY_ROWS 6
@@ -589,6 +597,13 @@ static void ps3_vga_gl_init(PS3VGAState *s)
 
         s->gl_ctx = qemu_console_gl_ctx_create(s->con, &params);
         if (!s->gl_ctx) {
+            /* A 3.0 core context is enough for everything used here, and is
+             * what a driver that refuses 3.2 accepts. */
+            params.major_ver = 3;
+            params.minor_ver = 0;
+            s->gl_ctx = qemu_console_gl_ctx_create(s->con, &params);
+        }
+        if (!s->gl_ctx) {
             if (s->gl_required) {
                 error_report("ps3-vga: the display could not create a GL "
                              "context");
@@ -599,6 +614,32 @@ static void ps3_vga_gl_init(PS3VGAState *s)
         }
 
         qemu_console_gl_ctx_make_current(s->con, s->gl_ctx);
+
+        /*
+         * Which driver the scanout runs on.  NVIDIA and AMD both take the
+         * BGRA upload and the RGBA8 framebuffer, but their context handling
+         * differs - the fallback above is the part that matters, since an AMD
+         * driver can refuse a 3.2 core request on an older runtime - and a
+         * vendor string in the log makes the path in use diagnosable.
+         */
+        {
+            const char *vendor = (const char *)glGetString(GL_VENDOR);
+            const char *renderer = (const char *)glGetString(GL_RENDERER);
+            const char *version = (const char *)glGetString(GL_VERSION);
+
+            snprintf(s->gl_vendor, sizeof(s->gl_vendor), "%s",
+                     vendor ? vendor : "unknown");
+            snprintf(s->gl_renderer, sizeof(s->gl_renderer), "%s",
+                     renderer ? renderer : "unknown");
+            s->gl_nvidia = vendor && strstr(vendor, "NVIDIA");
+            s->gl_amd = vendor && (strstr(vendor, "AMD") ||
+                                   strstr(vendor, "ATI") ||
+                                   strstr(vendor, "Advanced Micro Devices"));
+            info_report("ps3-vga: GL %s on %s (%s)",
+                        version ? version : "?", s->gl_renderer,
+                        s->gl_nvidia ? "NVIDIA" :
+                        s->gl_amd ? "AMD" : s->gl_vendor);
+        }
 
         glGenTextures(1, &tex);
         glBindTexture(GL_TEXTURE_2D, tex);

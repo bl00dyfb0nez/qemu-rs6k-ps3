@@ -698,6 +698,20 @@ typedef struct PS3EventPort {
 #define PS3_RSX_VCONST        512                 /* 8 KiB of constants */
 
 /*
+ * The fragment stage, as RPCS3's nv4097 names it.  The graphics library
+ * uploads the fp40 program into local memory and names its address with
+ * SET_SHADER_PROGRAM; each texture's eight registers start at SET_TEXTURE_OFFSET
+ * and repeat every eight methods.
+ */
+#define PS3_RSX_SET_SHADER_PROGRAM 0x239          /* NV4097_SET_SHADER_PROGRAM */
+#define PS3_RSX_SET_TEXTURE        0x680          /* NV4097_SET_TEXTURE_OFFSET */
+#define PS3_RSX_SET_SHADER_CONTROL 0x758          /* NV4097_SET_SHADER_CONTROL */
+#define PS3_RSX_FPROG_BYTES    16384              /* the program plus its constants */
+#define PS3_RSX_TEX_MAX        16                 /* the fp's texture units */
+#define PS3_RSX_FP_TEMP        16
+#define PS3_RSX_FP_INPUTS      16
+
+/*
  * One vertex after the fetch: the attribute registers as they arrive, and the
  * colour the rasterizer interpolates.  `w' is the position's fourth
  * component, which decides whether the position is clip space or already in
@@ -706,7 +720,19 @@ typedef struct PS3EventPort {
 typedef struct PS3RsxVertex {
     float x, y, z, w;
     float r, g, b, a;
+    /*
+     * The vertex program's output registers: output 0 is the position in the
+     * four fields above, and the fragment stage reads the rest as its
+     * varying inputs (COL0 is output 1, FOGC output 5, TEX0..TEX7 outputs
+     * 7..14, TEX8 output 15 and TEX9 output 6, which is RPCS3's table).
+     */
+    float var[16][4];
 } PS3RsxVertex;
+
+typedef struct PS3RsxTexture {
+    uint32_t offset, format, address, control0, control1, filter;
+    uint32_t image_rect, border;
+} PS3RsxTexture;
 
 typedef struct PS3RsxTile {
     bool bound;
@@ -1037,6 +1063,19 @@ struct PS3BootROMState {
     uint32_t rsx_vconst[PS3_RSX_VCONST][4];
     uint32_t rsx_vconst_load, rsx_vconst_word;
     bool rsx_vprog_ready, rsx_vprog_fallback_reported;
+    /*
+     * The fragment program and the textures it samples.  The program is
+     * copied out of local (or main) memory when SET_SHADER_PROGRAM names it;
+     * ps3_rsx_fprog_run() executes the fp40 for a pixel and
+     * ps3_rsx_tex_sample() reads a texel through the texture registers.
+     */
+    uint8_t rsx_fprog[PS3_RSX_FPROG_BYTES];
+    uint32_t rsx_fprog_addr;
+    unsigned rsx_fprog_len;
+    bool rsx_fprog_ready, rsx_fprog_reported;
+    uint32_t rsx_shader_control;
+    PS3RsxTexture rsx_tex[PS3_RSX_TEX_MAX];
+    uint64_t rsx_shaded;            /* pixels the fp40 produced */
     PS3RsxTile rsx_tiles[PS3_RSX_TILES];
     PS3RsxZcull rsx_zculls[PS3_RSX_ZCULLS];
     QEMUTimer *rsx_vblank_timer;
@@ -8796,11 +8835,12 @@ static bool ps3_rsx_vp_vec(unsigned op, const float a[4], const float b[4],
 /*
  * Run the loaded program for one vertex.  Returns false when there is no
  * program, when it uses an instruction this interpreter does not have, or when
- * it never writes output 0.
+ * it never writes output 0.  The sixteen outputs are what the fragment stage
+ * sees as its varying inputs.
  */
 static bool ps3_rsx_vprog_run(PS3BootROMState *s,
                               const float vin[PS3_RSX_ATTRS][4],
-                              float pos[4], float colour[4], bool *has_colour)
+                              float out[16][4])
 {
     float r[16][4] = { { 0 } }, o[16][4] = { { 0 } };
     bool wrote[16] = { false };
@@ -8808,7 +8848,6 @@ static bool ps3_rsx_vprog_run(PS3BootROMState *s,
     float a0 = 0.0f;
     unsigned pc, steps, i;
 
-    *has_colour = false;
     if (!s->rsx_vprog_ready) {
         return false;
     }
@@ -8889,15 +8928,726 @@ static bool ps3_rsx_vprog_run(PS3BootROMState *s,
         return false;
     }
 
-    memcpy(pos, o[0], sizeof(o[0]));
-    for (i = 1; i < 16; i++) {
+    for (i = 0; i < 16; i++) {
         if (wrote[i]) {
-            memcpy(colour, o[i], sizeof(o[i]));
-            *has_colour = true;
+            memcpy(out[i], o[i], sizeof(o[i]));
+        } else {
+            out[i][0] = 0.0f;
+            out[i][1] = 0.0f;
+            out[i][2] = 0.0f;
+            out[i][3] = 1.0f;
+        }
+    }
+
+    return true;
+}
+
+/*
+ * The fragment program.
+ *
+ * The graphics library uploads an fp40 shader with SET_SHADER_PROGRAM: the
+ * program sits in local (or main) memory behind a small header, and the first
+ * instruction is the first 16-byte slot whose opcode field is not zero.  Each
+ * instruction is four big-endian words - the destination and three sources -
+ * and RPCS3's RSXFragmentProgram.h is the encoding this follows: a source
+ * selects a temporary, an input attribute or a constant (which occupies the
+ * sixteen bytes after the instruction), applies a swizzle, an optional
+ * absolute value and negation, and the opcode produces the vec4 that the
+ * destination mask commits.
+ *
+ * Textures are sampled through the eight registers per unit at
+ * SET_TEXTURE_OFFSET: the format register says where the pixels live and what
+ * they are, the image rectangle gives the size, and the filter register picks
+ * nearest or linear.  Both swizzled and linear textures are read, in the
+ * formats the VSH uses: A8R8G8B8, B8, R5G6B5, A1R5G5B5, A4R4G4B4, G8B8 and
+ * the three DXT variants.
+ */
+
+/* The program's words are big-endian, and the fields are byte-swapped inside
+ * each 16-bit half, which is what RPCS3's from_be32 does. */
+static uint32_t ps3_rsx_fp_word(const uint8_t *p)
+{
+    uint32_t be = ps3_be32(p);
+
+    return ((be & 0x00FF00FFu) << 8) | ((be & 0xFF00FF00u) >> 8);
+}
+
+/* A host pointer for a span in the RSX's local or main memory, or NULL. */
+static const uint8_t *ps3_rsx_mem(PS3BootROMState *s, uint8_t *ram,
+                                  uint64_t ram_size, bool main_mem,
+                                  uint32_t addr, uint32_t span)
+{
+    if (main_mem) {
+        uint32_t ea = ps3_rsx_io_ea(s, addr & 0x0FFFFFFFu);
+
+        if (ea == 0xFFFFFFFFu || (uint64_t)ea + span > ram_size) {
+            return NULL;
+        }
+        return ram + ea;
+    }
+
+    if ((uint64_t)addr + span > s->rsx_local_size) {
+        return NULL;
+    }
+    return memory_region_get_ram_ptr(&s->rsx_local) + addr;
+}
+
+/* One address mode, as the texture address register names it. */
+static int ps3_rsx_wrap(int c, unsigned n, unsigned mode)
+{
+    int period;
+
+    if (!n) {
+        return 0;
+    }
+
+    switch (mode) {
+    case 1:                             /* repeat */
+        c %= (int)n;
+        return c < 0 ? c + (int)n : c;
+    case 2:                             /* mirrored repeat */
+        period = 2 * (int)n;
+        c %= period;
+        if (c < 0) {
+            c += period;
+        }
+        return c >= (int)n ? period - 1 - c : c;
+    default:                            /* clamp to edge */
+        return MIN(MAX(c, 0), (int)n - 1);
+    }
+}
+
+/* One DXT colour palette: four BGRA-ish colours in float form. */
+static void ps3_rsx_dxt_palette(uint16_t c0, uint16_t c1, bool opaque,
+                                float pal[4][4])
+{
+    unsigned i;
+    unsigned v[2] = { c0, c1 };
+
+    for (i = 0; i < 2; i++) {
+        pal[i][0] = ((v[i] >> 11) & 0x1F) / 31.0f;
+        pal[i][1] = ((v[i] >> 5) & 0x3F) / 63.0f;
+        pal[i][2] = (v[i] & 0x1F) / 31.0f;
+        pal[i][3] = 1.0f;
+    }
+
+    if (opaque || c0 > c1) {
+        for (i = 0; i < 3; i++) {
+            pal[2][i] = (2.0f * pal[0][i] + pal[1][i]) / 3.0f;
+            pal[3][i] = (pal[0][i] + 2.0f * pal[1][i]) / 3.0f;
+        }
+        pal[2][3] = pal[3][3] = 1.0f;
+    } else {
+        for (i = 0; i < 3; i++) {
+            pal[2][i] = (pal[0][i] + pal[1][i]) * 0.5f;
+            pal[3][i] = 0.0f;
+        }
+        pal[2][3] = 1.0f;
+        pal[3][3] = 0.0f;
+    }
+}
+
+/* One texel of a texture through its registers. */
+static bool ps3_rsx_tex_texel(PS3BootROMState *s, uint8_t *ram,
+                              uint64_t ram_size, unsigned unit,
+                              int x, int y, float out[4])
+{
+    PS3RsxTexture *t = &s->rsx_tex[unit];
+    unsigned fmt = (t->format >> 8) & 0xFF;
+    unsigned width = (t->image_rect >> 16) & 0xFFFF;
+    unsigned height = t->image_rect & 0xFFFF;
+    bool main_mem = (t->format & 3) == 3;
+    bool linear = !!(fmt & 0x20);
+    unsigned base_fmt = fmt & ~0x20u;
+    unsigned bpp, tile_w = 8, tile_h = 8;
+    unsigned pitch, off, bx, by, i;
+    const uint8_t *p;
+
+    if (!width || !height) {
+        return false;
+    }
+    x = ps3_rsx_wrap(x, width, t->address & 0xF);
+    y = ps3_rsx_wrap(y, height, (t->address >> 4) & 0xF);
+
+    switch (base_fmt) {
+    case 0x86:                          /* DXT1 */
+    case 0x87:                          /* DXT2/3 */
+    case 0x88:                          /* DXT4/5 */
+        bx = (unsigned)x >> 2;
+        by = (unsigned)y >> 2;
+        pitch = (((width + 3) >> 2)) * (base_fmt == 0x86 ? 8u : 16u);
+        off = by * pitch + bx * (base_fmt == 0x86 ? 8u : 16u);
+        p = ps3_rsx_mem(s, ram, ram_size, main_mem, t->offset + off,
+                        base_fmt == 0x86 ? 8 : 16);
+        if (!p) {
+            return false;
+        }
+        {
+            float pal[4][4];
+            unsigned idx, row, col;
+            uint16_t c0 = (p[0] << 8) | p[1];
+            uint16_t c1 = (p[2] << 8) | p[3];
+            uint32_t bits = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8) | p[7];
+
+            ps3_rsx_dxt_palette(c0, c1, base_fmt != 0x86, pal);
+            idx = (bits >> (2 * (((unsigned)y & 3) * 4 + ((unsigned)x & 3)))) & 3;
+            for (i = 0; i < 4; i++) {
+                out[i] = pal[idx][i];
+            }
+            if (base_fmt != 0x86) {
+                /* The DXT3/5 alpha block: eight explicit values, 4 bits each
+                 * for DXT3 and the two-colour ramp for DXT5. */
+                const uint8_t *a = p + 8;
+                unsigned ax = (unsigned)x & 3, ay = (unsigned)y & 3;
+
+                if (base_fmt == 0x87) {
+                    unsigned nib = (a[(ay * 4 + ax) >> 1] >>
+                                    (((ay * 4 + ax) & 1) ? 4 : 0)) & 0xF;
+                    out[3] = nib / 15.0f;
+                } else {
+                    unsigned a0 = a[0], a1 = a[1];
+                    unsigned bits2 = a[2] | (a[3] << 8) | (a[4] << 16) |
+                                     (a[5] << 24);
+                    unsigned idx2 = (bits2 >> (3 * (ay * 4 + ax))) & 7;
+                    float av[8];
+                    unsigned k;
+
+                    av[0] = a0 / 255.0f;
+                    av[1] = a1 / 255.0f;
+                    if (a0 > a1) {
+                        for (k = 0; k < 6; k++) {
+                            av[2 + k] = ((6 - k) * a0 + (1 + k) * a1) / (7.0f * 255.0f);
+                        }
+                    } else {
+                        for (k = 0; k < 4; k++) {
+                            av[2 + k] = ((4 - k) * a0 + (1 + k) * a1) / (5.0f * 255.0f);
+                        }
+                        av[6] = 0.0f;
+                        av[7] = 1.0f;
+                    }
+                    out[3] = av[idx2];
+                }
+            }
+            return true;
+        }
+    case 0x85:                          /* A8R8G8B8 */
+    case 0x9E:                          /* D8R8G8B8 */
+        bpp = 4;
+        break;
+    case 0x82:                          /* A1R5G5B5 */
+    case 0x83:                          /* A4R4G4B4 */
+    case 0x84:                          /* R5G6B5 */
+    case 0x8F:                          /* R6G5B5 */
+    case 0x94:                          /* X16 */
+    case 0x95:                          /* Y16_X16 */
+    case 0x97:                          /* R5G5B5A1 */
+    case 0x9D:                          /* D1R5G5B5 */
+        bpp = 2;
+        tile_w = 16;
+        break;
+    case 0x81:                          /* B8 */
+    case 0x8B:                          /* G8B8 */
+        bpp = base_fmt == 0x81 ? 1 : 2;
+        tile_w = base_fmt == 0x81 ? 32 : 16;
+        break;
+    default:
+        return false;
+    }
+
+    pitch = width * bpp;
+    if (linear) {
+        off = (unsigned)y * pitch + (unsigned)x * bpp;
+    } else {
+        unsigned tx = (unsigned)x / tile_w, ty = (unsigned)y / tile_h;
+        unsigned lx = (unsigned)x % tile_w, ly = (unsigned)y % tile_h;
+        unsigned tile = (lx & 1) | ((ly & 1) << 1) | (((lx >> 1) & 1) << 2) |
+                        (((ly >> 1) & 1) << 3) | (((lx >> 2) & 1) << 4) |
+                        (((ly >> 2) & 1) << 5) | (((lx >> 3) & 1) << 6) |
+                        (((ly >> 3) & 1) << 7);
+        unsigned across = (width + tile_w - 1) / tile_w;
+
+        off = (ty * across + tx) * 256 + tile * bpp;
+    }
+
+    p = ps3_rsx_mem(s, ram, ram_size, main_mem, t->offset + off, bpp);
+    if (!p) {
+        return false;
+    }
+
+    out[3] = 1.0f;
+    switch (base_fmt) {
+    case 0x85:                          /* B, G, R, A in memory */
+    case 0x9E:
+        out[0] = p[2] / 255.0f;
+        out[1] = p[1] / 255.0f;
+        out[2] = p[0] / 255.0f;
+        out[3] = p[3] / 255.0f;
+        break;
+    case 0x82:                          /* A1R5G5B5 */
+    case 0x9D: {                        /* D1R5G5B5 */
+        unsigned v = (p[0] << 8) | p[1];
+
+        out[3] = base_fmt == 0x82 ? ((v >> 15) & 1) : 1.0f;
+        out[0] = ((v >> 10) & 0x1F) / 31.0f;
+        out[1] = ((v >> 5) & 0x1F) / 31.0f;
+        out[2] = (v & 0x1F) / 31.0f;
+        break;
+    }
+    case 0x83: {                        /* A4R4G4B4 */
+        unsigned v = (p[0] << 8) | p[1];
+
+        out[3] = ((v >> 12) & 0xF) / 15.0f;
+        out[0] = ((v >> 8) & 0xF) / 15.0f;
+        out[1] = ((v >> 4) & 0xF) / 15.0f;
+        out[2] = (v & 0xF) / 15.0f;
+        break;
+    }
+    case 0x84: {                        /* R5G6B5 */
+        unsigned v = (p[0] << 8) | p[1];
+
+        out[0] = ((v >> 11) & 0x1F) / 31.0f;
+        out[1] = ((v >> 5) & 0x3F) / 63.0f;
+        out[2] = (v & 0x1F) / 31.0f;
+        break;
+    }
+    case 0x8F: {                        /* R6G5B5 */
+        unsigned v = (p[0] << 8) | p[1];
+
+        out[0] = ((v >> 10) & 0x3F) / 63.0f;
+        out[1] = ((v >> 5) & 0x1F) / 31.0f;
+        out[2] = (v & 0x1F) / 31.0f;
+        break;
+    }
+    case 0x97: {                        /* R5G5B5A1 */
+        unsigned v = (p[0] << 8) | p[1];
+
+        out[0] = ((v >> 11) & 0x1F) / 31.0f;
+        out[1] = ((v >> 6) & 0x1F) / 31.0f;
+        out[2] = ((v >> 1) & 0x1F) / 31.0f;
+        out[3] = (v & 1) ? 1.0f : 0.0f;
+        break;
+    }
+    case 0x8B:                          /* G8B8: green and blue */
+        out[0] = out[2] = p[0] / 255.0f;
+        out[1] = p[1] / 255.0f;
+        break;
+    case 0x81:                          /* B8: luminance */
+        out[0] = out[1] = out[2] = p[0] / 255.0f;
+        break;
+    case 0x94:                          /* X16 */
+    case 0x95:                          /* Y16_X16 */
+    {
+        unsigned v = (p[0] << 8) | p[1];
+
+        out[0] = v / 65535.0f;
+        out[1] = out[2] = out[0];
+        if (base_fmt == 0x95) {
+            out[1] = p[3] / 255.0f;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+    return true;
+}
+
+/* One texture lookup through a unit's filter register. */
+static void ps3_rsx_tex_sample(PS3BootROMState *s, uint8_t *ram,
+                               uint64_t ram_size, unsigned unit,
+                               float u, float v, float out[4])
+{
+    PS3RsxTexture *t = &s->rsx_tex[unit];
+    unsigned width = (t->image_rect >> 16) & 0xFFFF;
+    unsigned height = t->image_rect & 0xFFFF;
+    bool linear = ((t->filter >> 16) & 0xFFFF) == 2;
+    float texel[4];
+
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    if (!width || !height || !(t->control0 & 0x80000000u)) {
+        out[3] = 1.0f;
+        return;
+    }
+
+    if (!linear) {
+        int x = (int)floorf(u * width), y = (int)floorf(v * height);
+
+        if (ps3_rsx_tex_texel(s, ram, ram_size, unit, x, y, texel)) {
+            memcpy(out, texel, sizeof(texel));
+        }
+        return;
+    }
+
+    {
+        float fx = u * width - 0.5f, fy = v * height - 0.5f;
+        int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+        float ax = fx - x0, ay = fy - y0;
+        float c[4][4];
+        unsigned i, k;
+
+        for (k = 0; k < 4; k++) {
+            int xx = x0 + (k & 1), yy = y0 + (k >> 1);
+
+            if (!ps3_rsx_tex_texel(s, ram, ram_size, unit, xx, yy, c[k])) {
+                return;
+            }
+        }
+        for (i = 0; i < 4; i++) {
+            float top = c[0][i] * (1.0f - ax) + c[1][i] * ax;
+            float bottom = c[2][i] * (1.0f - ax) + c[3][i] * ax;
+
+            out[i] = top * (1.0f - ay) + bottom * ay;
+        }
+    }
+}
+
+/* One fp40 instruction, decoded. */
+typedef struct PS3RsxFpInst {
+    uint32_t src0, src1, src2;
+    unsigned opcode, mask, dst, attr, tex, scale, prec;
+    bool end, saturate, fp16, no_dest;
+} PS3RsxFpInst;
+
+static void ps3_rsx_fp_parse(const uint8_t *p, PS3RsxFpInst *in)
+{
+    uint32_t d0 = ps3_rsx_fp_word(p);
+
+    in->src0 = ps3_rsx_fp_word(p + 4);
+    in->src1 = ps3_rsx_fp_word(p + 8);
+    in->src2 = ps3_rsx_fp_word(p + 12);
+    in->end = d0 & 1;
+    in->dst = (d0 >> 1) & 0x3F;
+    in->fp16 = (d0 >> 7) & 1;
+    in->mask = (d0 >> 9) & 0xF;
+    in->attr = (d0 >> 13) & 0xF;
+    in->tex = (d0 >> 17) & 0xF;
+    in->prec = (d0 >> 22) & 3;
+    in->opcode = ((d0 >> 24) & 0x3F) | (((in->src1 >> 31) & 1) << 6);
+    in->no_dest = (d0 >> 30) & 1;
+    in->saturate = (d0 >> 31) & 1;
+    in->scale = (in->src1 >> 28) & 7;
+}
+
+/* One source operand. */
+static bool ps3_rsx_fp_src(PS3BootROMState *s, const uint8_t *prog,
+                           unsigned len, unsigned inst_off,
+                           const PS3RsxFpInst *in, uint32_t src, bool is_src0,
+                           const float vin[16][4], const float r[16][4],
+                           float out[4])
+{
+    unsigned reg = src & 3, tmp = (src >> 2) & 0x3F;
+    unsigned swz = (src >> 9) & 0xFF;
+    bool neg = (src >> 17) & 1;
+    bool absv = is_src0 ? !!((src >> 29) & 1) : !!((src >> 18) & 1);
+    float v[4], w[4];
+    unsigned i;
+
+    switch (reg) {
+    case 0:                             /* temporary register */
+        if (tmp >= PS3_RSX_FP_TEMP) {
+            return false;
+        }
+        memcpy(v, r[tmp], sizeof(v));
+        break;
+    case 1: {                           /* input attribute */
+        unsigned idx = in->attr;
+
+        if ((in->src2 >> 30) & 1) {
+            idx = ((in->src2 >> 19) & 0x7FF) + 4;
+        }
+        if (idx >= PS3_RSX_FP_INPUTS) {
+            return false;
+        }
+        memcpy(v, vin[idx], sizeof(v));
+        break;
+    }
+    case 2: {                           /* constant, in the slot after */
+        const uint8_t *cp = prog + inst_off + 16;
+
+        if (inst_off + 32 > len) {
+            return false;
+        }
+        for (i = 0; i < 4; i++) {
+            uint32_t word = ps3_rsx_fp_word(cp + 4 * i);
+
+            memcpy(&v[i], &word, sizeof(v[i]));
+        }
+        break;
+    }
+    default:
+        return false;
+    }
+
+    for (i = 0; i < 4; i++) {
+        w[i] = v[(swz >> (2 * i)) & 3];
+    }
+    if (absv) {
+        for (i = 0; i < 4; i++) {
+            w[i] = fabsf(w[i]);
+        }
+    }
+    if (neg) {
+        for (i = 0; i < 4; i++) {
+            w[i] = -w[i];
+        }
+    }
+    if (is_src0) {
+        switch (in->scale) {
+        case 1: for (i = 0; i < 4; i++) w[i] *= 2.0f; break;
+        case 2: for (i = 0; i < 4; i++) w[i] *= 4.0f; break;
+        case 3: for (i = 0; i < 4; i++) w[i] *= 8.0f; break;
+        case 5: for (i = 0; i < 4; i++) w[i] *= 0.5f; break;
+        case 6: for (i = 0; i < 4; i++) w[i] *= 0.25f; break;
+        case 7: for (i = 0; i < 4; i++) w[i] *= 0.125f; break;
+        default: break;
+        }
+    }
+
+    memcpy(out, w, sizeof(w));
+    return true;
+}
+
+static bool ps3_rsx_fp_uses_const(const PS3RsxFpInst *in)
+{
+    return (in->src0 & 3) == 2 || (in->src1 & 3) == 2 ||
+           (in->src2 & 3) == 2;
+}
+
+/*
+ * Run the loaded fragment program for one pixel.  The sixteen input registers
+ * are the fragment stage's varyings; the result is register 0.  A KIL whose
+ * operand is negative discards the pixel, which is reported as a failure so
+ * the rasterizer writes nothing.
+ */
+static bool ps3_rsx_fprog_run(PS3BootROMState *s, uint8_t *ram,
+                              uint64_t ram_size, const float vin[16][4],
+                              float out[4])
+{
+    const uint8_t *prog = s->rsx_fprog;
+    unsigned len = s->rsx_fprog_len;
+    float r[PS3_RSX_FP_TEMP][4] = { { 0 } };
+    unsigned pc, steps;
+    bool wrote0 = false;
+
+    if (!s->rsx_fprog_ready || len < 32) {
+        return false;
+    }
+
+    /* The header ends at the first slot that holds an instruction. */
+    pc = 0;
+    while (pc + 16 <= len) {
+        uint32_t d0 = ps3_rsx_fp_word(prog + pc);
+
+        if (((d0 >> 24) & 0x3F) || ((d0 >> 8) & 1)) {
+            break;
+        }
+        pc += 16;
+    }
+
+    for (steps = 0; steps < 1024 && pc + 16 <= len; steps++) {
+        PS3RsxFpInst in;
+        float a[4], b[4], c[4], res[4];
+        bool const_slot;
+        unsigned i;
+
+        ps3_rsx_fp_parse(prog + pc, &in);
+        const_slot = ps3_rsx_fp_uses_const(&in);
+
+        if (!ps3_rsx_fp_src(s, prog, len, pc, &in, in.src0, true, vin, r, a)) {
+            return false;
+        }
+
+        switch (in.opcode) {
+        case 0:                                 /* NOP */
+            memcpy(res, a, sizeof(a));
+            break;
+        case 1:                                 /* MOV */
+            memcpy(res, a, sizeof(a));
+            break;
+        case 2:                                 /* MUL */
+        case 3:                                 /* ADD */
+        case 4:                                 /* MAD */
+        case 5:                                 /* DP3 */
+        case 6:                                 /* DP4 */
+        case 7:                                 /* DST */
+        case 8:                                 /* MIN */
+        case 9:                                 /* MAX */
+        case 10:                                /* SLT */
+        case 11:                                /* SGE */
+        case 12:                                /* SLE */
+        case 13:                                /* SGT */
+        case 14:                                /* SNE */
+        case 15:                                /* SEQ */
+        case 16:                                /* FRC */
+        case 17:                                /* FLR */
+        case 26:                                /* RCP */
+        case 27:                                /* RSQ */
+        case 28:                                /* EX2 */
+        case 29:                                /* LG2 */
+        case 30:                                /* LIT */
+        case 31:                                /* LRP */
+        case 32:                                /* STR */
+        case 33:                                /* SFL */
+        case 34:                                /* COS */
+        case 35:                                /* SIN */
+        case 38:                                /* POW */
+        case 46:                                /* DP2A */
+        case 54:                                /* REFL */
+        case 56:                                /* DP2 */
+        case 57:                                /* NRM */
+        case 58:                                /* DIV */
+        case 59:                                /* DIVSQ */
+            if (!ps3_rsx_fp_src(s, prog, len, pc, &in, in.src1, false,
+                                vin, r, b)) {
+                return false;
+            }
+            if (!ps3_rsx_fp_src(s, prog, len, pc, &in, in.src2, false,
+                                vin, r, c)) {
+                return false;
+            }
+            switch (in.opcode) {
+            case 2: for (i = 0; i < 4; i++) res[i] = a[i] * b[i]; break;
+            case 3: for (i = 0; i < 4; i++) res[i] = a[i] + b[i]; break;
+            case 4: for (i = 0; i < 4; i++) res[i] = a[i] * b[i] + c[i]; break;
+            case 5: {
+                float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+                for (i = 0; i < 4; i++) res[i] = d;
+                break;
+            }
+            case 6: {
+                float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+                for (i = 0; i < 4; i++) res[i] = d;
+                break;
+            }
+            case 7:                             /* DST */
+                res[0] = 1.0f;
+                res[1] = a[1] * b[1];
+                res[2] = a[2];
+                res[3] = b[3];
+                break;
+            case 8: for (i = 0; i < 4; i++) res[i] = MIN(a[i], b[i]); break;
+            case 9: for (i = 0; i < 4; i++) res[i] = MAX(a[i], b[i]); break;
+            case 10: for (i = 0; i < 4; i++) res[i] = a[i] < b[i] ? 1.0f : 0.0f; break;
+            case 11: for (i = 0; i < 4; i++) res[i] = a[i] >= b[i] ? 1.0f : 0.0f; break;
+            case 12: for (i = 0; i < 4; i++) res[i] = a[i] <= b[i] ? 1.0f : 0.0f; break;
+            case 13: for (i = 0; i < 4; i++) res[i] = a[i] > b[i] ? 1.0f : 0.0f; break;
+            case 14: for (i = 0; i < 4; i++) res[i] = a[i] != b[i] ? 1.0f : 0.0f; break;
+            case 15: for (i = 0; i < 4; i++) res[i] = a[i] == b[i] ? 1.0f : 0.0f; break;
+            case 16: for (i = 0; i < 4; i++) res[i] = a[i] - floorf(a[i]); break;
+            case 17: for (i = 0; i < 4; i++) res[i] = floorf(a[i]); break;
+            case 26: res[0] = res[1] = res[2] = res[3] = 1.0f / a[0]; break;
+            case 27: res[0] = res[1] = res[2] = res[3] = 1.0f / sqrtf(fabsf(a[0])); break;
+            case 28: res[0] = res[1] = res[2] = res[3] = exp2f(a[0]); break;
+            case 29: res[0] = res[1] = res[2] = res[3] = log2f(fabsf(a[0])); break;
+            case 30:                            /* LIT */
+                res[0] = 1.0f;
+                res[1] = MAX(a[0], 0.0f);
+                res[2] = MAX(a[1], 0.0f);
+                res[3] = powf(MAX(a[3], 0.0f), MIN(MAX(a[1], -128.0f), 128.0f));
+                break;
+            case 31:                            /* LRP: a*b + (1-a)*c */
+                for (i = 0; i < 4; i++) res[i] = a[i] * b[i] + (1.0f - a[i]) * c[i];
+                break;
+            case 32: for (i = 0; i < 4; i++) res[i] = 1.0f; break;
+            case 33: for (i = 0; i < 4; i++) res[i] = 0.0f; break;
+            case 34: res[0] = res[1] = res[2] = res[3] = cosf(a[0]); break;
+            case 35: res[0] = res[1] = res[2] = res[3] = sinf(a[0]); break;
+            case 38:                            /* POW */
+                res[0] = res[1] = res[2] = res[3] = powf(fabsf(a[0]), b[0]);
+                break;
+            case 46:                            /* DP2A */
+                res[0] = res[1] = res[2] = res[3] =
+                    a[0] * b[0] + a[1] * b[1];
+                break;
+            case 54:                            /* REFL */
+                for (i = 0; i < 4; i++) {
+                    res[i] = a[i] - 2.0f * b[i] *
+                             (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]);
+                }
+                break;
+            case 56:                            /* DP2 */
+                res[0] = res[1] = res[2] = res[3] = a[0] * b[0] + a[1] * b[1];
+                break;
+            case 57: {                          /* NRM */
+                float mag = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+
+                for (i = 0; i < 4; i++) res[i] = mag ? a[i] / mag : 0.0f;
+                break;
+            }
+            case 58:                            /* DIV */
+                for (i = 0; i < 4; i++) res[i] = b[i] ? a[i] / b[i] : a[i];
+                break;
+            case 59:                            /* DIVSQ */
+                for (i = 0; i < 4; i++) {
+                    res[i] = b[i] ? a[i] / (b[i] * b[i]) : a[i];
+                }
+                break;
+            default:
+                break;
+            }
+            break;
+        case 18:                                /* KIL */
+            if (a[0] < 0.0f) {
+                return false;
+            }
+            memcpy(res, a, sizeof(a));
+            break;
+        case 23:                                /* TEX */
+        case 24:                                /* TXP */
+        case 25:                                /* TXD */
+        case 47:                                /* TXL */
+        case 49:                                /* TXB */
+        {
+            float u = a[0], v = a[1], one = 1.0f;
+
+            if (in.opcode == 24 && a[3] != 0.0f) {
+                u /= a[3];
+                v /= a[3];
+            }
+            (void)one;
+            ps3_rsx_tex_sample(s, ram, ram_size, in.tex & (PS3_RSX_TEX_MAX - 1),
+                               u, v, res);
+            break;
+        }
+        default:
+            return false;               /* an opcode this interpreter lacks */
+        }
+
+        if (in.saturate) {
+            for (i = 0; i < 4; i++) {
+                res[i] = MIN(MAX(res[i], 0.0f), 1.0f);
+            }
+        }
+
+        if (!in.no_dest && in.mask) {
+            unsigned d = in.dst < PS3_RSX_FP_TEMP ? in.dst : 0;
+
+            for (i = 0; i < 4; i++) {
+                if (in.mask & (1u << i)) {
+                    r[d][i] = res[i];
+                }
+            }
+            if (d == 0) {
+                wrote0 = true;
+            }
+        }
+
+        pc += 16;
+        if (const_slot) {
+            pc += 16;
+        }
+        if (in.end) {
             break;
         }
     }
 
+    if (!wrote0) {
+        return false;
+    }
+
+    memcpy(out, r[0], sizeof(r[0]));
     return true;
 }
 
@@ -8939,28 +9689,33 @@ static bool ps3_rsx_vertex(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
     float p[4], c[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     int ci = ps3_rsx_colour_attr(s);
     bool ok;
+    unsigned k;
 
     if (shaded) {
         *shaded = false;
     }
 
+    for (k = 0; k < 16; k++) {
+        v->var[k][0] = 0.0f;
+        v->var[k][1] = 0.0f;
+        v->var[k][2] = 0.0f;
+        v->var[k][3] = 1.0f;
+    }
+
     if (s->rsx_vprog_ready) {
-        float vin[PS3_RSX_ATTRS][4], pos[4], col[4];
-        bool has_colour;
+        float vin[PS3_RSX_ATTRS][4];
 
         if (ps3_rsx_all_attrs(s, ram, ram_size, index, inlined, vin) &&
-            ps3_rsx_vprog_run(s, vin, pos, col, &has_colour)) {
-            v->x = pos[0];
-            v->y = pos[1];
-            v->z = pos[2];
-            v->w = pos[3];
-            if (!has_colour) {
-                col[0] = col[1] = col[2] = col[3] = 1.0f;
-            }
-            v->r = MIN(MAX(col[0], 0.0f), 1.0f);
-            v->g = MIN(MAX(col[1], 0.0f), 1.0f);
-            v->b = MIN(MAX(col[2], 0.0f), 1.0f);
-            v->a = MIN(MAX(col[3], 0.0f), 1.0f);
+            ps3_rsx_vprog_run(s, vin, v->var)) {
+            v->x = v->var[0][0];
+            v->y = v->var[0][1];
+            v->z = v->var[0][2];
+            v->w = v->var[0][3];
+            /* Output 1 is the diffuse colour the fragment stage reads. */
+            v->r = MIN(MAX(v->var[1][0], 0.0f), 1.0f);
+            v->g = MIN(MAX(v->var[1][1], 0.0f), 1.0f);
+            v->b = MIN(MAX(v->var[1][2], 0.0f), 1.0f);
+            v->a = MIN(MAX(v->var[1][3], 0.0f), 1.0f);
             if (shaded) {
                 *shaded = true;
             }
@@ -9130,6 +9885,62 @@ static void ps3_rsx_pixel(PS3BootROMState *s, const PS3RsxSurface *surf,
 }
 
 /*
+ * One fragment.
+ *
+ * When the graphics library has loaded an fp40 the fragment stage runs it
+ * with the interpolated varyings - WPOS, the two colours, the fog and the ten
+ * texture coordinates - and its register 0 is the colour.  Otherwise the
+ * model shades with the vertex colour it interpolated, which is what the 2D
+ * interface path that carries no programs uses.
+ */
+static void ps3_rsx_shade(PS3BootROMState *s, const PS3RsxSurface *surf,
+                          uint8_t *ram, uint64_t ram_size,
+                          int x, int y, double w0, double w1, double w2,
+                          double sum, const PS3RsxVertex *v0,
+                          const PS3RsxVertex *v1, const PS3RsxVertex *v2)
+{
+    if (s->rsx_fprog_ready) {
+        float in[16][4], out[4];
+        float wsum = (float)((w0 * v0->w + w1 * v1->w + w2 * v2->w) / sum);
+        float invw = fabsf(wsum) > 1e-9f ? 1.0f / wsum : 1.0f;
+        unsigned k, c;
+
+        for (k = 0; k < 16; k++) {
+            for (c = 0; c < 4; c++) {
+                in[k][c] = (float)((w0 * v0->var[k][c] +
+                                    w1 * v1->var[k][c] +
+                                    w2 * v2->var[k][c]) / sum);
+            }
+        }
+
+        in[0][0] = x + 0.5f;
+        in[0][1] = y + 0.5f;
+        in[0][2] = 0.5f * in[0][2] * invw + 0.5f;    /* clip z to window z */
+        in[0][3] = invw;
+        for (c = 0; c < 4; c++) {                   /* COL0/COL1 are clamped */
+            in[1][c] = MIN(MAX(in[1][c], 0.0f), 1.0f);
+            in[2][c] = MIN(MAX(in[2][c], 0.0f), 1.0f);
+        }
+        in[14][0] = 1.0f;                           /* SSA: front facing */
+        in[14][1] = 0.0f;
+        in[14][2] = 0.0f;
+        in[14][3] = 1.0f;
+
+        if (ps3_rsx_fprog_run(s, ram, ram_size, in, out)) {
+            ps3_rsx_pixel(s, surf, x, y, out[0], out[1], out[2], out[3]);
+            s->rsx_shaded++;
+        }
+        return;
+    }
+
+    ps3_rsx_pixel(s, surf, x, y,
+                  (float)((w0 * v0->r + w1 * v1->r + w2 * v2->r) / sum),
+                  (float)((w0 * v0->g + w1 * v1->g + w2 * v2->g) / sum),
+                  (float)((w0 * v0->b + w1 * v1->b + w2 * v2->b) / sum),
+                  (float)((w0 * v0->a + w1 * v1->a + w2 * v2->a) / sum));
+}
+
+/*
  * A triangle.
  *
  * The edge functions are evaluated incrementally along each row, so a span
@@ -9138,6 +9949,7 @@ static void ps3_rsx_pixel(PS3BootROMState *s, const PS3RsxSurface *surf,
  * non-perspective-corrected fill does.
  */
 static void ps3_rsx_tri(PS3BootROMState *s, const PS3RsxSurface *surf,
+                        uint8_t *ram, uint64_t ram_size,
                         const PS3RsxVertex *v0, const PS3RsxVertex *v1,
                         const PS3RsxVertex *v2)
 {
@@ -9186,17 +9998,15 @@ static void ps3_rsx_tri(PS3BootROMState *s, const PS3RsxSurface *surf,
             if (w0 < 0 || w1 < 0 || w2 < 0) {
                 continue;
             }
-            ps3_rsx_pixel(s, surf, x, y,
-                          (float)((w0 * v0->r + w1 * v1->r + w2 * v2->r) / sum),
-                          (float)((w0 * v0->g + w1 * v1->g + w2 * v2->g) / sum),
-                          (float)((w0 * v0->b + w1 * v1->b + w2 * v2->b) / sum),
-                          (float)((w0 * v0->a + w1 * v1->a + w2 * v2->a) / sum));
+            ps3_rsx_shade(s, surf, ram, ram_size, x, y, w0, w1, w2, sum,
+                          v0, v1, v2);
         }
     }
 }
 
 /* A line segment, as a run of pixels from one end to the other. */
 static void ps3_rsx_line(PS3BootROMState *s, const PS3RsxSurface *surf,
+                         uint8_t *ram, uint64_t ram_size,
                          const PS3RsxVertex *a, const PS3RsxVertex *b)
 {
     double dx = (double)b->x - a->x, dy = (double)b->y - a->y;
@@ -9221,16 +10031,14 @@ static void ps3_rsx_line(PS3BootROMState *s, const PS3RsxSurface *surf,
         if (x < surf->x0 || x > surf->x1 || y < surf->y0 || y > surf->y1) {
             continue;
         }
-        ps3_rsx_pixel(s, surf, x, y,
-                      (float)(a->r + (b->r - a->r) * t),
-                      (float)(a->g + (b->g - a->g) * t),
-                      (float)(a->b + (b->b - a->b) * t),
-                      (float)(a->a + (b->a - a->a) * t));
+        ps3_rsx_shade(s, surf, ram, ram_size, x, y, 1.0 - t, t, 0.0, 1.0,
+                      a, b, a);
     }
 }
 
 /* A point: one pixel. */
 static void ps3_rsx_point(PS3BootROMState *s, const PS3RsxSurface *surf,
+                          uint8_t *ram, uint64_t ram_size,
                           const PS3RsxVertex *v)
 {
     int x = (int)floor(v->x + 0.5), y = (int)floor(v->y + 0.5);
@@ -9240,7 +10048,8 @@ static void ps3_rsx_point(PS3BootROMState *s, const PS3RsxSurface *surf,
     }
 
     s->rsx_prims++;
-    ps3_rsx_pixel(s, surf, x, y, v->r, v->g, v->b, v->a);
+    ps3_rsx_shade(s, surf, ram, ram_size, x, y, 1.0, 0.0, 0.0, 1.0,
+                  v, v, v);
 }
 
 /* One index of the index array DRAW_INDEX_ARRAY reads. */
@@ -9291,6 +10100,7 @@ static void ps3_rsx_rasterize(PS3BootROMState *s, uint8_t *ram,
     bool clip = false, shaded_all = true;
     float vp_x = 0, vp_y = 0, vp_w, vp_h;
     uint64_t prims0 = s->rsx_prims, pixels0 = s->rsx_pixels;
+    uint64_t shaded0 = s->rsx_shaded;
 
     if (!s->rsx_prim) {
         return;
@@ -9462,13 +10272,14 @@ static void ps3_rsx_rasterize(PS3BootROMState *s, uint8_t *ram,
 #define RSX_TRI(a, b, c)                                                  \
     do {                                                                  \
         if (RSX_VALID(a) && RSX_VALID(b) && RSX_VALID(c)) {               \
-            ps3_rsx_tri(s, &surf, &vtx[a], &vtx[b], &vtx[c]);             \
+            ps3_rsx_tri(s, &surf, ram, ram_size, &vtx[a], &vtx[b],         \
+                        &vtx[c]);                                         \
         }                                                                 \
     } while (0)
 #define RSX_LINE(a, b)                                                    \
     do {                                                                  \
         if (RSX_VALID(a) && RSX_VALID(b)) {                               \
-            ps3_rsx_line(s, &surf, &vtx[a], &vtx[b]);                     \
+            ps3_rsx_line(s, &surf, ram, ram_size, &vtx[a], &vtx[b]);      \
         }                                                                 \
     } while (0)
 
@@ -9476,7 +10287,7 @@ static void ps3_rsx_rasterize(PS3BootROMState *s, uint8_t *ram,
     case 1:                             /* points */
         for (i = 0; i < n; i++) {
             if (RSX_VALID(i)) {
-                ps3_rsx_point(s, &surf, &vtx[i]);
+                ps3_rsx_point(s, &surf, ram, ram_size, &vtx[i]);
             }
         }
         break;
@@ -9549,8 +10360,9 @@ static void ps3_rsx_rasterize(PS3BootROMState *s, uint8_t *ram,
     s->rsx_draws++;
     if (s->ppu_trace) {
         info_report("ps3-rsx: draw done: %" PRIu64 " primitive(s), %" PRIu64
-                    " pixel(s)", s->rsx_prims - prims0,
-                    s->rsx_pixels - pixels0);
+                    " pixel(s), %" PRIu64 " shaded by the fp40",
+                    s->rsx_prims - prims0, s->rsx_pixels - pixels0,
+                    s->rsx_shaded - shaded0);
     }
     g_free(vtx);
     g_free(idx);
@@ -9585,6 +10397,58 @@ static void ps3_rsx_method(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
         method < PS3_RSX_SET_VTX_FMT + PS3_RSX_ATTRS) {
         s->rsx_vtx_fmt[method - PS3_RSX_SET_VTX_FMT] = value;
         return;
+    }
+
+    /*
+     * The vertex program's words arrive through the 32 methods at
+     * SET_TRANSFORM_PROGRAM; the load register names the instruction the
+     * first four words of the range belong to, so each dword's slot follows
+     * RPCS3's set_transform_program: load * 4 + index % 4.
+     */
+    if (method >= PS3_RSX_SET_TRANSFORM_PROGRAM &&
+        method < PS3_RSX_SET_TRANSFORM_PROGRAM + 32) {
+        unsigned index = method - PS3_RSX_SET_TRANSFORM_PROGRAM;
+        unsigned slot = s->rsx_vprog_load * 4 + (index % 4);
+
+        if (slot < PS3_RSX_VPROG_WORDS) {
+            s->rsx_vprog[slot] = value;
+        }
+        s->rsx_vprog_word = index;
+        s->rsx_vprog_ready = true;
+        return;
+    }
+    if (method >= PS3_RSX_SET_TRANSFORM_CONSTANT &&
+        method < PS3_RSX_SET_TRANSFORM_CONSTANT + 32) {
+        unsigned index = method - PS3_RSX_SET_TRANSFORM_CONSTANT;
+        unsigned slot = s->rsx_vconst_load * 4 + index;
+
+        if (slot < PS3_RSX_VCONST * 4) {
+            s->rsx_vconst[slot / 4][slot % 4] = value;
+        }
+        s->rsx_vconst_word = index;
+        return;
+    }
+
+    /*
+     * The fragment stage's registers.  Each texture unit owns eight methods at
+     * SET_TEXTURE_OFFSET (offset, format, address, control0, control1, filter,
+     * image rectangle, border colour), which is RPCS3's stride.
+     */
+    if (method >= PS3_RSX_SET_TEXTURE &&
+        method < PS3_RSX_SET_TEXTURE + PS3_RSX_TEX_MAX * 8) {
+        unsigned n = (method - PS3_RSX_SET_TEXTURE) / 8;
+        PS3RsxTexture *t = &s->rsx_tex[n];
+
+        switch ((method - PS3_RSX_SET_TEXTURE) % 8) {
+        case 0: t->offset = value; return;
+        case 1: t->format = value; return;
+        case 2: t->address = value; return;
+        case 3: t->control0 = value; return;
+        case 4: t->control1 = value; return;
+        case 5: t->filter = value; return;
+        case 6: t->image_rect = value; return;
+        default: t->border = value; return;
+        }
     }
 
     switch (method) {
@@ -9642,6 +10506,64 @@ static void ps3_rsx_method(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
     case PS3_RSX_SET_VTX_INDEX:         /* NV4097_SET_VERTEX_DATA_BASE_INDEX */
         s->rsx_vtx_index_base = value & 0xFFFFF;
         return;
+    case PS3_RSX_SET_TRANSFORM_PROGRAM_LOAD:
+        s->rsx_vprog_load = value & (PS3_RSX_VPROG_INST - 1);
+        return;
+    case PS3_RSX_SET_TRANSFORM_PROGRAM_START:
+        s->rsx_vprog_start = value & (PS3_RSX_VPROG_INST - 1);
+        return;
+    case PS3_RSX_SET_TRANSFORM_CONST_LOAD:
+        s->rsx_vconst_load = value & (PS3_RSX_VCONST - 1);
+        return;
+    case PS3_RSX_SET_SHADER_CONTROL:
+        s->rsx_shader_control = value;
+        return;
+    case PS3_RSX_SET_SHADER_PROGRAM: {
+        /*
+         * The address names the program's header: bits 0..1 select the memory
+         * (2 local, 3 main) and the rest is its offset.  Copy the program and
+         * the constants it carries inline so a draw reads them from here.
+         */
+        unsigned loc = value & 3;
+        uint32_t addr = value & ~3u;
+        unsigned want = PS3_RSX_FPROG_BYTES;
+        const uint8_t *p;
+
+        s->rsx_fprog_addr = addr;
+        s->rsx_fprog_ready = false;
+        s->rsx_fprog_len = 0;
+
+        if (loc != 2 && loc != 3) {
+            return;                     /* not a location a program can live in */
+        }
+        if (loc == 2 && (uint64_t)addr + 16 <= s->rsx_local_size) {
+            want = MIN(want, s->rsx_local_size - addr);
+        } else if (loc == 3) {
+            want = MIN(want, 4096u);
+        } else {
+            return;
+        }
+
+        p = ps3_rsx_mem(s, ram, ram_size, loc == 3, addr, want);
+        if (!p) {
+            if (!s->rsx_fprog_reported) {
+                s->rsx_fprog_reported = true;
+                info_report("ps3-rsx: fragment program at 0x%X is not mapped",
+                            addr);
+            }
+            return;
+        }
+
+        memcpy(s->rsx_fprog, p, want);
+        s->rsx_fprog_len = want;
+        s->rsx_fprog_ready = true;
+        if (!s->rsx_fprog_reported) {
+            s->rsx_fprog_reported = true;
+            info_report("ps3-rsx: fragment program at 0x%X (%u bytes, %s)",
+                        addr, want, loc == 2 ? "local" : "main");
+        }
+        return;
+    }
     case PS3_RSX_SET_INDEX_ADDR:        /* NV4097_SET_INDEX_ARRAY_ADDRESS */
         s->rsx_index_addr = value & 0x1FFFFFFCu;
         return;
