@@ -85,6 +85,33 @@ uint64_t ps3_spes_protection_faults(const PS3SPEGroup *group);
 /* External memory shared by the group (writable). */
 uint8_t *ps3_spes_ext_ptr(PS3SPEGroup *group, size_t *size);
 
+/*
+ * Point a group at memory the caller owns - lv2's SPEs share guest RAM rather
+ * than a copy - instead of the buffer ps3_spes_new() allocated.  The group
+ * releases only memory it allocated itself.
+ */
+void ps3_spes_map_ext(PS3SPEGroup *group, uint8_t *ext, size_t size);
+
+/* ---- local storage, as lv2's sys_spu_thread_*_ls sees it --------------- */
+
+/* Copy an SPU image segment into a thread's local store. */
+void ps3_spu_load_ls(PS3SPU *spu, uint32_t lsa, const void *src, size_t len);
+/* Fill a local-store range with one word, for SYS_SPU_SEGMENT_TYPE_FILL. */
+void ps3_spu_fill_ls(PS3SPU *spu, uint32_t lsa, size_t len, uint32_t value);
+
+const uint8_t *ps3_spu_ls_ptr(const PS3SPU *spu, uint32_t lsa);
+uint32_t ps3_spu_ls_read32(const PS3SPU *spu, uint32_t lsa);
+uint64_t ps3_spu_ls_read64(const PS3SPU *spu, uint32_t lsa);
+void ps3_spu_ls_write32(PS3SPU *spu, uint32_t lsa, uint32_t value);
+void ps3_spu_ls_write64(PS3SPU *spu, uint32_t lsa, uint64_t value);
+
+/*
+ * The SPU ABI passes a 64-bit argument in the preferred slot: the low half of
+ * the quadword register, i.e. lanes 2 and 3.  sys_spu_thread_initialize puts
+ * arg1..arg4 in $3..$6 that way before the thread starts.
+ */
+void ps3_spu_set_gpr64(PS3SPU *spu, unsigned reg, uint64_t value);
+
 /* ---- PPU-side SPE control (the problem/privileged state registers) ---- */
 
 /* SPU_RunCntl: start or stop issuing instructions. */

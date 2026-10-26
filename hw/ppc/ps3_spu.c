@@ -50,6 +50,7 @@ struct PS3SPU {
      * therefore still there to be inspected afterwards. */
     uint8_t *ext;
     size_t ext_size;
+    bool owns_ext;
 
     uint32_t gpr[SPU_MAX_GPR][4];  /* four 32-bit slots, big-endian order */
     uint32_t pc;
@@ -74,6 +75,7 @@ struct PS3SPU {
     uint32_t mfc_tag;
     uint32_t mfc_cmd;
     uint32_t tag_mask;
+    uint32_t tag_done;      /* bit n: tag group n has completed */
 
     /*
      * The rest of the channel set: the event/mailbox/decrementer state and
@@ -116,6 +118,7 @@ struct PS3SPU {
     bool isolated;
     bool runnable;
     bool stalled;
+    bool int_enable;        /* SPU_NPC[IE] as SPU_RdMachStat reports it */
     uint32_t mfc_atomic_stat;
     uint32_t mfc_list_stall;
 
@@ -183,6 +186,31 @@ struct PS3SPU {
     bool log_events;
     unsigned stop_code;   /* the stop instruction's immediate, when it stops */
 };
+
+/*
+ * SPEs sharing one external memory and (for the isolation check) one view of
+ * where each local store appears in the effective-address space.  The boot
+ * path uses a single SPE; the machine hands the same group to game code.
+ */
+struct PS3SPEGroup {
+    unsigned count;
+    uint8_t *ls_block;
+    size_t ls_block_size;
+    uint32_t ls_ea_base;
+
+    uint8_t *ext;
+    size_t ext_size;
+    bool ext_owned;         /* false once lv2 points the group at guest RAM */
+
+    PS3SPU *spe[PS3_SPE_MAX];
+
+    /* The group-wide lock-line reservation (getllar/putllc). */
+    uint64_t lr_ea;
+    bool lr_valid;
+    unsigned lr_owner;
+};
+
+static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len);
 
 static uint32_t be32(const uint8_t *p)
 {
@@ -444,15 +472,17 @@ static uint64_t spu_d_mask(bool hit)
 }
 
 /* Local-store addresses wrap at 32 bits first, then lose the four low bits:
- * `lqx $14,$90,$88` with $88 = -0x40 must read 0x400, not 0x40000. */
-static uint32_t ls_addr(uint32_t addr)
+ * `lqx $14,$90,$88` with $88 = -0x40 must read 0x400, not 0x40000.  The
+ * SPU_LSLR limit additionally wraps the address inside the application's
+ * visible store, which is how privileged software emulates a smaller SPU. */
+static uint32_t ls_addr(const PS3SPU *spu, uint32_t addr)
 {
-    return (addr & SPU_LS_MASK) & ~0xFu;
+    return ((addr & SPU_LS_MASK) & ~0xFu) & spu->lslr;
 }
 
 static void ls_read(const PS3SPU *spu, uint32_t addr, uint8_t out[16])
 {
-    const uint32_t a = ls_addr(addr);
+    const uint32_t a = ls_addr(spu, addr);
 
     for (unsigned i = 0; i < 16; i++) {
         out[i] = (a + i < spu->ls_size) ? spu->ls[a + i] : 0;
@@ -461,7 +491,7 @@ static void ls_read(const PS3SPU *spu, uint32_t addr, uint8_t out[16])
 
 static void ls_write(PS3SPU *spu, uint32_t addr, const uint8_t in[16])
 {
-    const uint32_t a = ls_addr(addr);
+    const uint32_t a = ls_addr(spu, addr);
 
     for (unsigned i = 0; i < 16 && a + i < spu->ls_size; i++) {
         spu->ls[a + i] = in[i];
@@ -593,64 +623,170 @@ static void gen_controls(uint8_t out[16], unsigned pos, unsigned size)
 
 /* ---- channels and MFC ------------------------------------------------- */
 
-static void tag_complete(PS3SPU *spu)
-{
-    if (spu->tag_count == SPU_TAG_FIFO) {
-        return;
-    }
+/*
+ * SPU event bits, as they appear in SPU_RdEventStat.  The model raises the
+ * ones that have a local cause: tag-group completion, a list stall, command
+ * queue room, inbound and outbound mailbox availability, the decrementer, the
+ * two signal channels, a lost lock line and the multisource sync ack.
+ */
+#define SPU_EV_TAG_UPDATE    0x0001u
+#define SPU_EV_TAG_STALL     0x0002u
+#define SPU_EV_QUEUE_VACANCY 0x0008u
+#define SPU_EV_MBOX_IN       0x0010u
+#define SPU_EV_DEC           0x0020u
+#define SPU_EV_INT_MBOX_ROOM 0x0040u
+#define SPU_EV_MBOX_ROOM     0x0080u
+#define SPU_EV_SIG2          0x0100u
+#define SPU_EV_SIG1          0x0200u
+#define SPU_EV_LLR_LOST      0x0400u
+#define SPU_EV_PRIV_ATTN     0x0800u
+#define SPU_EV_MSSYNC        0x1000u
 
-    spu->tag_fifo[(spu->tag_head + spu->tag_count) % SPU_TAG_FIFO] =
-        spu->mfc_tag & 0x1F;
-    spu->tag_count++;
+/* MFC command opcodes, base value with the barrier/fence/list/start flags off. */
+#define MFC_CMD_PUT      0x20u
+#define MFC_CMD_PUTL     0x24u
+#define MFC_CMD_PUTR     0x30u
+#define MFC_CMD_GET      0x40u
+#define MFC_CMD_GETL     0x44u
+#define MFC_CMD_SNDSIG   0xA0u
+#define MFC_CMD_PUTLLUC  0xB0u
+#define MFC_CMD_PUTLLC   0xB4u
+#define MFC_CMD_PUTQLLUC 0xB8u
+#define MFC_CMD_BARRIER  0xC0u
+#define MFC_CMD_EIEIO    0xC8u
+#define MFC_CMD_SYNC     0xCCu
+#define MFC_CMD_GETLLAR  0xD0u
+
+#define MFC_FLAG_BARRIER 0x01u
+#define MFC_FLAG_FENCE   0x02u
+#define MFC_FLAG_LIST    0x04u
+#define MFC_FLAG_START   0x08u
+
+#define MFC_MAX_TRANSFER 0x4000u
+#define MFC_QUEUE_DEPTH  8u
+
+/* Four-entry queue in one direction, exactly as the channel counts expect. */
+static void mbox_push(uint32_t q[4], unsigned *head, unsigned *count, uint32_t v)
+{
+    q[(*head + *count) & 3] = v;
+    (*count)++;
 }
 
-static void mfc_start(PS3SPU *spu)
+static uint32_t mbox_pop(uint32_t q[4], unsigned *head, unsigned *count)
 {
-    const uint32_t size = (spu->mfc_size & 0xFFFF) ? (spu->mfc_size & 0xFFFF)
-                                                   : 0x4000;
-    /* LSA bits 3:17: the low four bits are not part of the address. */
-    const uint32_t lsa = spu->mfc_lsa & SPU_LS_MASK & ~0xFu;
-    const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
+    const uint32_t v = q[*head];
 
-    if (spu->mfc_cmd & 0x40) {              /* MFC_GET */
-        for (uint32_t i = 0; i < size; i++) {
-            const uint64_t src = ea + i;
-            const uint32_t dst = (lsa + i) & SPU_LS_MASK;
+    *head = (*head + 1) & 3;
+    (*count)--;
+    return v;
+}
 
-            if (dst < spu->ls_size) {
-                spu->ls[dst] = (src < spu->ext_size) ? spu->ext[src] : 0;
+static void spe_event(PS3SPU *spu, uint32_t bit)
+{
+    spu->event_stat |= bit;
+}
+
+/* A completed MFC command sets its tag group and wakes anything waiting on it. */
+static void mfc_tag_complete(PS3SPU *spu, uint32_t tag)
+{
+    spu->tag_done |= 1u << (tag & 31);
+    spe_event(spu, SPU_EV_TAG_UPDATE);
+}
+
+/*
+ * Where a DMA range lives.  An effective address inside the group's local
+ * store windows resolves to that SPE's local store; everything else is
+ * external memory.  A transfer aimed at an isolated SPE's store is refused
+ * (Cell's isolation contract) and counted, which is the memory protection the
+ * early loaders never exercise but game code does.
+ */
+static uint8_t *dma_range(PS3SPU *spu, uint64_t ea, uint32_t size, bool *refused)
+{
+    PS3SPEGroup *g = spu->group;
+
+    *refused = false;
+
+    if (g) {
+        for (unsigned i = 0; i < g->count; i++) {
+            PS3SPU *t = g->spe[i];
+            const uint64_t base = (uint64_t)g->ls_ea_base +
+                                  (uint64_t)i * PS3_LS_SIZE_BYTES;
+
+            if (!t || ea < base || ea + size > base + PS3_LS_SIZE_BYTES) {
+                continue;
             }
+
+            if (t != spu && t->isolated) {
+                spu->protection_faults++;
+                *refused = true;
+                return NULL;
+            }
+
+            return t->ls + (uint32_t)(ea - base);
         }
 
+        /* A range that only partly overlaps an isolated store is refused too. */
+        for (unsigned i = 0; i < g->count; i++) {
+            PS3SPU *t = g->spe[i];
+            const uint64_t base = (uint64_t)g->ls_ea_base +
+                                  (uint64_t)i * PS3_LS_SIZE_BYTES;
+
+            if (t && t != spu && t->isolated &&
+                ea < base + PS3_LS_SIZE_BYTES && ea + size > base) {
+                spu->protection_faults++;
+                *refused = true;
+                return NULL;
+            }
+        }
+    }
+
+    if (ea + size > spu->ext_size) {
+        spu->dma_errors++;
+        return NULL;
+    }
+
+    return spu->ext + ea;
+}
+
+/* One data transfer in either direction, as the MFC command queue sees it. */
+static void mfc_transfer(PS3SPU *spu, uint32_t cmd, uint32_t lsa,
+                         uint64_t ea, uint32_t size, uint32_t tag)
+{
+    const bool get = (cmd & ~0xFu) == MFC_CMD_GET;
+    bool refused = false;
+    uint8_t *ext;
+
+    if (size == 0) {
+        size = MFC_MAX_TRANSFER;
+    }
+    size = MIN(size, MFC_MAX_TRANSFER);
+
+    lsa = (lsa & SPU_LS_MASK & ~0xFu) & spu->lslr;
+    ext = dma_range(spu, ea, size, &refused);
+
+    if (ext && get) {
+        for (uint32_t i = 0; i < size; i++) {
+            spu->ls[((lsa + i) & SPU_LS_MASK) & spu->lslr] = ext[i];
+        }
         spu->mfc_gets++;
         spu->last_get_ea = (uint32_t)ea;
         spu->last_get_size = size;
 
-        /* The first transfers say whether the loader is walking its input as
-         * intended (a size of 0 is the 16 KiB maximum, not an empty one). */
         if (spu->log_events && spu->mfc_gets <= 8) {
             fprintf(stderr,
                     "[spu] get %u bytes ea=0x%" PRIX64 " -> lsa=0x%X at 0x%X"
                     " (cmd=0x%X)\n",
-                    size, ea, lsa, spu->last_pc, spu->mfc_cmd);
+                    size, ea, lsa, spu->last_pc, cmd);
         }
-    } else if (spu->mfc_cmd & 0x20) {       /* MFC_PUT */
+    } else if (ext) {
         for (uint32_t i = 0; i < size; i++) {
-            const uint32_t src = (lsa + i) & SPU_LS_MASK;
-            const uint64_t dst = ea + i;
-
-            if (dst < spu->ext_size) {
-                spu->ext[dst] = (src < spu->ls_size) ? spu->ls[src] : 0;
-            }
+            ext[i] = spu->ls[((lsa + i) & SPU_LS_MASK) & spu->lslr];
         }
-
         spu->mfc_puts++;
         spu->last_put_ea = (uint32_t)ea;
         spu->last_put_size = size;
         spu->last_put_lsa = lsa;
 
-        /* Few enough to be worth a line each, and the only trace of where the
-         * loader sent its output.  Small transfers carry the word itself. */
         if (spu->log_events) {
             if (size == 4) {
                 fprintf(stderr,
@@ -666,55 +802,253 @@ static void mfc_start(PS3SPU *spu)
         }
     }
 
-    tag_complete(spu);
+    /* A store invalidates the group's lock line. */
+    if (spu->group && spu->group->lr_valid &&
+        ea <= spu->group->lr_ea + 127 && ea + size > spu->group->lr_ea) {
+        spu->group->lr_valid = false;
+        spe_event(spu, SPU_EV_LLR_LOST);
+    }
+
+    mfc_tag_complete(spu, tag);
 }
 
-static uint32_t ch_read(PS3SPU *spu, unsigned ch)
+/*
+ * MFC list commands: each element is 8 bytes of {stall bit, pad, 16-bit size,
+ * 32-bit EA low}.  A set stall-and-notify bit stops the walk and raises the
+ * stall event; the command can be resumed with MFC_WrListStallAck, which this
+ * synchronous model treats as "continue with the next element".
+ */
+static void mfc_list(PS3SPU *spu, uint32_t cmd, uint32_t lsa,
+                     uint64_t ea_high, uint32_t size, uint32_t tag)
+{
+    uint32_t off = 0;
+
+    lsa &= SPU_LS_MASK & ~0x7u;
+    size = MIN(size, MFC_MAX_TRANSFER);
+
+    while (off + 8 <= size) {
+        const uint8_t *p = spu->ls + ((lsa + off) & SPU_LS_MASK & spu->lslr);
+        const uint32_t ts = ((uint32_t)p[2] << 8) | p[3];
+
+        if (p[0] & 0x80) {
+            spu->mfc_list_stall = lsa + off;
+            spe_event(spu, SPU_EV_TAG_STALL);
+            return;
+        }
+
+        if ((ts & 0x7FFFu) == 0) {
+            break;
+        }
+
+        mfc_transfer(spu, cmd & ~MFC_FLAG_LIST, lsa + off + 0,
+                     ea_high | (((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                                ((uint32_t)p[6] << 8) | p[7]),
+                     ts & 0x7FFFu, tag);
+        off += 8;
+    }
+}
+
+static void mfc_command(PS3SPU *spu)
+{
+    const uint32_t cmd = spu->mfc_cmd;
+    const uint32_t base = cmd & ~0xFu;
+    const uint32_t size = (spu->mfc_size & 0xFFFF) ? (spu->mfc_size & 0xFFFF)
+                                                   : MFC_MAX_TRANSFER;
+    const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
+
+    if ((cmd & MFC_FLAG_LIST) || base == MFC_CMD_GETL || base == MFC_CMD_PUTL) {
+        mfc_list(spu, base, spu->mfc_lsa, (uint64_t)spu->mfc_eah << 32, size,
+                 spu->mfc_tag);
+        return;
+    }
+
+    switch (base) {
+    case MFC_CMD_PUT:
+    case MFC_CMD_PUTR:
+        mfc_transfer(spu, cmd, spu->mfc_lsa, ea, size, spu->mfc_tag);
+        break;
+
+    case MFC_CMD_GET:
+        mfc_transfer(spu, cmd, spu->mfc_lsa, ea, size, spu->mfc_tag);
+        break;
+
+    case MFC_CMD_SNDSIG:
+        /* A signal to the PPE; there is no data movement to model. */
+        mfc_tag_complete(spu, spu->mfc_tag);
+        break;
+
+    case MFC_CMD_BARRIER:
+    case MFC_CMD_EIEIO:
+    case MFC_CMD_SYNC:
+        /* The engine is synchronous, so ordering commands always succeed. */
+        mfc_tag_complete(spu, spu->mfc_tag);
+        break;
+
+    case MFC_CMD_GETLLAR: {
+        const uint32_t lsa = spu->mfc_lsa & SPU_LS_MASK & ~0x7Fu;
+        bool refused = false;
+        uint8_t *ext = dma_range(spu, ea & ~0x7Full, 128, &refused);
+
+        if (ext && !refused) {
+            memcpy(spu->ls + lsa, ext, 128);
+            if (spu->group) {
+                spu->group->lr_ea = ea & ~0x7Full;
+                spu->group->lr_valid = true;
+                spu->group->lr_owner = spu->id;
+            }
+            spu->mfc_atomic_stat = 4;       /* GETLLAR success */
+        } else {
+            spu->mfc_atomic_stat = 1;
+        }
+        mfc_tag_complete(spu, spu->mfc_tag);
+        break;
+    }
+
+    case MFC_CMD_PUTLLC: {
+        const uint32_t lsa = spu->mfc_lsa & SPU_LS_MASK & ~0x7Fu;
+        const bool valid = spu->group && spu->group->lr_valid &&
+                           spu->group->lr_owner == spu->id &&
+                           spu->group->lr_ea == (ea & ~0x7Full);
+        bool refused = false;
+        uint8_t *ext = valid ? dma_range(spu, ea & ~0x7Full, 128, &refused)
+                             : NULL;
+
+        if (ext && !refused) {
+            memcpy(ext, spu->ls + lsa, 128);
+            spu->mfc_atomic_stat = 0;       /* PUTLLC success */
+        } else {
+            spu->mfc_atomic_stat = 1;       /* reservation was lost */
+        }
+        if (spu->group) {
+            spu->group->lr_valid = false;
+        }
+        mfc_tag_complete(spu, spu->mfc_tag);
+        break;
+    }
+
+    case MFC_CMD_PUTLLUC:
+    case MFC_CMD_PUTQLLUC: {
+        const uint32_t lsa = spu->mfc_lsa & SPU_LS_MASK & ~0x7Fu;
+        bool refused = false;
+        uint8_t *ext = dma_range(spu, ea & ~0x7Full, 128, &refused);
+
+        if (ext && !refused) {
+            memcpy(ext, spu->ls + lsa, 128);
+            spu->mfc_atomic_stat = 2;       /* PUTLLUC success */
+        } else {
+            spu->mfc_atomic_stat = 1;
+        }
+        mfc_tag_complete(spu, spu->mfc_tag);
+        break;
+    }
+
+    default:
+        /* An unknown opcode suspends the queue on hardware; count it. */
+        spu->dma_errors++;
+        mfc_tag_complete(spu, spu->mfc_tag);
+        break;
+    }
+}
+
+/*
+ * Channel reads.  `false' means the channel count was zero and the SPU would
+ * stall: the caller leaves the PC where it is so the next scheduling slot can
+ * retry, which is what makes mailbox and signal handshakes work between SPEs.
+ */
+static bool ch_read(PS3SPU *spu, unsigned ch, uint32_t *value)
 {
     switch (ch) {
     case 0x00:                                  /* SPU_RdEventStat */
-        return spu->event_stat & spu->event_mask;
-    case 0x08:                                  /* SPU_RdDec */
-        return spu->decrementer;
-    case 0x0B:                                  /* SPU_RdEventMask */
-        return spu->event_mask;
-    case 0x0C:                                  /* MFC_RdTagMask */
-        return spu->tag_mask;
-    case 0x0F:                                  /* SPU_RdSRR0 */
-        return spu->srr0;
-    case 0x1D:                                  /* SPU_RdInMbox */
-        if (spu->in_mbox_valid) {
-            spu->in_mbox_valid = false;
-            return spu->in_mbox;
+        if (!(spu->event_stat & spu->event_mask)) {
+            return false;
         }
-        return 0;
-    case 0x03:                                  /* SPU_RdSigNotify1 */
-        return spu->sig_hi;
-    case 0x04:                                  /* SPU_RdSigNotify2 */
-        return spu->sig_lo;
-    case 0x0D:                                  /* SPU_RdMachStat */
-        return 0x00020000;
-    case 0x18:                                  /* MFC_RdTagStat */
-        if (spu->tag_count) {
-            const uint8_t tag = spu->tag_fifo[spu->tag_head];
+        *value = spu->event_stat & spu->event_mask;
+        return true;
 
-            spu->tag_head = (spu->tag_head + 1) % SPU_TAG_FIFO;
-            spu->tag_count--;
-            return 0x80000000u | tag;
+    case 0x03:                                  /* SPU_RdSigNotify1 */
+    case 0x04: {                                /* SPU_RdSigNotify2 */
+        const unsigned n = ch - 0x03;
+
+        if (!spu->signal_pending[n]) {
+            return false;
         }
-        return 0;
+        *value = spu->signal[n];
+        spu->signal[n] = 0;
+        spu->signal_pending[n] = false;
+        return true;
+    }
+
+    case 0x08:                                  /* SPU_RdDec */
+        *value = spu->decrementer;
+        return true;
+
+    case 0x0B:                                  /* SPU_RdEventMask */
+        *value = spu->event_mask;
+        return true;
+
+    case 0x0C:                                  /* MFC_RdTagMask */
+        *value = spu->tag_mask;
+        return true;
+
+    case 0x0D:                                  /* SPU_RdMachStat */
+        /* Bits 30/31 are the isolation and interrupt-enable status the ISA
+         * documents.  Bit 17 is in the implementation-dependent field, and
+         * the mask ROM's entry gate branches on it (0x000 in its listing), so
+         * it stays set exactly as the console's loader finds it. */
+        *value = 0x00020000u | (spu->isolated ? 0x2u : 0u) |
+                 (spu->int_enable ? 1u : 0u);
+        return true;
+
+    case 0x0F:                                  /* SPU_RdSRR0 */
+        *value = spu->srr0;
+        return true;
+
+    case 0x18: {                                /* MFC_RdTagStat */
+        const uint32_t mask = spu->tag_mask ? spu->tag_mask : 0xFFFFFFFFu;
+        const uint32_t done = spu->tag_done & mask;
+
+        if (!done) {
+            return false;
+        }
+        *value = done;
+        spu->tag_done &= ~done;
+        return true;
+    }
+
+    case 0x19:                                  /* MFC_RdListStallStat */
+        *value = spu->mfc_list_stall;
+        return true;
+
+    case 0x1B:                                  /* MFC_RdAtomicStat */
+        *value = spu->mfc_atomic_stat;
+        return true;
+
+    case 0x1D:                                  /* SPU_RdInMbox */
+        if (!spu->in_mbox_count) {
+            return false;
+        }
+        *value = mbox_pop(spu->in_mbox, &spu->in_mbox_head, &spu->in_mbox_count);
+        return true;
+
     case 0x42:                                  /* channel 66: root key */
         if (spu->has_ch66 && spu->ch66_pos < 8) {
-            return be32(spu->ch66 + 4 * spu->ch66_pos++);
+            *value = be32(spu->ch66 + 4 * spu->ch66_pos++);
+        } else {
+            *value = 0;
         }
-        return 0;
+        return true;
+
     case 0x49:                                  /* channel 73: loader version */
         if (spu->has_ch73 && spu->ch73_pos < 2) {
-            return spu->ch73[spu->ch73_pos++];
+            *value = spu->ch73[spu->ch73_pos++];
+        } else {
+            *value = 0;
         }
-        return 0;
+        return true;
+
     default:
-        return 0;
+        *value = 0;
+        return true;
     }
 }
 
@@ -723,87 +1057,119 @@ static uint32_t ch_read_count(PS3SPU *spu, unsigned ch)
     switch (ch) {
     case 0x00:                                  /* SPU_RdEventStat */
         return (spu->event_stat & spu->event_mask) ? 1 : 0;
+    case 0x03:
+    case 0x04:
+        return spu->signal_pending[ch - 0x03] ? 1 : 0;
     case 0x08:                                  /* SPU_RdDec */
     case 0x0B:                                  /* SPU_RdEventMask */
     case 0x0C:                                  /* MFC_RdTagMask */
+    case 0x0D:                                  /* SPU_RdMachStat */
     case 0x0E:                                  /* SPU_WrSRR0 */
     case 0x0F:                                  /* SPU_RdSRR0 */
+    case 0x19:                                  /* MFC_RdListStallStat */
+    case 0x1B:                                  /* MFC_RdAtomicStat */
         return 1;
+    case 0x18: {                                /* MFC_RdTagStat */
+        const uint32_t mask = spu->tag_mask ? spu->tag_mask : 0xFFFFFFFFu;
+
+        return __builtin_popcount(spu->tag_done & mask);
+    }
+    case 0x15:                                  /* MFC_Cmd: free queue slots */
+        return MFC_QUEUE_DEPTH;
+    case 0x1C:                                  /* SPU_WrOutMbox */
+        return 4 - spu->out_mbox_count;
     case 0x1D:                                  /* SPU_RdInMbox */
-        return spu->in_mbox_valid ? 1 : 0;
-    case 0x18:                                  /* MFC_RdTagStat */
-        return spu->tag_count;
+        return spu->in_mbox_count;
+    case 0x1E:                                  /* SPU_WrOutIntrMbox */
+        return 4 - spu->out_intr_count;
     case 0x42:
         return (spu->has_ch66 && spu->ch66_pos < 8) ? 1 : 0;
     case 0x49:
         return (spu->has_ch73 && spu->ch73_pos < 2) ? 2 - spu->ch73_pos : 0;
     default:
-        return 0;
+        return 1;
     }
 }
 
-static void ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
+/* `false' means the write channel was full and the SPU would stall. */
+static bool ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
 {
     switch (ch) {
     case 0x01:                                  /* SPU_WrEventMask */
         spu->event_mask = value;
-        break;
+        return true;
+
     case 0x02:                                  /* SPU_WrEventAck */
         spu->event_stat &= ~value;
-        break;
+        return true;
+
     case 0x07:                                  /* SPU_WrDec */
         spu->decrementer = value;
-        break;
+        return true;
+
+    case 0x09:                                  /* MFC_WrMSSyncReq */
+        spe_event(spu, SPU_EV_MSSYNC);
+        return true;
+
     case 0x0E:                                  /* SPU_WrSRR0 */
         spu->srr0 = value;
-        break;
-    case 0x1C:                                  /* SPU_WrOutMbox */
-    case 0x1E:                                  /* SPU_WrOutIntrMbox */
-        spu->out_mbox = value;
-        break;
-    case 0x19:                                  /* MFC_WrListStallAck */
-    case 0x45:                                  /* SPU_Set_Bkmk_Tag */
-    case 0x46:                                  /* SPU_PM_Start_Ev */
-    case 0x47:                                  /* SPU_PM_Stop_Ev */
-        break;
-    case 0x40:                                  /* SPU_IsoCntl */
-        /*
-         * Isolation is recorded, not enforced: this model's local store is a
-         * flat 256 KiB array with no requestor ID, so there is no boundary to
-         * check.  Reading the state back is what a test needs to see it took.
-         */
-        spu->iso_control = value;
-        break;
+        return true;
+
     case 0x10:                                  /* MFC_LSA */
         spu->mfc_lsa = value;
-        break;
+        return true;
     case 0x11:                                  /* MFC_EAH */
         spu->mfc_eah = value;
-        break;
+        return true;
     case 0x12:                                  /* MFC_EAL */
         spu->mfc_eal = value;
-        break;
+        return true;
     case 0x13:                                  /* MFC_Size */
         spu->mfc_size = value;
-        break;
+        return true;
     case 0x14:                                  /* MFC_TagID */
         spu->mfc_tag = value;
-        break;
-    case 0x15:                                  /* MFC_Cmd: starts the transfer */
+        return true;
+    case 0x15:                                  /* MFC_Cmd: starts the command */
         spu->mfc_cmd = value;
-        mfc_start(spu);
-        break;
+        mfc_command(spu);
+        return true;
     case 0x16:                                  /* MFC_WrTagMask */
         spu->tag_mask = value;
-        break;
+        return true;
     case 0x17:                                  /* MFC_WrTagUpdate */
-        /* The engine is synchronous, so a completion update has nothing to
-         * wait for; the tag queue already holds the result. */
-        break;
+        /* Every command completes synchronously, so an update request has
+         * nothing to wait for; the tag mask already reflects it. */
+        spe_event(spu, SPU_EV_TAG_UPDATE);
+        return true;
+
+    case 0x1A:                                  /* MFC_WrListStallAck */
+        spu->mfc_list_stall = 0;
+        spu->event_stat &= ~SPU_EV_TAG_STALL;
+        spe_event(spu, SPU_EV_QUEUE_VACANCY);
+        return true;
+
+    case 0x1C:                                  /* SPU_WrOutMbox */
+        if (spu->out_mbox_count == 4) {
+            return false;
+        }
+        mbox_push(spu->out_mbox, &spu->out_mbox_head, &spu->out_mbox_count,
+                  value);
+        return true;
+
+    case 0x1E:                                  /* SPU_WrOutIntrMbox */
+        if (spu->out_intr_count == 4) {
+            return false;
+        }
+        mbox_push(spu->out_intr, &spu->out_intr_head, &spu->out_intr_count,
+                  value);
+        return true;
+
     default:
-        break;
+        return true;
     }
 }
+
 
 /* ---- decode ----------------------------------------------------------- */
 
@@ -856,7 +1222,12 @@ PS3SPU *ps3_spu_new(uint8_t *ls, size_t ls_size,
      * loader to put its output past the end of the flash window. */
     spu->ext_size = flash_size + 4 * MiB;
     spu->ext = g_malloc0(spu->ext_size);
+    spu->owns_ext = true;
     spu->log_events = true;
+    spu->lslr = SPU_LS_MASK;
+    spu->runnable = true;
+    spu->signal_overwrite[0] = true;
+    spu->signal_overwrite[1] = true;
 
     if (flash) {
         memcpy(spu->ext, flash, flash_size);
@@ -871,8 +1242,439 @@ void ps3_spu_free(PS3SPU *spu)
         return;
     }
 
-    g_free(spu->ext);
+    if (spu->owns_ext) {
+        g_free(spu->ext);
+    }
     g_free(spu);
+}
+/* ---- SPE groups, run control and the concurrent scheduler -------------- */
+
+/*
+ * A stand-alone SPE owns its external memory; one that belongs to a group
+ * shares the group's.  `owns_ext' is what keeps ps3_spu_free() from freeing
+ * memory it did not allocate.
+ */
+static void spe_init(PS3SPU *spu, unsigned id, PS3SPEGroup *group,
+                     uint8_t *ls, size_t ls_size)
+{
+    spu->id = id;
+    spu->group = group;
+    spu->ls = ls;
+    spu->ls_size = ls_size;
+    spu->lslr = SPU_LS_MASK;
+    spu->runnable = true;
+    spu->signal_overwrite[0] = true;
+    spu->signal_overwrite[1] = true;
+    spu->log_events = true;
+}
+
+PS3SPEGroup *ps3_spes_new(unsigned count, uint8_t *ls_block, size_t block_size,
+                          const uint8_t *flash, size_t flash_size,
+                          uint32_t ls_ea_base)
+{
+    PS3SPEGroup *g;
+
+    if (count == 0 || count > PS3_SPE_MAX) {
+        return NULL;
+    }
+    if (!ls_block || block_size < (size_t)count * PS3_LS_SIZE_BYTES) {
+        return NULL;
+    }
+
+    g = g_new0(PS3SPEGroup, 1);
+    g->count = count;
+    g->ls_block = ls_block;
+    g->ls_block_size = block_size;
+    g->ls_ea_base = ls_ea_base;
+
+    g->ext_size = flash_size + 4 * MiB;
+    g->ext = g_malloc0(g->ext_size);
+    g->ext_owned = true;
+    if (flash) {
+        memcpy(g->ext, flash, flash_size);
+    }
+
+    for (unsigned i = 0; i < count; i++) {
+        PS3SPU *spu = g_new0(PS3SPU, 1);
+
+        spe_init(spu, i, g, ls_block + (size_t)i * PS3_LS_SIZE_BYTES,
+                 PS3_LS_SIZE_BYTES);
+        spu->ext = g->ext;
+        spu->ext_size = g->ext_size;
+        g->spe[i] = spu;
+    }
+
+    return g;
+}
+
+void ps3_spes_free(PS3SPEGroup *g)
+{
+    if (!g) {
+        return;
+    }
+
+    for (unsigned i = 0; i < g->count; i++) {
+        g_free(g->spe[i]);
+    }
+    if (g->ext_owned) {
+        g_free(g->ext);
+    }
+    g_free(g);
+}
+
+unsigned ps3_spes_count(const PS3SPEGroup *g)
+{
+    return g ? g->count : 0;
+}
+
+PS3SPU *ps3_spes_spu(PS3SPEGroup *g, unsigned n)
+{
+    return (g && n < g->count) ? g->spe[n] : NULL;
+}
+
+uint64_t ps3_spes_cycles(const PS3SPEGroup *g)
+{
+    uint64_t widest = 0;
+
+    if (!g) {
+        return 0;
+    }
+
+    for (unsigned i = 0; i < g->count; i++) {
+        if (g->spe[i] && g->spe[i]->cycles > widest) {
+            widest = g->spe[i]->cycles;
+        }
+    }
+    return widest;
+}
+
+uint64_t ps3_spes_mfc_gets(const PS3SPEGroup *g)
+{
+    uint64_t n = 0;
+
+    for (unsigned i = 0; g && i < g->count; i++) {
+        n += g->spe[i] ? g->spe[i]->mfc_gets : 0;
+    }
+    return n;
+}
+
+uint64_t ps3_spes_mfc_puts(const PS3SPEGroup *g)
+{
+    uint64_t n = 0;
+
+    for (unsigned i = 0; g && i < g->count; i++) {
+        n += g->spe[i] ? g->spe[i]->mfc_puts : 0;
+    }
+    return n;
+}
+
+uint64_t ps3_spes_protection_faults(const PS3SPEGroup *g)
+{
+    uint64_t n = 0;
+
+    for (unsigned i = 0; g && i < g->count; i++) {
+        n += g->spe[i] ? g->spe[i]->protection_faults : 0;
+    }
+    return n;
+}
+
+uint8_t *ps3_spes_ext_ptr(PS3SPEGroup *g, size_t *size)
+{
+    if (size) {
+        *size = g ? g->ext_size : 0;
+    }
+    return g ? g->ext : NULL;
+}
+
+void ps3_spes_map_ext(PS3SPEGroup *g, uint8_t *ext, size_t size)
+{
+    if (!g || !ext || !size) {
+        return;
+    }
+
+    if (g->ext_owned) {
+        g_free(g->ext);
+    }
+
+    g->ext = ext;
+    g->ext_size = size;
+    g->ext_owned = false;
+
+    for (unsigned i = 0; i < g->count; i++) {
+        if (g->spe[i]) {
+            g->spe[i]->ext = ext;
+            g->spe[i]->ext_size = size;
+            g->spe[i]->owns_ext = false;
+        }
+    }
+}
+
+/* Execute one instruction.  Returns a PS3_SPU_* status, or -1 to mean the
+ * instruction issued and the SPE can keep going. */
+static int spe_step(PS3SPU *spu, char *why, size_t why_len)
+{
+    const uint32_t pc = spu->pc;
+
+    spu->stalled = false;
+    spu->insns++;
+
+    if (!execute(spu, pc, why, why_len)) {
+        return spu->halted ? PS3_SPU_STOPPED : PS3_SPU_FAULT;
+    }
+
+    return spu->stalled ? PS3_SPU_BLOCKED : -1;
+}
+
+int ps3_spes_run_quantum(PS3SPEGroup *g, uint64_t slice,
+                         uint64_t *insns_run, char *why, size_t why_len)
+{
+    uint64_t ran = 0;
+
+    if (!g) {
+        return PS3_SPU_FAULT;
+    }
+
+    for (uint64_t n = 0; n < slice; n++) {
+        bool progressed = false;
+
+        for (unsigned i = 0; i < g->count; i++) {
+            PS3SPU *spu = g->spe[i];
+            int rc;
+
+            if (!spu || spu->halted || !spu->runnable) {
+                continue;
+            }
+
+            rc = spe_step(spu, why, why_len);
+            if (rc == PS3_SPU_FAULT) {
+                if (insns_run) {
+                    *insns_run = ran;
+                }
+                return rc;
+            }
+            if (rc < 0) {
+                ran++;
+                progressed = true;
+            }
+        }
+
+        if (!progressed) {
+            break;      /* every runnable SPE is halted or waiting */
+        }
+    }
+
+    if (insns_run) {
+        *insns_run = ran;
+    }
+
+    for (unsigned i = 0; i < g->count; i++) {
+        PS3SPU *spu = g->spe[i];
+
+        if (spu && !spu->halted && spu->runnable && !spu->stalled) {
+            snprintf(why, why_len, "SPE %u still running at 0x%X after %" PRIu64
+                     " instructions", i, spu->pc, ran);
+            return PS3_SPU_LIMIT;
+        }
+    }
+
+    for (unsigned i = 0; i < g->count; i++) {
+        PS3SPU *spu = g->spe[i];
+
+        if (spu && spu->stalled && !spu->halted) {
+            snprintf(why, why_len, "SPE %u blocked on a channel at 0x%X",
+                     i, spu->pc);
+            return PS3_SPU_BLOCKED;
+        }
+    }
+
+    snprintf(why, why_len, "all %u SPEs halted (%" PRIu64 " instructions, "
+             "%" PRIu64 " MFC gets, %" PRIu64 " puts, %" PRIu64
+             " protection faults)",
+             g->count, ran, ps3_spes_mfc_gets(g), ps3_spes_mfc_puts(g),
+             ps3_spes_protection_faults(g));
+    return PS3_SPU_STOPPED;
+}
+
+/* ---- PPU-side SPE control --------------------------------------------- */
+
+void ps3_spe_run(PS3SPU *spu, bool run)
+{
+    if (spu) {
+        spu->runnable = run;
+        spu->stalled = false;
+    }
+}
+
+bool ps3_spe_running(const PS3SPU *spu)
+{
+    return spu && spu->runnable && !spu->halted;
+}
+
+bool ps3_spe_halted(const PS3SPU *spu)
+{
+    return spu && spu->halted;
+}
+
+void ps3_spe_reset(PS3SPU *spu)
+{
+    if (!spu) {
+        return;
+    }
+
+    spu->halted = false;
+    spu->stalled = false;
+    spu->pc = 0;
+    spu->srr0 = 0;
+    spu->event_stat = 0;
+    spu->event_mask = 0;
+    spu->tag_done = 0;
+    spu->mfc_atomic_stat = 0;
+    spu->mfc_list_stall = 0;
+    spu->protection_faults = 0;
+    spu->dma_errors = 0;
+    spu->cycles = 0;
+    spu->dual_issue_pairs = 0;
+    spu->stall_cycles = 0;
+    spu->last_pipe_valid = false;
+    memset(spu->reg_ready, 0, sizeof(spu->reg_ready));
+}
+
+/*
+ * Isolation load and exit requests, the SPU_RunCntl values 10 and 11.  An
+ * isolation load also forces the local-storage limit to the full store, as the
+ * architecture specifies.
+ */
+void ps3_spe_request_isolation(PS3SPU *spu)
+{
+    if (!spu) {
+        return;
+    }
+
+    spu->isolated = true;
+    spu->lslr = SPU_LS_MASK;
+    spu->event_stat |= SPU_EV_PRIV_ATTN;
+}
+
+void ps3_spe_exit_isolation(PS3SPU *spu)
+{
+    if (spu) {
+        spu->isolated = false;
+    }
+}
+
+bool ps3_spe_isolated(const PS3SPU *spu)
+{
+    return spu && spu->isolated;
+}
+
+uint32_t ps3_spe_pc(const PS3SPU *spu)
+{
+    return spu ? spu->pc : 0;
+}
+
+void ps3_spe_set_pc(PS3SPU *spu, uint32_t pc)
+{
+    if (spu) {
+        spu->pc = pc & SPU_LS_MASK;
+    }
+}
+
+void ps3_spe_set_ls_limit(PS3SPU *spu, uint32_t limit)
+{
+    if (spu) {
+        /* The limit is an address mask; keep it quadword aligned and inside
+         * the store so a wrapped access always lands somewhere real. */
+        spu->lslr = limit & SPU_LS_MASK & ~0xFu;
+    }
+}
+
+uint32_t ps3_spe_ls_limit(const PS3SPU *spu)
+{
+    return spu ? spu->lslr : 0;
+}
+
+bool ps3_spe_push_in_mbox(PS3SPU *spu, uint32_t value)
+{
+    if (!spu || spu->in_mbox_count == 4) {
+        return false;
+    }
+
+    mbox_push(spu->in_mbox, &spu->in_mbox_head, &spu->in_mbox_count, value);
+    spe_event(spu, SPU_EV_MBOX_IN);
+    return true;
+}
+
+bool ps3_spe_pop_out_mbox(PS3SPU *spu, uint32_t *value)
+{
+    if (!spu || !spu->out_mbox_count) {
+        return false;
+    }
+
+    if (value) {
+        *value = mbox_pop(spu->out_mbox, &spu->out_mbox_head,
+                          &spu->out_mbox_count);
+    } else {
+        mbox_pop(spu->out_mbox, &spu->out_mbox_head, &spu->out_mbox_count);
+    }
+
+    spe_event(spu, SPU_EV_MBOX_ROOM);
+    return true;
+}
+
+bool ps3_spe_pop_out_intr_mbox(PS3SPU *spu, uint32_t *value)
+{
+    if (!spu || !spu->out_intr_count) {
+        return false;
+    }
+
+    if (value) {
+        *value = mbox_pop(spu->out_intr, &spu->out_intr_head,
+                          &spu->out_intr_count);
+    } else {
+        mbox_pop(spu->out_intr, &spu->out_intr_head, &spu->out_intr_count);
+    }
+
+    spe_event(spu, SPU_EV_INT_MBOX_ROOM);
+    return true;
+}
+
+void ps3_spe_set_signal(PS3SPU *spu, unsigned which, uint32_t value)
+{
+    if (!spu || which > 1) {
+        return;
+    }
+
+    if (spu->signal_overwrite[which]) {
+        spu->signal[which] = value;
+        spu->signal_pending[which] = true;
+    } else {
+        spu->signal[which] |= value;
+        spu->signal_pending[which] = spu->signal[which] != 0;
+    }
+
+    spe_event(spu, which ? SPU_EV_SIG2 : SPU_EV_SIG1);
+}
+
+void ps3_spe_set_signal_overwrite(PS3SPU *spu, unsigned which, bool overwrite)
+{
+    if (spu && which <= 1) {
+        spu->signal_overwrite[which] = overwrite;
+    }
+}
+
+uint64_t ps3_spu_stall_cycles(const PS3SPU *spu)
+{
+    return spu ? spu->stall_cycles : 0;
+}
+
+uint64_t ps3_spu_protection_faults(const PS3SPU *spu)
+{
+    return spu ? spu->protection_faults : 0;
+}
+
+uint64_t ps3_spu_dma_errors(const PS3SPU *spu)
+{
+    return spu ? spu->dma_errors : 0;
 }
 
 void ps3_spu_set_ch66(PS3SPU *spu, const uint8_t key[32])
@@ -894,6 +1696,13 @@ void ps3_spu_set_sig(PS3SPU *spu, uint32_t hi, uint32_t lo)
 {
     spu->sig_hi = hi;
     spu->sig_lo = lo;
+
+    /* The ROM reads these through channels 3 and 4, which are the signal
+     * notification registers: arm both so the entry gate does not wait. */
+    spu->signal[0] = hi;
+    spu->signal[1] = lo;
+    spu->signal_pending[0] = true;
+    spu->signal_pending[1] = true;
 }
 
 void ps3_spu_set_reg(PS3SPU *spu, unsigned reg, uint32_t value)
@@ -924,6 +1733,77 @@ uint32_t ps3_spu_gpr_word(const PS3SPU *spu, unsigned reg, unsigned lane)
 unsigned ps3_spu_stop_code(const PS3SPU *spu)
 {
     return spu->stop_code;
+}
+
+void ps3_spu_set_gpr64(PS3SPU *spu, unsigned reg, uint64_t value)
+{
+    spu->gpr[reg & 127][2] = (uint32_t)(value >> 32);
+    spu->gpr[reg & 127][3] = (uint32_t)value;
+}
+
+void ps3_spu_load_ls(PS3SPU *spu, uint32_t lsa, const void *src, size_t len)
+{
+    const uint8_t *p = src;
+    size_t done = 0;
+
+    if (!spu || !p) {
+        return;
+    }
+
+    while (done < len) {
+        size_t at = (lsa + done) & SPU_LS_MASK;
+        size_t n = MIN(len - done, (size_t)PS3_LS_SIZE_BYTES - at);
+
+        memcpy(spu->ls + at, p + done, n);
+        done += n;
+    }
+}
+
+void ps3_spu_fill_ls(PS3SPU *spu, uint32_t lsa, size_t len, uint32_t value)
+{
+    size_t done = 0;
+
+    if (!spu) {
+        return;
+    }
+
+    while (done < len) {
+        size_t at = (lsa + done) & SPU_LS_MASK;
+        size_t n = MIN(len - done, (size_t)PS3_LS_SIZE_BYTES - at);
+        size_t i;
+
+        for (i = 0; i + 4 <= n; i += 4) {
+            put_be32(spu->ls + at + i, value);
+        }
+        done += n;
+    }
+}
+
+const uint8_t *ps3_spu_ls_ptr(const PS3SPU *spu, uint32_t lsa)
+{
+    return spu->ls + (lsa & SPU_LS_MASK);
+}
+
+uint32_t ps3_spu_ls_read32(const PS3SPU *spu, uint32_t lsa)
+{
+    return be32(spu->ls + (lsa & SPU_LS_MASK & ~3u));
+}
+
+uint64_t ps3_spu_ls_read64(const PS3SPU *spu, uint32_t lsa)
+{
+    return ((uint64_t)ps3_spu_ls_read32(spu, lsa) << 32) |
+           ps3_spu_ls_read32(spu, lsa + 4);
+}
+
+void ps3_spu_ls_write32(PS3SPU *spu, uint32_t lsa, uint32_t value)
+{
+    put_be32(spu->ls + (lsa & SPU_LS_MASK & ~3u), value);
+}
+
+void ps3_spu_ls_write64(PS3SPU *spu, uint32_t lsa, uint64_t value)
+{
+    ps3_spu_ls_write32(spu, lsa, (uint32_t)(value >> 32));
+    ps3_spu_ls_write32(spu, lsa + 4, (uint32_t)value);
 }
 
 uint64_t ps3_spu_cycles(const PS3SPU *spu)
@@ -1018,6 +1898,169 @@ static int spu_isa_fail(char *why, size_t why_len, const char *what,
             return spu_isa_fail(why, why_len, what, got_, want_);           \
         }                                                                  \
     } while (0)
+
+static uint32_t t_stqd(unsigned rt, unsigned ra, unsigned i10)
+{
+    return (0x24u << 24) | ((i10 & 0x3FF) << 14) | (ra << 7) | rt;
+}
+
+/*
+ * The concurrent half of the self-test.  Two SPEs share external memory: one
+ * stores a word through the MFC and posts its mailbox, the other polls the
+ * same address until the word arrives.  Then the isolation check runs the
+ * producer again with the receiver marked isolated and the DMA aimed at its
+ * local store, which must be refused and counted.
+ */
+#define SPES_LS_EA 0xF1000000u
+
+static void spe_emit(uint8_t *ls, unsigned *pc, uint32_t word)
+{
+    put_be32(ls + *pc, word);
+    *pc += 4;
+}
+
+/* il (or ilhu/iohl for a full word) then wrch: one MFC parameter. */
+static void spe_mfc_param(uint8_t *ls, unsigned *pc, uint32_t value,
+                          unsigned channel)
+{
+    if (value > 0xFFFFu) {
+        spe_emit(ls, pc, t_il(0x082, 3, value >> 16));       /* ilhu */
+        spe_emit(ls, pc, t_il(0x0C1, 3, value & 0xFFFFu));   /* iohl */
+    } else {
+        spe_emit(ls, pc, t_il(0x081, 3, value));
+    }
+    spe_emit(ls, pc, t_rrr(0x10D, 3, channel, 0));
+}
+
+static void spe_prog_put(uint8_t *ls, uint32_t eal)
+{
+    unsigned pc = 0;
+
+    spe_emit(ls, &pc, t_il(0x081, 2, 0x600D));
+    spe_emit(ls, &pc, t_stqd(2, 0, 0x20));      /* data at LS 0x200 */
+    spe_mfc_param(ls, &pc, 4, 0x13);            /* MFC_Size */
+    spe_mfc_param(ls, &pc, 0, 0x14);            /* MFC_TagID */
+    spe_mfc_param(ls, &pc, eal, 0x12);          /* MFC_EAL */
+    spe_mfc_param(ls, &pc, 0, 0x11);            /* MFC_EAH */
+    spe_mfc_param(ls, &pc, 0x200, 0x10);        /* MFC_LSA */
+    spe_mfc_param(ls, &pc, 0x20, 0x15);         /* MFC_Cmd = PUT */
+    spe_mfc_param(ls, &pc, 0x1111, 0x1C);       /* outbound mailbox */
+    spe_emit(ls, &pc, 0);                       /* stop */
+}
+
+static void spe_prog_get(uint8_t *ls, uint32_t eal)
+{
+    unsigned pc = 0;
+    const unsigned retry = 0x28;
+
+    spe_mfc_param(ls, &pc, 4, 0x13);
+    spe_mfc_param(ls, &pc, 0, 0x14);
+    spe_mfc_param(ls, &pc, eal, 0x12);
+    spe_mfc_param(ls, &pc, 0, 0x11);
+    spe_mfc_param(ls, &pc, 0x40, 0x10);         /* LSA */
+    spe_mfc_param(ls, &pc, 0x40, 0x15);         /* MFC_Cmd = GET */
+    spe_emit(ls, &pc, t_lqd(4, 0, 4));          /* LS 0x40 */
+    spe_emit(ls, &pc, t_il(0x040, 4, ((int)(retry - pc)) / 4)); /* brz */
+    spe_emit(ls, &pc, 0);                       /* stop */
+}
+
+static int spes_selftest(char *why, size_t why_len)
+{
+    uint8_t *block = g_malloc0(2 * PS3_LS_SIZE_BYTES);
+    PS3SPEGroup *g = ps3_spes_new(2, block, 2 * PS3_LS_SIZE_BYTES, NULL, 0,
+                                  SPES_LS_EA);
+    PS3SPU *a, *b;
+    uint64_t insns = 0;
+    uint32_t word = 0;
+    int rc;
+
+    if (!g) {
+        g_free(block);
+        snprintf(why, why_len, "SPE group: allocation failed");
+        return -1;
+    }
+
+    a = ps3_spes_spu(g, 0);
+    b = ps3_spes_spu(g, 1);
+
+    spe_prog_put(a->ls, 0x2000);
+    spe_prog_get(b->ls, 0x2000);
+    ps3_spe_set_pc(a, 0);
+    ps3_spe_set_pc(b, 0);
+    ps3_spe_run(a, true);
+    ps3_spe_run(b, true);
+
+    rc = ps3_spes_run_quantum(g, 4000, &insns, why, why_len);
+    if (rc != PS3_SPU_STOPPED) {
+        char inner[160];
+
+        snprintf(inner, sizeof(inner), "%s", why);
+        snprintf(why, why_len, "SPE concurrency: %s (rc=%d, A pc=0x%X %s, "
+                 "B pc=0x%X %s, shared=0x%08X)", inner, rc, a->pc,
+                 a->halted ? "halted" : "running", b->pc,
+                 b->halted ? "halted" : "running", be32(g->ext + 0x2000));
+        ps3_spes_free(g);
+        g_free(block);
+        return -1;
+    }
+
+    if (be32(g->ext + 0x2000) != 0x600D || be32(b->ls + 0x40) != 0x600D) {
+        snprintf(why, why_len, "SPE concurrency: shared word 0x%08X, "
+                 "received 0x%08X, want 0x600D",
+                 be32(g->ext + 0x2000), be32(b->ls + 0x40));
+        ps3_spes_free(g);
+        g_free(block);
+        return -1;
+    }
+
+    if (!ps3_spe_pop_out_mbox(a, &word) || word != 0x1111) {
+        snprintf(why, why_len, "SPE concurrency: mailbox 0x%08X, want 0x1111",
+                 word);
+        ps3_spes_free(g);
+        g_free(block);
+        return -1;
+    }
+
+    if (ps3_spu_cycles(a) == 0 || ps3_spu_cycles(b) == 0) {
+        snprintf(why, why_len, "SPE timing: no issue cycles recorded");
+        ps3_spes_free(g);
+        g_free(block);
+        return -1;
+    }
+
+    /* Isolation: the receiver is put into the isolated state, so a DMA that
+     * targets its local store must be refused. */
+    ps3_spe_reset(a);
+    ps3_spe_reset(b);
+    memset(block, 0, 2 * PS3_LS_SIZE_BYTES);
+    ps3_spe_request_isolation(b);
+    spe_prog_put(a->ls, SPES_LS_EA + PS3_LS_SIZE_BYTES);
+    ps3_spe_set_pc(a, 0);
+    ps3_spe_run(a, true);
+    ps3_spe_run(b, false);
+
+    rc = ps3_spes_run_quantum(g, 400, &insns, why, why_len);
+    if (rc != PS3_SPU_STOPPED) {
+        snprintf(why, why_len, "SPE isolation: %s", why);
+        ps3_spes_free(g);
+        g_free(block);
+        return -1;
+    }
+
+    if (ps3_spu_protection_faults(a) != 1 || be32(b->ls + 0x10) != 0) {
+        snprintf(why, why_len, "SPE isolation: %" PRIu64
+                 " faults, target word 0x%08X (want 1 and 0)",
+                 ps3_spu_protection_faults(a), be32(b->ls + 0x10));
+        ps3_spes_free(g);
+        g_free(block);
+        return -1;
+    }
+
+    ps3_spe_exit_isolation(b);
+    ps3_spes_free(g);
+    g_free(block);
+    return 0;
+}
 
 /*
  * Run a program that touches every family the interpreter implements and
@@ -1193,7 +2236,10 @@ int ps3_spu_isa_selftest(char *why, size_t why_len)
 
     ps3_spu_free(spu);
     g_free(ls);
-    return 0;
+
+    /* The concurrent and isolation half of the check needs a group, so it
+     * lives in its own function and runs after the single-SPE program. */
+    return spes_selftest(why, why_len);
 #undef EMIT
 }
 
@@ -1292,6 +2338,112 @@ static bool kind_is_branch(unsigned kind)
         return true;
     default:
         return false;
+    }
+}
+
+/*
+ * Result latency by family, in issue cycles: the SPU's local-store and
+ * floating-point results arrive in the sixth cycle after issue, integer
+ * multiply and the shuffle/rotate group are shorter, and the simple ALU and
+ * control operations are single-cycle.  These are the documented pipeline
+ * depths used as an estimate; they are not silicon-measured numbers.
+ */
+static unsigned kind_latency(unsigned kind)
+{
+    switch (kind) {
+    case K_LQD: case K_LQX: case K_LQA: case K_LQR:
+    case K_FA: case K_FS: case K_FM: case K_FMA: case K_FMS: case K_FNMS:
+    case K_FREST: case K_FRSQEST: case K_FI: case K_FESD: case K_FRDS:
+    case K_CSFLT: case K_CUFLT: case K_CFLTS: case K_CFLTU:
+    case K_FCEQ: case K_FCGT: case K_FCMEQ: case K_FCMGT:
+    case K_DFA: case K_DFS: case K_DFM: case K_DFMA: case K_DFMS:
+    case K_DFNMS: case K_DFNMA: case K_DFCEQ: case K_DFCGT:
+    case K_DFCMEQ: case K_DFCMGT: case K_DFTSV:
+    case K_RDCH: case K_RCHCNT:
+        return 6;
+    case K_SHUFB: case K_SELB: case K_CBD: case K_CBX: case K_CHD:
+    case K_CHX: case K_CWD: case K_CWX: case K_CDD: case K_CDX:
+        return 4;
+    case K_MPY: case K_MPYU: case K_MPYI: case K_MPYUI: case K_MPYA:
+    case K_MPYS: case K_MPYH: case K_MPYHH: case K_MPYHHA:
+    case K_MPYHHU: case K_MPYHHAU:
+    case K_SHL: case K_SHLH: case K_SHLI: case K_SHLHI:
+    case K_ROT: case K_ROTH: case K_ROTI: case K_ROTHI:
+    case K_ROTM: case K_ROTHM: case K_ROTMI: case K_ROTHMI:
+    case K_ROTMA: case K_ROTMAH: case K_ROTMAI: case K_ROTMAHI:
+    case K_ROTQBY: case K_ROTQBYI: case K_ROTQBYBI:
+    case K_ROTQMBY: case K_ROTQMBYI: case K_ROTMQBYBI:
+    case K_ROTQBI: case K_ROTQBII: case K_ROTMQBI: case K_ROTQMBII:
+    case K_SHLQBY: case K_SHLQBYI: case K_SHLQBYBI:
+        return 2;
+    default:
+        return 1;
+    }
+}
+
+/* Register reads and writes, for the hazard estimate. */
+static bool kind_reads_ra(unsigned kind)
+{
+    switch (kind) {
+    case K_IL: case K_ILH: case K_ILHU: case K_ILA: case K_IOHL:
+    case K_FSMBI: case K_NONE: case K_HALT: case K_BR: case K_BRA:
+    case K_BRSL: case K_BRASL: case K_RDCH: case K_RCHCNT: case K_IRET:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool kind_reads_rb(unsigned kind)
+{
+    switch (kind) {
+    /* immediate forms and address/immediate loads do not use RB */
+    case K_IL: case K_ILH: case K_ILHU: case K_ILA: case K_IOHL:
+    case K_FSMBI: case K_LQD: case K_STQD: case K_LQA: case K_STQA:
+    case K_LQR: case K_STQR: case K_AI: case K_AHI: case K_SFI:
+    case K_SFHI: case K_ORI: case K_ORHI: case K_ORBI: case K_ANDI:
+    case K_ANDHI: case K_ANDBI: case K_XORI: case K_XORHI: case K_XORBI:
+    case K_CGTI: case K_CGTHI: case K_CGTBI: case K_CLGTI: case K_CLGTHI:
+    case K_CLGTBI: case K_CEQI: case K_CEQHI: case K_CEQBI: case K_MPYI:
+    case K_MPYUI:
+    case K_SHLI: case K_SHLHI: case K_ROTI: case K_ROTHI: case K_ROTMI:
+    case K_ROTHMI: case K_ROTMAI: case K_ROTMAHI: case K_SHLQBYI:
+    case K_ROTQBYI: case K_ROTQMBYI: case K_ROTQBII: case K_ROTQMBII:
+    case K_CBD: case K_CHD: case K_CWD: case K_CDD:
+    case K_NONE: case K_HALT: case K_RDCH: case K_WRCH: case K_RCHCNT:
+    case K_STOPD:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool kind_reads_rt(unsigned kind)
+{
+    switch (kind) {
+    case K_SHUFB: case K_SELB: case K_MPYA:
+    case K_FMA: case K_FMS: case K_FNMS:
+    case K_DFMA: case K_DFMS: case K_DFNMA: case K_DFNMS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool kind_writes_rt(unsigned kind)
+{
+    switch (kind) {
+    case K_NONE: case K_HALT: case K_STOPD:
+    case K_BR: case K_BRA: case K_BRZ: case K_BRNZ: case K_BRHZ:
+    case K_BRHNZ: case K_BI: case K_BIZ: case K_BINZ: case K_BIHZ:
+    case K_BIHNZ: case K_IRET:
+    case K_STQD: case K_STQX: case K_STQA: case K_STQR:
+    case K_WRCH: case K_MTSPR: case K_FSCRWR:
+    case K_HEQ: case K_HEQI: case K_HGT: case K_HGTI: case K_HLGT:
+    case K_HLGTI:
+        return false;
+    default:
+        return true;
     }
 }
 
@@ -2260,12 +3412,25 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
         break;
 
     /* ---- channels --------------------------------------------------- */
-    case K_RDCH:
-        gpr_fill(spu, in.rt, ch_read(spu, in.ra));
+    case K_RDCH: {
+        uint32_t v;
+
+        if (!ch_read(spu, in.ra, &v)) {
+            /* Blocking channel with a zero count: leave the PC here and let
+             * the scheduler retry.  This is how mailbox and signal handshakes
+             * between SPEs make progress. */
+            spu->stalled = true;
+            return true;
+        }
+        gpr_fill(spu, in.rt, v);
         break;
+    }
 
     case K_WRCH:
-        ch_write(spu, in.ra, scw(spu, in.rt));
+        if (!ch_write(spu, in.ra, scw(spu, in.rt))) {
+            spu->stalled = true;
+            return true;
+        }
         break;
 
     case K_RCHCNT:
@@ -2700,24 +3865,51 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
     }
 
     /*
-     * Issue accounting.  Two instructions that use different pipes share a
-     * cycle; a control transfer breaks the pair because the next fetch is not
-     * known when the branch issues.  This is an estimate of issue slots, not a
-     * cycle-accurate timing model (there are no stalls, hazards or latencies).
+     * Issue accounting.  Two instructions on different pipes share a cycle;
+     * a control transfer breaks the pair because the next fetch is not known
+     * when the branch issues.  An instruction that reads a register before the
+     * previous writer's result is available waits out the difference, which is
+     * where the latency classes above matter.  This is a documented estimate
+     * of issue cycles, not a cycle-accurate Cell pipeline.
      */
-    if (kind_is_branch(in.op->kind)) {
-        spu->cycles++;
-        spu->last_pipe_valid = false;
-    } else {
-        const bool even = kind_even_pipe(in.op->kind);
+    {
+        const bool branch = kind_is_branch(in.op->kind);
+        uint64_t issue = spu->cycles;
 
-        if (spu->last_pipe_valid && even != spu->last_pipe_even) {
-            spu->dual_issue_pairs++;
+        if (kind_reads_ra(in.op->kind) && spu->reg_ready[in.ra & 127] > issue) {
+            issue = spu->reg_ready[in.ra & 127];
+        }
+        if (kind_reads_rb(in.op->kind) && spu->reg_ready[in.rb & 127] > issue) {
+            issue = spu->reg_ready[in.rb & 127];
+        }
+        if (kind_reads_rt(in.op->kind) && spu->reg_ready[in.rt & 127] > issue) {
+            issue = spu->reg_ready[in.rt & 127];
+        }
+
+        if (issue > spu->cycles) {
+            spu->stall_cycles += issue - spu->cycles;
+            spu->cycles = issue;
+            spu->last_pipe_valid = false;
+        }
+
+        if (branch) {
+            spu->cycles++;
             spu->last_pipe_valid = false;
         } else {
-            spu->cycles++;
-            spu->last_pipe_valid = true;
-            spu->last_pipe_even = even;
+            const bool even = kind_even_pipe(in.op->kind);
+
+            if (spu->last_pipe_valid && even != spu->last_pipe_even) {
+                spu->dual_issue_pairs++;
+                spu->last_pipe_valid = false;
+            } else {
+                spu->cycles++;
+                spu->last_pipe_valid = true;
+                spu->last_pipe_even = even;
+            }
+        }
+
+        if (kind_writes_rt(in.op->kind)) {
+            spu->reg_ready[in.rt & 127] = spu->cycles + kind_latency(in.op->kind);
         }
     }
 
@@ -2751,14 +3943,16 @@ static void report_hot(PS3SPU *spu, const char *what, char *why, size_t why_len)
 
 static void run_reset(PS3SPU *spu)
 {
-    spu->tag_head = 0;
-    spu->tag_count = 0;
+    spu->tag_done = 0;
     spu->stop_code = 0;
     spu->halted = false;
+    spu->stalled = false;
     spu->cycles = 0;
     spu->dual_issue_pairs = 0;
+    spu->stall_cycles = 0;
     spu->last_pipe_even = false;
     spu->last_pipe_valid = false;
+    memset(spu->reg_ready, 0, sizeof(spu->reg_ready));
     memset(spu->hot, 0, sizeof(spu->hot));
 
     for (unsigned i = 0; i < ARRAY_SIZE(spu->hist); i++) {
@@ -2775,6 +3969,7 @@ int ps3_spu_run_to(PS3SPU *spu, uint32_t entry, uint32_t stop_pc,
 
     for (uint64_t i = 0; i < limit; i++) {
         const uint32_t pc = spu->pc;
+        int rc;
 
         if (pc == stop_pc) {
             snprintf(why, why_len, "reached 0x%X after %" PRIu64
@@ -2782,10 +3977,17 @@ int ps3_spu_run_to(PS3SPU *spu, uint32_t entry, uint32_t stop_pc,
             return 0;
         }
 
-        spu->insns++;
-
-        if (!execute(spu, pc, why, why_len)) {
-            return spu->halted ? 0 : 2;
+        rc = spe_step(spu, why, why_len);
+        if (rc == PS3_SPU_FAULT) {
+            return PS3_SPU_FAULT;
+        }
+        if (rc == PS3_SPU_BLOCKED) {
+            snprintf(why, why_len, "blocked on a channel at 0x%X after "
+                     "%" PRIu64 " instructions", spu->pc, spu->insns);
+            return PS3_SPU_BLOCKED;
+        }
+        if (rc == PS3_SPU_STOPPED) {
+            return 0;
         }
     }
 
@@ -2808,12 +4010,18 @@ int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
     run_reset(spu);
 
     for (uint64_t i = 0; i < limit; i++) {
-        const uint32_t pc = spu->pc;
+        const int rc = spe_step(spu, why, why_len);
 
-        spu->insns++;
-
-        if (!execute(spu, pc, why, why_len)) {
-            return spu->halted ? 0 : 2;
+        if (rc == PS3_SPU_FAULT) {
+            return PS3_SPU_FAULT;
+        }
+        if (rc == PS3_SPU_BLOCKED) {
+            snprintf(why, why_len, "blocked on a channel at 0x%X after "
+                     "%" PRIu64 " instructions", spu->pc, spu->insns);
+            return PS3_SPU_BLOCKED;
+        }
+        if (rc == PS3_SPU_STOPPED) {
+            return PS3_SPU_STOPPED;
         }
     }
 

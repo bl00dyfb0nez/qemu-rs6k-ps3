@@ -355,6 +355,9 @@ static const TypeInfo ps3_mic_info = {
 
 #define PS3_ROM_SIZE        0x400
 #define PS3_LS_SIZE         0x40000
+/* Where the model exposes every SPE's local store to the PPU.  SPE 0 also
+ * keeps the old 0xF1000000 window used by the boot path. */
+#define PS3_SPES_LS_BASE    0xF2000000
 #define PS3_CONTAINER_HDR   0x40
 #define PS3_ROM_MAX_BLOCKS  0x3DC0
 
@@ -688,6 +691,48 @@ typedef struct PS3Sem {
     int32_t max;
 } PS3Sem;
 
+/*
+ * The application layer's SPEs.  A title reaches lv2's sys_spu interface
+ * through libspu: it imports an SPU ELF (_sys_spu_image_import), creates a
+ * thread group, initialises each thread from that image, starts the group and
+ * joins it.  The model keeps the imported images and the groups here; the
+ * local store and the DMA of the running SPE belong to ps3_spu.c.
+ */
+#define PS3_SPU_LV2_GROUPS 4
+#define PS3_SPU_IMAGES     8
+
+typedef struct PS3SPUImageSeg {
+    uint32_t type;          /* 1 copy, 2 fill, 4 info */
+    uint32_t ls;            /* destination in local storage */
+    uint32_t size;
+    uint32_t addr;          /* source EA for a copy, the word for a fill */
+} PS3SPUImageSeg;
+
+typedef struct PS3SPUImage {
+    bool used;
+    uint32_t id;
+    uint32_t entry;
+    unsigned nsegs;
+    PS3SPUImageSeg seg[0x20];
+} PS3SPUImage;
+
+typedef struct PS3SPULv2Group {
+    bool used;
+    /*
+     * The low byte is the SPE number, as lv2's SPU thread ids have it: the
+     * address a sys_spu_thread_* call names is group_id | spu_num.
+     */
+    uint32_t id;
+    unsigned count;
+    uint8_t *ls;            /* count * 256 KiB of local store */
+    PS3SPEGroup *spes;
+    bool thread[PS3_SPE_MAX];
+    uint32_t cfg[PS3_SPE_MAX];  /* sys_spu_thread_set_spu_cfg */
+    bool started;
+    bool terminated;
+    uint32_t exit_cause;
+} PS3SPULv2Group;
+
 typedef struct PS3Thread {
     bool used;
     bool dead;
@@ -737,7 +782,8 @@ struct PS3BootROMState {
     SysBusDevice parent_obj;
 
     MemoryRegion rom_mr;      /* the 0x400-byte mask ROM, 32-bit byte-swapped */
-    MemoryRegion ls_mr;       /* 256 KiB local store, plaintext lands at 0x400 */
+    MemoryRegion ls_mr;       /* every SPE's local store, 256 KiB per SPE */
+    MemoryRegion ls_alias_mr; /* 256 KiB view of SPE 0 at 0xF1000000 */
     MemoryRegion regs_mr;     /* status and control */
     MemoryRegion flash_mr;    /* the console's flash image, when a drive is given */
     MemoryRegion uart_mr;     /* the PPU-side console lv0 polls */
@@ -762,6 +808,7 @@ struct PS3BootROMState {
     uint64_t flash_base;
 
     PS3SPU *spu;
+    PS3SPEGroup *spes;        /* the eight SPEs, sharing one external memory */
     char spu_why[160];
     uint64_t spu_insns;
     int spu_status;
@@ -842,6 +889,10 @@ struct PS3BootROMState {
     PS3Cond cond[PS3_COND_MAX];
     PS3Sem sem[PS3_SEM_MAX];
     uint32_t lv2_container_size;
+    /* The application layer's SPEs (sys_spu). */
+    PS3SPULv2Group spug[PS3_SPU_LV2_GROUPS];
+    PS3SPUImage spuimg[PS3_SPU_IMAGES];
+    uint32_t spu_next_id;
     /* Where the next sys_mmapper address is handed out (RSX-backed ranges). */
     uint32_t lv2_mmap_next;
     /*
@@ -9333,6 +9384,286 @@ static bool ps3_lv2_rsx(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
     }
 }
 
+/* ---- the SPE interface: lv2's sys_spu --------------------------------- */
+
+static PS3SPUImage *ps3_spu_lv2_image(PS3BootROMState *s, uint32_t id)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_SPU_IMAGES; i++) {
+        if (s->spuimg[i].used && s->spuimg[i].id == id) {
+            return &s->spuimg[i];
+        }
+    }
+
+    return NULL;
+}
+
+static PS3SPULv2Group *ps3_spu_lv2_group(PS3BootROMState *s, uint32_t id)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_SPU_LV2_GROUPS; i++) {
+        if (s->spug[i].used && s->spug[i].id == id) {
+            return &s->spug[i];
+        }
+    }
+
+    return NULL;
+}
+
+static PS3SPU *ps3_spu_lv2_thread(PS3BootROMState *s, uint32_t id,
+                                  PS3SPULv2Group **out)
+{
+    PS3SPULv2Group *g = ps3_spu_lv2_group(s, id & ~0xFFu);
+    unsigned n = id & 0xFFu;
+
+    if (!g || n >= g->count || !g->thread[n]) {
+        return NULL;
+    }
+    if (out) {
+        *out = g;
+    }
+
+    return ps3_spes_spu(g->spes, n);
+}
+
+/*
+ * Parse an SPU ELF's program headers into the shape sys_spu_thread_initialize
+ * deploys: a COPY of p_filesz bytes from the image, then a FILL for the rest of
+ * p_memsz.  `src' is the effective address the ELF itself sits at, because a
+ * copy segment names its bytes in guest memory, not a host pointer.
+ */
+static int ps3_spu_lv2_parse(PS3SPUImage *img, const uint8_t *elf, size_t len,
+                             uint32_t src)
+{
+    uint32_t phoff, phentsize, phnum, entry, n = 0, i;
+
+    if (len < 0x34 || memcmp(elf, "\x7f" "ELF", 4) ||
+        elf[4] != 1 || elf[5] != 2 || elf[6] != 1) {
+        return -1;              /* not a 32-bit big-endian ELF */
+    }
+
+    entry = ps3_be32(elf + 0x18) & (PS3_LS_SIZE - 1);
+    phoff = ps3_be32(elf + 0x1C);
+    phentsize = ((uint32_t)elf[0x2A] << 8) | elf[0x2B];
+    phnum = ((uint32_t)elf[0x2C] << 8) | elf[0x2D];
+
+    if (phentsize < 0x20 || phnum == 0 || phnum > 0x20 ||
+        (uint64_t)phoff + (uint64_t)phnum * phentsize > len) {
+        return -1;
+    }
+
+    for (i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + phoff + i * phentsize;
+        uint32_t type = ps3_be32(ph);
+        uint32_t offset = ps3_be32(ph + 0x04);
+        uint32_t vaddr = ps3_be32(ph + 0x08);
+        uint32_t filesz = ps3_be32(ph + 0x10);
+        uint32_t memsz = ps3_be32(ph + 0x14);
+
+        if (type == 4) {                /* SYS_SPU_SEGMENT_TYPE_INFO */
+            if (n < 0x20) {
+                img->seg[n].type = 4;
+                img->seg[n].ls = vaddr & (PS3_LS_SIZE - 1);
+                img->seg[n].size = memsz;
+                img->seg[n].addr = 0;
+                n++;
+            }
+            continue;
+        }
+        if (type != 1 || !filesz) {     /* PT_LOAD */
+            continue;
+        }
+        if ((uint64_t)offset + filesz > len || n >= 0x20) {
+            return -1;
+        }
+
+        img->seg[n].type = 1;
+        img->seg[n].ls = vaddr & (PS3_LS_SIZE - 1);
+        img->seg[n].size = filesz;
+        img->seg[n].addr = src + offset;
+        n++;
+
+        if (memsz > filesz && n < 0x20) {
+            img->seg[n].type = 2;
+            img->seg[n].ls = (vaddr + filesz) & (PS3_LS_SIZE - 1);
+            img->seg[n].size = memsz - filesz;
+            img->seg[n].addr = 0;
+            n++;
+        }
+    }
+
+    if (!n) {
+        return -1;
+    }
+
+    img->entry = entry;
+    img->nsegs = n;
+    return 0;
+}
+
+static PS3SPUImage *ps3_spu_lv2_image_new(PS3BootROMState *s,
+                                          const uint8_t *elf, size_t len,
+                                          uint32_t src)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_SPU_IMAGES; i++) {
+        PS3SPUImage *img = &s->spuimg[i];
+
+        if (img->used) {
+            continue;
+        }
+        memset(img, 0, sizeof(*img));
+        if (ps3_spu_lv2_parse(img, elf, len, src) != 0) {
+            return NULL;
+        }
+        img->used = true;
+        img->id = s->spu_next_id++;
+        if (!img->id) {
+            img->id = s->spu_next_id++;
+        }
+        return img;
+    }
+
+    return NULL;
+}
+
+/*
+ * A kernel image is an id in the guest's sys_spu_image: the segments stay in
+ * the model, exactly as lv2 keeps them in its own id table, so a title's
+ * `segs' field is unused and `nsegs' reads back 0.
+ */
+static void ps3_spu_lv2_publish(uint8_t *ram, uint64_t ram_size, uint32_t ea,
+                                const PS3SPUImage *img)
+{
+    if (!ea || (uint64_t)ea + 0x10 > ram_size) {
+        return;
+    }
+
+    ps3_put_be32(ram + ea, 1);          /* SYS_SPU_IMAGE_TYPE_KERNEL */
+    ps3_put_be32(ram + ea + 0x04, img->id);
+    ps3_put_be32(ram + ea + 0x08, 0);
+    ps3_put_be32(ram + ea + 0x0C, 0);
+}
+
+static bool ps3_spu_lv2_deploy(PS3SPU *spu, const PS3SPUImage *img,
+                               uint8_t *ram, uint64_t ram_size)
+{
+    unsigned i;
+
+    for (i = 0; i < img->nsegs; i++) {
+        const PS3SPUImageSeg *seg = &img->seg[i];
+
+        if (seg->type == 1) {
+            if (!seg->addr || (uint64_t)seg->addr + seg->size > ram_size) {
+                return false;
+            }
+            ps3_spu_load_ls(spu, seg->ls, ram + seg->addr, seg->size);
+        } else if (seg->type == 2) {
+            ps3_spu_fill_ls(spu, seg->ls, seg->size, seg->addr);
+        }
+    }
+
+    ps3_spe_set_pc(spu, img->entry);
+    return true;
+}
+
+static PS3SPULv2Group *ps3_spu_lv2_group_new(PS3BootROMState *s, uint8_t *ram,
+                                             uint64_t ram_size, unsigned count,
+                                             uint32_t *out_id)
+{
+    unsigned i;
+
+    if (!count || count > PS3_SPE_MAX) {
+        return NULL;
+    }
+
+    for (i = 0; i < PS3_SPU_LV2_GROUPS; i++) {
+        PS3SPULv2Group *g = &s->spug[i];
+
+        if (g->used) {
+            continue;
+        }
+
+        memset(g, 0, sizeof(*g));
+        g->ls = g_malloc0((size_t)count * PS3_LS_SIZE);
+        g->spes = ps3_spes_new(count, g->ls, (size_t)count * PS3_LS_SIZE,
+                               NULL, 0, PS3_SPES_LS_BASE);
+        if (!g->spes) {
+            g_free(g->ls);
+            memset(g, 0, sizeof(*g));
+            return NULL;
+        }
+        /* The SPEs DMA into guest RAM itself, not into a private copy. */
+        ps3_spes_map_ext(g->spes, ram, ram_size);
+        g->id = 0x100u << i;
+        g->count = count;
+        g->used = true;
+        *out_id = g->id;
+        return g;
+    }
+
+    return NULL;
+}
+
+static void ps3_spu_lv2_group_free(PS3SPULv2Group *g)
+{
+    if (!g || !g->used) {
+        return;
+    }
+
+    ps3_spes_free(g->spes);
+    g_free(g->ls);
+    memset(g, 0, sizeof(*g));
+}
+
+/*
+ * Run whatever SPEs are ready.  A group is only stepped when it has been
+ * started, and the loop stops as soon as every SPE is halted or blocked on a
+ * channel - there are no periodic ticks and no host threads, so a title's
+ * `group_start' so consistently completes the SPE's work before the next call
+ * looks at the result.
+ */
+static void ps3_spu_lv2_pump(PS3BootROMState *s, uint64_t budget)
+{
+    unsigned gi;
+
+    for (gi = 0; gi < PS3_SPU_LV2_GROUPS; gi++) {
+        PS3SPULv2Group *g = &s->spug[gi];
+        uint64_t left = budget;
+        char why[160];
+
+        if (!g->used || !g->started || g->terminated) {
+            continue;
+        }
+
+        while (left) {
+            uint64_t slice = MIN(left, 1u << 14);
+            uint64_t ran = 0;
+            int st = ps3_spes_run_quantum(g->spes, slice, &ran, why, sizeof(why));
+
+            left -= MIN(left, ran ? ran : slice);
+            if (st == PS3_SPU_STOPPED) {
+                g->exit_cause = 1;          /* group exit */
+                g->started = false;
+                info_report("ps3-ppu: spu group 0x%X: %s", g->id, why);
+                break;
+            }
+            if (st == PS3_SPU_FAULT) {
+                g->exit_cause = 2;          /* exception */
+                g->started = false;
+                info_report("ps3-ppu: spu group 0x%X faulted: %s", g->id, why);
+                break;
+            }
+            if (st == PS3_SPU_BLOCKED) {
+                break;                      /* waiting on a mailbox or event */
+            }
+        }
+    }
+}
+
 static void ps3_lv2_service(PS3BootROMState *s)
 {
     CPUState *cs = qemu_get_cpu(0);
@@ -9361,6 +9692,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
     a3 = cpu->env.gpr[6];
     a4 = cpu->env.gpr[7];
     a5 = cpu->env.gpr[8];
+
+    /* A started SPE group runs alongside the PPU, a slice per lv2 call. */
+    ps3_spu_lv2_pump(s, 1u << 12);
 
     /* The wired link: lv2's sys_net calls run on the host's sockets. */
     if (ps3_lv2_net(s, ram, ram_size, nr, a0, a1, a2, a3,
@@ -11686,6 +12020,491 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
+    /*
+     * The SPEs.  libspu reaches lv2 through these calls: an application imports
+     * its SPU ELF, creates a group, initialises one thread per SPE with
+     * arg1..arg4 and starts the group.  The model loads the image into the
+     * thread's local store, runs it against guest RAM and reports its stop
+     * code, so the PPU side sees the results a real SPE would have left.
+     */
+    case 0x09B: {               /* _sys_spu_image_get_information(img,
+                                 * entry*, nsegs*) */
+        PS3SPUImage *img;
+
+        if (!a0 || (uint64_t)a0 + 0x10 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        img = ps3_spu_lv2_image(s, ps3_be32(ram + a0 + 4));
+        if (!img) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, img->entry);
+        }
+        if (a2 && (uint64_t)a2 + 4 <= ram_size) {
+            ps3_put_be32(ram + a2, img->nsegs);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x09C: {               /* sys_spu_image_open(img, path) */
+        g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a1);
+        g_autofree gchar *data = NULL;
+        gsize len = 0;
+        uint32_t base, end;
+        PS3SPUImage *img;
+
+        if (!a0 || (uint64_t)a0 + 0x10 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (!host || !g_file_get_contents(host, &data, &len, NULL) || !len) {
+            ret = PS3_LV2_ENOENT;
+            break;
+        }
+        base = (s->lv2_heap + 0xFF) & ~0xFFu;
+        end = (base + (uint32_t)len + 0xFF) & ~0xFFu;
+        if (end < base || (uint64_t)end + 0x100 > ram_size) {
+            ret = PS3_LV2_ENOMEM;
+            break;
+        }
+        memcpy(ram + base, data, len);
+        s->lv2_heap = end;
+        ps3_put_be32(ram + PS3_LV2_HEAP, end);
+
+        img = ps3_spu_lv2_image_new(s, ram + base, len, base);
+        if (!img) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        ps3_spu_lv2_publish(ram, ram_size, a0, img);
+        ret = 0;
+        break;
+    }
+    case 0x09D: {               /* _sys_spu_image_import(img, src, size,
+                                 * type) */
+        PS3SPUImage *img;
+
+        if (!a0 || (uint64_t)a0 + 0x10 > ram_size ||
+            !a1 || !a2 || (uint64_t)a1 + a2 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        img = ps3_spu_lv2_image_new(s, ram + a1, a2, a1);
+        if (!img) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        ps3_spu_lv2_publish(ram, ram_size, a0, img);
+        ret = 0;
+        break;
+    }
+    case 0x09E: {               /* _sys_spu_image_close(img) */
+        PS3SPUImage *img;
+
+        if (!a0 || (uint64_t)a0 + 0x10 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        img = ps3_spu_lv2_image(s, ps3_be32(ram + a0 + 4));
+        if (!img) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        img->used = false;
+        ret = 0;
+        break;
+    }
+    case 0x09F: {               /* _sys_spu_image_get_segments(img, segs*,
+                                 * nseg) */
+        PS3SPUImage *img;
+        unsigned n, count;
+
+        if (!a0 || (uint64_t)a0 + 0x10 > ram_size || (int32_t)a3 <= 0) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        img = ps3_spu_lv2_image(s, ps3_be32(ram + a0 + 4));
+        if (!img) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        count = MIN((unsigned)a3, img->nsegs);
+        for (n = 0; n < count; n++) {
+            uint32_t at = a1 + n * 0x18;
+
+            if (!a1 || (uint64_t)at + 0x18 > ram_size) {
+                break;
+            }
+            ps3_put_be32(ram + at, img->seg[n].type);
+            ps3_put_be32(ram + at + 0x04, img->seg[n].ls);
+            ps3_put_be32(ram + at + 0x08, img->seg[n].size);
+            ps3_put_be32(ram + at + 0x0C, img->seg[n].addr);
+            ps3_put_be64(ram + at + 0x10, 0);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0A5: {               /* sys_spu_thread_get_exit_status(id,
+                                 * status*) */
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, NULL);
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1,
+                         ps3_spe_halted(spu) ? ps3_spu_stop_code(spu) : 0);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0A6: {               /* sys_spu_thread_set_argument(id, arg*) */
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, NULL);
+        unsigned n;
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!a1 || (uint64_t)a1 + 0x20 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (n = 0; n < 4; n++) {
+            ps3_spu_set_gpr64(spu, 3 + n, ps3_be64(ram + a1 + n * 8));
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0A9:                 /* sys_spu_initialize(usable, raw) */
+        info_report("ps3-ppu: sys_spu_initialize(%u usable, %u raw)",
+                    a0, a1);
+        ret = 0;
+        break;
+    case 0x0AA: {               /* sys_spu_thread_group_create(id*, num, prio,
+                                 * attr*) */
+        PS3SPULv2Group *g;
+        uint32_t gid = 0;
+
+        if (!a0 || (uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        g = ps3_spu_lv2_group_new(s, ram, ram_size, a1, &gid);
+        if (!g) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        ps3_put_be32(ram + a0, gid);
+        info_report("ps3-ppu: spu group 0x%X: %u SPE(s), priority %d",
+                    gid, a1, (int32_t)a2);
+        ret = 0;
+        break;
+    }
+    case 0x0AB: {               /* sys_spu_thread_group_destroy(id) */
+        PS3SPULv2Group *g = ps3_spu_lv2_group(s, a0);
+
+        if (!g) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ps3_spu_lv2_group_free(g);
+        ret = 0;
+        break;
+    }
+    case 0x0AC: {               /* sys_spu_thread_initialize(thread*,
+                                 * group, spu_num, img*, attr*, arg*) */
+        PS3SPUImage user = { 0 }, *img = &user;
+        PS3SPULv2Group *g;
+        PS3SPU *spu;
+        unsigned n;
+
+        if (!a3 || (uint64_t)a3 + 0x10 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        g = ps3_spu_lv2_group(s, a1);
+        if (!g) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a2 >= g->count) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+
+        if (ps3_be32(ram + a3) == 1) {
+            /* A kernel image: `entry_point' is the model's image id. */
+            img = ps3_spu_lv2_image(s, ps3_be32(ram + a3 + 4));
+            if (!img) {
+                ret = PS3_LV2_ESRCH;
+                break;
+            }
+        } else if (ps3_be32(ram + a3) == 0) {
+            /* A user image: the segments themselves are guest memory. */
+            uint32_t entry = ps3_be32(ram + a3 + 4);
+            uint32_t segs = ps3_be32(ram + a3 + 8);
+            uint32_t nsegs = ps3_be32(ram + a3 + 0xC);
+
+            if (!entry || entry >= PS3_LS_SIZE || !segs ||
+                !nsegs || nsegs > 0x20) {
+                ret = PS3_LV2_EINVAL;
+                break;
+            }
+            user.entry = entry;
+            user.nsegs = nsegs;
+            for (n = 0; n < nsegs; n++) {
+                uint32_t at = segs + n * 0x18;
+
+                if ((uint64_t)at + 0x18 > ram_size) {
+                    break;
+                }
+                user.seg[n].type = ps3_be32(ram + at);
+                user.seg[n].ls = ps3_be32(ram + at + 0x04);
+                user.seg[n].size = ps3_be32(ram + at + 0x08);
+                user.seg[n].addr = ps3_be32(ram + at + 0x0C);
+            }
+        } else {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+
+        spu = ps3_spes_spu(g->spes, a2);
+        if (!ps3_spu_lv2_deploy(spu, img, ram, ram_size)) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (a5 && (uint64_t)a5 + 0x20 <= ram_size) {
+            for (n = 0; n < 4; n++) {
+                ps3_spu_set_gpr64(spu, 3 + n, ps3_be64(ram + a5 + n * 8));
+            }
+        }
+        g->thread[a2] = true;
+        if (a4 && (uint64_t)a4 + 4 <= ram_size) {
+            ps3_put_be32(ram + a4, g->id | a2);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0A7:                 /* sys_spu_thread_group_start_on_exit */
+        ret = 0;
+        break;
+    case 0x0AD: {               /* sys_spu_thread_group_start(id) */
+        PS3SPULv2Group *g = ps3_spu_lv2_group(s, a0);
+        unsigned n;
+
+        if (!g) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        for (n = 0; n < g->count; n++) {
+            if (g->thread[n]) {
+                ps3_spe_run(ps3_spes_spu(g->spes, n), true);
+            }
+        }
+        g->started = true;
+        g->terminated = false;
+        ps3_spu_lv2_pump(s, 1u << 20);
+        ret = 0;
+        break;
+    }
+    case 0x0AE:                 /* sys_spu_thread_group_suspend(id) */
+    case 0x0AF: {               /* sys_spu_thread_group_resume(id) */
+        PS3SPULv2Group *g = ps3_spu_lv2_group(s, a0);
+        bool run = (nr == 0x0AF);
+        unsigned n;
+
+        if (!g) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        for (n = 0; n < g->count; n++) {
+            if (g->thread[n]) {
+                ps3_spe_run(ps3_spes_spu(g->spes, n), run);
+            }
+        }
+        if (run) {
+            ps3_spu_lv2_pump(s, 1u << 14);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0B0:                 /* sys_spu_thread_group_yield(id) */
+        ps3_spu_lv2_pump(s, 1u << 14);
+        ret = 0;
+        break;
+    case 0x0B1: {               /* sys_spu_thread_group_terminate(id,
+                                 * status) */
+        PS3SPULv2Group *g = ps3_spu_lv2_group(s, a0);
+        unsigned n;
+
+        if (!g) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        for (n = 0; n < g->count; n++) {
+            if (g->thread[n]) {
+                ps3_spe_run(ps3_spes_spu(g->spes, n), false);
+            }
+        }
+        g->terminated = true;
+        g->started = false;
+        g->exit_cause = 1;
+        if (a1) {
+            info_report("ps3-ppu: spu group 0x%X terminated with status %d",
+                        g->id, (int32_t)a1);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0B2: {               /* sys_spu_thread_group_join(id, cause*,
+                                 * status*, timeout*) */
+        PS3SPULv2Group *g = ps3_spu_lv2_group(s, a0);
+
+        if (!g) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ps3_spu_lv2_pump(s, 1u << 22);
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, g->exit_cause ? g->exit_cause : 1);
+        }
+        if (a2 && (uint64_t)a2 + 4 <= ram_size) {
+            ps3_put_be32(ram + a2, 0);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0B3:                 /* sys_spu_thread_group_set_priority */
+        ret = 0;
+        break;
+    case 0x0B4: {               /* sys_spu_thread_group_get_priority(id,
+                                 * prio*) */
+        PS3SPULv2Group *g = ps3_spu_lv2_group(s, a0);
+
+        if (!g) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, 0);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0B5: {               /* sys_spu_thread_write_ls(id, lsa, value,
+                                 * type) */
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, NULL);
+        unsigned bytes = a3, n;
+        uint8_t buf[8];
+        uint64_t value = cpu->env.gpr[7];
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!bytes || bytes > 8 || (bytes & (bytes - 1)) ||
+            (a1 & (bytes - 1)) || a1 >= PS3_LS_SIZE) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        for (n = 0; n < bytes; n++) {
+            buf[n] = (uint8_t)(value >> (8 * (bytes - 1 - n)));
+        }
+        ps3_spu_load_ls(spu, a1, buf, bytes);
+        ret = 0;
+        break;
+    }
+    case 0x0B6: {               /* sys_spu_thread_read_ls(id, lsa, value*,
+                                 * type) */
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, NULL);
+        unsigned bytes = a3;
+        uint8_t buf[8];
+        uint64_t value = 0;
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (!bytes || bytes > 8 || (bytes & (bytes - 1)) ||
+            (a1 & (bytes - 1)) || a1 >= PS3_LS_SIZE ||
+            !a2 || (uint64_t)a2 + 8 > ram_size) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        memcpy(buf, ps3_spu_ls_ptr(spu, a1), bytes);
+        for (unsigned n = 0; n < bytes; n++) {
+            value = (value << 8) | buf[n];
+        }
+        ps3_put_be64(ram + a2, value);
+        ret = 0;
+        break;
+    }
+    case 0x0B8: {               /* sys_spu_thread_write_snr(id, number,
+                                 * value) */
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, NULL);
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a1 != 1 && a1 != 2) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        ps3_spe_set_signal(spu, a1 - 1, a2);
+        ps3_spu_lv2_pump(s, 1u << 12);
+        ret = 0;
+        break;
+    }
+    case 0x0B9:                 /* sys_spu_thread_group_connect_event */
+    case 0x0BA:                 /* sys_spu_thread_group_disconnect_event */
+    case 0x0BF:                 /* sys_spu_thread_connect_event */
+    case 0x0C0:                 /* sys_spu_thread_disconnect_event */
+        ret = 0;
+        break;
+    case 0x0BB: {               /* sys_spu_thread_set_spu_cfg(id, cfg) */
+        PS3SPULv2Group *g = NULL;
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, &g);
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        g->cfg[a0 & 0xFF] = a1;
+        ret = 0;
+        break;
+    }
+    case 0x0BC: {               /* sys_spu_thread_get_spu_cfg(id, cfg*) */
+        PS3SPULv2Group *g = NULL;
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, &g);
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a1 && (uint64_t)a1 + 4 <= ram_size) {
+            ps3_put_be32(ram + a1, g->cfg[a0 & 0xFF]);
+        }
+        ret = 0;
+        break;
+    }
+    case 0x0BE: {               /* sys_spu_thread_write_spu_mb(id, value) */
+        PS3SPU *spu = ps3_spu_lv2_thread(s, a0, NULL);
+
+        if (!spu) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ps3_spe_push_in_mbox(spu, a1);
+        ps3_spu_lv2_pump(s, 1u << 12);
+        ret = 0;
+        break;
+    }
     default:
         if (s->ppu_trace) {
             info_report("ps3-ppu: lv2 syscall 0x%X is not modelled", nr);
@@ -12449,8 +13268,16 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
                           "ps3-boot-rom.regs", 0x40);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->regs_mr);
 
-    memory_region_init_ram(&s->ls_mr, OBJECT(s), "ps3.ls", PS3_LS_SIZE,
-                           &error_fatal);
+    memory_region_init_ram(&s->ls_mr, OBJECT(s), "ps3.spes.ls",
+                           (size_t)PS3_SPE_MAX * PS3_LS_SIZE, &error_fatal);
+
+    /* The boot path's 0xF1000000 window stays a 256 KiB alias of SPE 0, so it
+     * keeps mmio index 1; the whole array is index 2, mapped at
+     * PS3_SPES_LS_BASE, which is also the effective address the isolation
+     * check uses for each SPE's store. */
+    memory_region_init_alias(&s->ls_alias_mr, OBJECT(s), "ps3.ls",
+                             &s->ls_mr, 0, PS3_LS_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->ls_alias_mr);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->ls_mr);
 
     memory_region_init_ram(&s->rom_mr, OBJECT(s), "ps3.spu-rom", PS3_ROM_SIZE,
@@ -12545,8 +13372,15 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->flash_mr);
     }
 
-    s->spu = ps3_spu_new(memory_region_get_ram_ptr(&s->ls_mr), PS3_LS_SIZE,
-                         s->flash, s->flash_len);
+    s->spes = ps3_spes_new(PS3_SPE_MAX,
+                           memory_region_get_ram_ptr(&s->ls_mr),
+                           (size_t)PS3_SPE_MAX * PS3_LS_SIZE,
+                           s->flash, s->flash_len, PS3_SPES_LS_BASE);
+    if (!s->spes) {
+        error_setg(errp, "ps3-boot-rom: cannot allocate the SPE group");
+        return;
+    }
+    s->spu = ps3_spes_spu(s->spes, 0);
 
     /*
      * A stage image is a whole run: load it, execute it, report, exit.  It is
@@ -13841,11 +14675,26 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("flash-base", PS3BootROMState, flash_base, 0x20000000),
 };
 
+static void ps3_rom_unrealize(DeviceState *dev)
+{
+    PS3BootROMState *s = PS3_BOOT_ROM(dev);
+    unsigned i;
+
+    for (i = 0; i < PS3_SPU_LV2_GROUPS; i++) {
+        ps3_spu_lv2_group_free(&s->spug[i]);
+    }
+
+    ps3_spes_free(s->spes);
+    s->spes = NULL;
+    s->spu = NULL;
+}
+
 static void ps3_rom_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = ps3_rom_realize;
+    dc->unrealize = ps3_rom_unrealize;
     device_class_set_legacy_reset(dc, ps3_rom_reset);
     device_class_set_props(dc, ps3_rom_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
@@ -14182,6 +15031,7 @@ static void rs6000_ps3_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(rom), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(rom), 0, PS3_BOOT_ROM_REGS);
     sysbus_mmio_map(SYS_BUS_DEVICE(rom), 1, PS3_LS_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(rom), 2, PS3_SPES_LS_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(rom), 2, 0xE0000000);
 
     if (dinfo) {
