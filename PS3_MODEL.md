@@ -145,6 +145,28 @@ Once the container verifies, the scanout also gets the console's boot screen:
 (`-global ps3-boot-rom.boot-logo=off` disables it).  The glyphs are the console
 font scaled up; the artwork is the model's own.
 
+Two seconds after the wordmark the home screen replaces it, the way the console
+comes up to its home in about five seconds from the power button: the wave
+background, the category row with Game selected, `USER1` in the corner and the
+host's clock (the same clock `sys_ss` gives the guest).  It is a rendition of
+the XMB, not Sony's artwork and not vsh.self's rendering: the real screen needs
+the guest's own `cellGcm` frames, and until those arrive this is what the
+window shows.  Nothing is drawn unless the chain verified - a console whose
+trust chain stops shows its boot screen and stays there - and the guest's
+scanout takes the screen the moment vsh.self programs `cellVideoOut`.
+
+`-global ps3-vga.dump=home.ppm` writes the boot surface after every line and
+once more for the home screen, so the window's contents can be inspected
+without a display:
+
+```sh
+$Q -M rs6000-ps3 -bios .tmp/rom/rom.bin \
+   -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
+   -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin \
+   -global ps3-vga.dump=.tmp/home.ppm -display sdl
+```
+
+
 A third line appears above the two chain lines - `VSH: 2 SEGMENT(S), 7291232
 BYTES MAPPED, ENTERING` - and the log continues with the modules vsh.self
 loads (`libfs_utility2`, `sys_audio`, `sys_config`, the `_sys_micin_main` /
@@ -1066,16 +1088,156 @@ the main thread takes the core, and the boot proceeds through module loading,
 `sys_hid_manager_open`, `sys_config_open` and `libpadconfig` (the
 `libpadconfig_stub.cc:34` assertion no longer fires).
 
-The remaining stop is a program interrupt at `0x700`, the vector this model
-leaves empty: an `x3::LocalMdQueryThread` thread (and, on some runs, the main
-thread) reaches it after a failed mutex lock.  That is the next thing to chase -
-the run has not reached `sys_rsx` yet.
+### The drives: lv2's storage layer
+
+The VSH's media manager does not touch the ATA command block; it uses lv2's
+`sys_storage` virtual-device calls.  Every one of them was unmodelled, so the
+family answered `0` and the drive never connected: the VSH printed
+`BD Drive connect error`, its `x3::LocalMdQueryThread` workers died, and the
+main thread sat on the media list's mutex at `0x5390B8` waiting for a
+handshake that could not happen.  The layer now answers:
+
+| Syscall | What it does here |
+| --- | --- |
+| `0x262` device config | 6 storages, 17 devices, as lv2 reports them |
+| `0x263` report devices | the 17 lv2 device ids (BD, HDD x3, NAND x7, NOR x4, USB) |
+| `0x261` device info | `StorageDeviceInfo`: the media's own sector count and size; an empty drawer really reports 0 sectors |
+| `0x258`/`0x259` open/close | a handle table of eight devices |
+| `0x25A`/`0x25B` read/write | 2048-byte sectors from the BD image, 512-byte sectors from the HDD image; a BD write is refused, as on the drive |
+| `0x25C`/`0x268` device command | success with a zeroed reply: there is no drive firmware to answer SCSI here |
+| `0x25D`-`0x260`, `0x264`-`0x26F`, `0x2BB` | success (async I/O, medium events, regions, BD emu) |
+
+The image is the one the machine already gives QEMU's ATAPI device at `0x1F0`:
+`-drive if=ide,media=cdrom,file=disc.iso` attaches it, and the model opens the
+same file read-only as `disc-file`, so the guest's own ATA driver and lv2's
+storage layer see one disc.  A decrypted ISO is served sector for sector, which
+is exactly what a drive hands a console for a dumped game - there is no
+per-sector re-encryption to undo because the image is already the plaintext the
+console would read.
+
+The model's own files (the XMB's `vsh/resource/explore/xmb/*.xml`, the console's
+`dev_flash2/etc`, and the rest of the guest's `dev_flash*` tree) are not a
+special case: `sys_fs` maps every guest path to the host directory given by
+`dev-flash`, so XML, `.sprx` and data files are served the way they are stored.
+
+The thread services the VSH's `x3` layer also needs are real now:
+`sys_ppu_thread_detach` (`0x2D`), `get_join_state` (`0x2E`), `set_priority`
+(`0x2F`), `get_priority` (`0x30`), `get_stack_information` (`0x31`) and
+yield (`0x2A`), backed by the priority, stack base and size lv2 records at
+`_sys_ppu_thread_create`.
+
+`sys_memory_get_page_attribute` (`0x15F`) writes lv2's `sys_page_attr_t`
+(`{u64 attribute, u64 access_right, u32 page_size, u32 pad}`).  It used to put
+the page size in the first word, so `page_size` read 0 and `attribute` was a
+size: the caller that sized a mapping from it walked off into nothing.
+
+### Where that run stops now
+
+With the drive connected the boot goes much further: the BD enumerates,
+`/dev_bdvd` opens, the `x3` threads (`_EventHandler`, `_PollingService`,
+`LocalMdQueryThread`, `_CacheWriteThread`, `_BackupThread`) start, and the VSH
+prints `Registry initialization start:............ done` - it is past the media
+layer that used to hold it at `0x5390B8`.
+
+The remaining stop is an exception the model leaves unhandled, and the trace
+now names it to the instruction.  The 970's "hypervisor emulation assist"
+vector (`0x700`) is what QEMU raises for an invalid or privileged instruction;
+this model installs no handler there, so the first one ends the thread.
+
+`-d int` gives the fault: `Raise exception at 0000000200000020 => HV_EMU (96)
+error=21`.  `0x21` is `POWERPC_EXCP_PRIV_REG` (an `mtspr`/`mfspr` of a
+privileged register), and the address is not code: `0x200000020` is the flash
+window (`0x20000000`) plus `0x20`.  So the guest branched to a 64-bit value
+whose two halves are `0x00000002` and `0x00000020` - the shape of two 32-bit
+words read as one address.
+
+The model's own report ties that to one call site:
+
+```
+thread 0x0 took the program interrupt vector at 0x700 (lr=0x200000020)
+  r1=0xFFFE700 r2=0x6F5558 r11=0x8C r31=0x73CDB0
+  frame 00000000 0FFFE800 006E7780 00000000 00000002 00000020 00000200 00002000
+```
+
+`r1+0x10`, the frame's LR save slot, holds `00000002 00000020`, and the last
+lv2 call before the fault was the wrapper at VSH `0x1CBE08`:
+
+```
+1cbe04: f8 01 00 10   std  r0,16(r1)     ; save LR
+1cbe08: 39 60 00 82   li   r11,0x82      ; sys_event_queue_receive
+1cbe0c: 44 00 00 02   sc
+1cbe10: e8 01 00 10   ld   r0,16(r1)     ; restore the same slot
+1cbe20: 7c 08 03 a6   mtlr r0
+1cbe30: 4e 80 00 20   blr              ; -> 0x200000020
+```
+
+So the return address is not a truncated pointer: the caller's LR slot was
+overwritten with a four-word record `{2, 0x20, 0x200, 0x2000}`.  That record is
+not stack garbage - the same sixteen bytes sit in the VSH's own data at
+`0x1083CA0`, immediately after the path buffer at `0x1083C50` that holds
+`/dev_flash/sys/internal/libf` and the descriptor `{ptr=0x1083CA0, 3, 0}` at
+`0x1083C80`.  In other words a module-load record ends up copied over a stack
+frame's linkage area, and the epilogue of the next call returns into it.
+
+That places the next step in the PRX path (`sys_prx_load_module` /
+`start_module` option blocks, and whatever writes the `0x1083C80` descriptor),
+not in the syscall dispatcher: the run has still not reached `sys_rsx`.
+
+A second, earlier fault in the same family shows up on the `x3` workers, and it
+is the one to chase first because it happens before the main thread's:
+
+```
+thread 0x10C took the program interrupt vector at 0x700 (lr=0x184B8)
+  r1=0x15C7D50 r2=0x6F5558 r3=0x2800204A r12=0x48002042
+  r29=0x28002042 r30=0x4800204200000000 r31=0x2800204A ctr=0x543054
+```
+
+`0x184B8` is the VSH's `__cxa_finalize`, and the registers say what it was
+doing: `r12` holds `0x48002042`, which is a branch *instruction word* (`b`,
+opcode 18) and not an address; `r29` is the same word with `0x20000000`
+removed, `r30` is it shifted left 32, and `r31`/`r3` are `0x2800204A`, i.e. a
+pointer outside RAM (the model's RAM ends at `0x10000000`).  So the exit list a
+worker walks holds words taken from code instead of function descriptors, and
+the first dereference sends it to `0x700`.
+
+Both faults are therefore the same shape - a 32-bit word from the wrong place
+standing in for a 64-bit pointer - and both are downstream of a module that was
+loaded and then started.  `sys_prx_start_module`'s option block is the place to
+start: the model writes a 64-bit entry point at `opt+0x10` and, when
+`opt[0] != 0x20`, another at `opt+0x20`, and the caller is expected to invoke
+what it finds there.  A caller that instead keeps a descriptor list will read
+those words as pointers.
+
+`-global ps3-boot-rom.ppu-trace=on` now walks the back chain at the fault
+(`chain[n] sp=... lr=... back=...`), so the caller of the frame that returned
+into garbage is named in the log instead of guessed at.
 
 The lv2 low page is installed **only for `vsh-run`**.  `0xC00` is inside the
 page lv0 loads its own trampoline into (its entry is `0xC40`), so installing
 the shim for a `ppu-elf` lv0 stage overwrote the hypervisor's first
 instructions and sent it to `0` (`program interrupt at pc 0x700, srr0=0`).
 Gating it on `vsh-run` puts lv0 back on its documented path to `0x800C5C0`.
+
+### What the SPU interpreter is not
+
+The SPE here is an instruction-level interpreter of the ISA subset the mask ROM
+and the loaders use.  It is enough to open the container and run lv0ldr, and it
+is not the SPE a game would need:
+
+| Missing | Why it is not there |
+| --- | --- |
+| floating point: `fa`, `fs`, `fm`, `fma`, `fnms`, `frest`, `frsqest`, `fi`, `csflt`, `cuflt`, `cflts`, `cfltu`, the double-precision forms | the loaders do pure integer and crypto work |
+| SPR access and most channel control | only the channels the loaders touch exist (66, 73, signal notify, MFC tag and a few others); status-and-control register access beyond those is absent, so it faults |
+| memory protection | the SPU's protection/isolation instructions are not used by the early loaders |
+| halt variants | only plain `stop` is present; `stopd` and its dependency forms are not |
+| multiply variants | only `mpy`, `mpyu`, `mpyi`, `mpyui` and `mpya`; `mpys`, `mpyh`, `mpyhh` and the rest are absent |
+| miscellaneous | the rarely-used permute, interpolate and special forms: anything the mask ROM -> lv0ldr / isoldr / appldr path does not need |
+| cycle accuracy | instructions retire with no timing model at all, so nothing that measures, spins on a cycle budget or depends on dual-issue behaviour sees the real machine |
+| more than one SPE | the model has a single SPE and no concurrent execution, so code that starts a second SPE or expects two running together does not get it |
+
+None of that blocks the chain: the ROM and lv0ldr use only the integer, branch
+and MFC subset that is implemented.  It does block anything that runs real SPE
+code, which is the work after the RSX path.
 
 ## Using it with the low-level boot chain
 

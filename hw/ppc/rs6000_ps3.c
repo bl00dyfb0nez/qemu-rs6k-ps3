@@ -83,6 +83,7 @@
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
 #include "system/blockdev.h"
+#include "qemu/option.h"
 #include "qobject/qdict.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -463,6 +464,25 @@ typedef struct PS3Lv2Module {
 #define PS3_LV2_SECTOR  512
 
 /*
+ * lv2's storage layer: the BD drive and the disk, behind sys_storage_*.
+ *
+ * The guest never touches the ATA command block for these: lv2's storage API
+ * is a "virtual device" one, and the VSH's x3 media manager enumerates the
+ * drives, opens the Blu-ray one and reads its sectors through it.  The device
+ * ids are lv2's; the low part names the drive kind, bits 32..39 the partition
+ * of it.  RPCS3's sys_storage.h has the same list.
+ */
+#define PS3_STOR_MAX        8
+#define PS3_STOR_BDVD       0x101000000000006ULL
+#define PS3_STOR_ATA_HDD    0x101000000000007ULL
+#define PS3_STOR_NAND       0x100000000000001ULL
+#define PS3_STOR_NAND_UNK   0x100000000000003ULL
+#define PS3_STOR_NOR        0x100000000000004ULL
+#define PS3_STOR_USB        0x10300000000000AULL
+#define PS3_STOR_DEVICES    17
+#define PS3_STOR_SECT_BD    0x800
+
+/*
  * PPU threads.  One core still runs guest code, but lv2's threads are now real:-
  * each has a saved context, and the blocking calls the VSH makes (sleep, join,
  * exit) hand the core to the next runnable one.  The switch happens from the
@@ -579,6 +599,7 @@ typedef struct PS3Thread {
     bool dead;
     bool blocked;
     bool main;
+    bool fault_reported;        /* it landed on a vector; said so once */
     /* Waiting inside an lv2 call: the call is finished when it is woken. */
     bool parked;
     int wait_eq;                /* index of the queue it waits on */
@@ -589,6 +610,12 @@ typedef struct PS3Thread {
     uint32_t wait_sem_id;       /* semaphore it waits on, 0 = none */
     uint32_t id;
     uint32_t join_target;
+    /* lv2's thread attributes: the priority the creator asked for, the stack
+     * it was given, and whether it can still be joined.  The VSH's x3 layer
+     * asks for all three around the media threads it starts. */
+    int32_t prio;
+    bool detached;
+    uint32_t stack_base, stack_size;
     /* Returning here lands on `li r11,0x29; sc`, i.e. sys_ppu_thread_exit. */
     uint32_t exit_stub;
     uint64_t gpr[32];
@@ -752,6 +779,7 @@ struct PS3BootROMState {
     uint8_t lv2_fan_policy;         /* 0 auto, 1 manual, 2 full */
     uint8_t lv2_fan_duty;
     bool lv2_usleep_reported;       /* the idle loop's sleep was reported */
+    bool lv2_storage_reported;      /* the BD drive's enumeration was reported */
     bool lv2_btsetting_reported;    /* sys_btsetting_if's first call */
     bool lv2_av_reported;           /* the guest read the sink's EDID */
     bool lv2_video_reported;        /* cellVideoOut configured a mode */
@@ -850,6 +878,20 @@ struct PS3BootROMState {
     bool hdd_keyed;
 
     /*
+     * The Blu-ray drive's image, which is the same one the machine gives
+     * QEMU's ATAPI device at 0x1F0: the guest's own ATA driver and lv2's
+     * sys_storage then see one disc.  `disc_size' is the media's size, so an
+     * empty drawer reports zero sectors instead of pretending to have a disc.
+     */
+    char *disc_file;                /* the image the drive was given */
+    BlockBackend *disc;             /* opened read-only, lv2's view of it */
+    uint64_t disc_size;
+    struct {
+        bool used;
+        uint64_t device;
+    } stor[PS3_STOR_MAX];
+
+    /*
      * The eMMC: the superslim's firmware medium.  A 4xxx console has no NOR -
      * metldr and the loaders live on eMMC - so the image here is the whole
      * flash, encrypted with the encdec keys PCK1 derives (the same ladder as
@@ -865,6 +907,7 @@ struct PS3BootROMState {
     bool emmc_keyed;
     char *boot_medium;
     bool boot_logo;                 /* the boot screen, once the chain is done */
+    QEMUTimer *home_timer;          /* the home screen after the wordmark */
     char *emer_self;                /* emer_init.self, the recovery program */
     bool recovery;                  /* lv2 started the emergency program */
 
@@ -1329,6 +1372,18 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
     return true;
 }
 
+/*
+ * Two seconds of virtual time: the wordmark, then the home screen.  A real
+ * console is at its home screen about five seconds after the power button,
+ * and the chain above has already spent the first ones.
+ */
+#define PS3_HOME_DELAY_NS   (2 * NANOSECONDS_PER_SECOND)
+
+static void ps3_rom_home_tick(void *opaque)
+{
+    ps3_vga_home_screen();
+}
+
 static void ps3_rom_boot(PS3BootROMState *s)
 {
     const char *name = s->container ?: "lv0ldr.2";
@@ -1432,6 +1487,19 @@ static void ps3_rom_boot(PS3BootROMState *s)
      */
     if (result == PS3_BOOT_OK && s->boot_logo) {
         ps3_vga_boot_logo("RS6K", "Playstation 3 Emulator");
+
+        /*
+         * And then the home screen, the way the console comes up to it: the
+         * wordmark stays up long enough to read, then the wave replaces it.
+         * It is only ever drawn for a chain that verified - a console whose
+         * trust chain stops has nothing to show.
+         */
+        if (!s->home_timer) {
+            s->home_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         ps3_rom_home_tick, NULL);
+        }
+        timer_mod(s->home_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                 PS3_HOME_DELAY_NS);
     }
 }
 
@@ -4854,7 +4922,7 @@ static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
                                        uint64_t ram_size, CPUPPCState *env,
                                        uint32_t entry, uint32_t tls,
                                        uint32_t arg, uint32_t stack,
-                                       uint32_t name)
+                                       int32_t prio, uint32_t name)
 {
     char text[32];
     PS3Thread *t = NULL;
@@ -4936,6 +5004,9 @@ static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
     memset(t, 0, sizeof(*t));
     t->used = true;
     t->id = ++s->lv2_next_id;
+    t->prio = (int32_t)prio;
+    t->stack_base = base;
+    t->stack_size = size;
     /*
      * lv2 starts a user thread with a clean register file: r3 is the
      * argument, r13 the thread's TLS base, r2 the entry's TOC.  Inheriting
@@ -6596,7 +6667,7 @@ static bool ps3_lv2_sys_io(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
         {
             uint32_t tid = ps3_lv2_thread_created(s, ram, ram_size, env,
                                                   a1, env->gpr[13], a2,
-                                                  a4, a6);
+                                                  a4, (int32_t)env->gpr[6], a6);
 
             if (!tid) {
                 r = -EAGAIN;
@@ -6979,6 +7050,333 @@ static void ps3_rsx_flip(PS3BootROMState *s, unsigned id)
  * with success: the library treats a failure here as a broken RSX, not as an
  * optional feature.
  */
+/*
+ * sys_storage, the way lv2 presents the drives to the application layer.
+ *
+ * This is what the VSH's media manager uses, not the ATA command block: it
+ * asks how many storages and devices there are, reports the device list, then
+ * reads the device info of each one, opens the Blu-ray drive and reads
+ * 2048-byte sectors.  Every one of those calls was unmodelled, so the whole
+ * family answered 0 and the drive never "connected": the VSH printed
+ * `BD Drive connect error', its x3 worker threads died, and its main thread
+ * sat in the media list's mutex at 0x5390B8 waiting for a handshake that could
+ * not happen.  With the layer here that handshake completes and the boot
+ * carries on into cellGcmInit.
+ */
+static uint64_t ps3_stor_base(uint64_t device)
+{
+    return device & 0xFFFFF00FFFFFFFFULL;
+}
+
+static unsigned ps3_stor_num(uint64_t device)
+{
+    return (device >> 32) & 0xFF;
+}
+
+static int ps3_stor_index(PS3BootROMState *s, uint32_t fd)
+{
+    if (!fd || fd > PS3_STOR_MAX) {
+        return -1;
+    }
+    return s->stor[fd - 1].used ? (int)(fd - 1) : -1;
+}
+
+static uint64_t ps3_stor_hdd_sectors(PS3BootROMState *s, unsigned num)
+{
+    uint64_t total = s->hdd_size ? s->hdd_size / PS3_LV2_SECTOR
+                                 : 0x2542EAB0ULL;
+
+    switch (num) {
+    case 0:
+        return total;
+    case 1:
+        return total > 0x483018 ? total - 0x483018 : total;
+    default:
+        return 0x3FFFF8;
+    }
+}
+
+static const uint64_t ps3_stor_all[PS3_STOR_DEVICES] = {
+    PS3_STOR_USB,
+    PS3_STOR_NAND, PS3_STOR_NAND | (1ULL << 32), PS3_STOR_NAND | (2ULL << 32),
+    PS3_STOR_NAND | (3ULL << 32), PS3_STOR_NAND | (4ULL << 32),
+    PS3_STOR_NAND | (5ULL << 32), PS3_STOR_NAND | (6ULL << 32),
+    PS3_STOR_ATA_HDD, PS3_STOR_ATA_HDD | (1ULL << 32),
+    PS3_STOR_ATA_HDD | (2ULL << 32),
+    PS3_STOR_BDVD,
+    PS3_STOR_NOR, PS3_STOR_NOR | (1ULL << 32), PS3_STOR_NOR | (2ULL << 32),
+    PS3_STOR_NOR | (3ULL << 32),
+    PS3_STOR_NAND_UNK,
+};
+
+/* StorageDeviceInfo: name[0x20], 0x20, 0x24, count u64 at 0x28, sector size
+ * u32 at 0x30, a constant 1 at 0x34 and eight flag bytes at 0x38. */
+static int32_t ps3_stor_info(PS3BootROMState *s, uint8_t *ram,
+                             uint64_t ram_size, uint64_t device, uint32_t ptr)
+{
+    uint8_t info[0x40];
+    uint64_t sectors = 0;
+    uint32_t size = PS3_LV2_SECTOR;
+    uint8_t flags[8] = { 0, 0, 1, 0, 0, 0, 0, 1 };
+    unsigned num = ps3_stor_num(device);
+
+    if (!ptr || (uint64_t)ptr + sizeof(info) > ram_size) {
+        return PS3_LV2_EFAULT;
+    }
+
+    switch (ps3_stor_base(device)) {
+    case PS3_STOR_BDVD:
+        if (num > 0) {
+            return -5;              /* no such partition, as lv2 answers */
+        }
+        size = PS3_STOR_SECT_BD;
+        /* An empty drawer really is empty: the media's size is the answer. */
+        sectors = s->disc_size / PS3_STOR_SECT_BD;
+        break;
+    case PS3_STOR_ATA_HDD:
+        if (num > 2) {
+            return -5;
+        }
+        sectors = ps3_stor_hdd_sectors(s, num);
+        flags[1] = 1;
+        break;
+    case PS3_STOR_NAND: {
+        static const uint64_t nand[7] = { 0x80000, 0x75F8, 0x63E00, 0x8000,
+                                          0x400, 0x2000, 0x200 };
+
+        if (num > 6) {
+            return -5;
+        }
+        sectors = nand[num];
+        flags[1] = 1;
+        break;
+    }
+    case PS3_STOR_NOR: {
+        static const uint64_t nor[4] = { 0x8000, 0x77F8, 0x100, 0x400 };
+
+        if (num > 3) {
+            return -5;
+        }
+        sectors = nor[num];
+        break;
+    }
+    case PS3_STOR_NAND_UNK:
+        if (num > 1) {
+            return -5;
+        }
+        size = PS3_STOR_SECT_BD;
+        sectors = 0x7FFFFFFF;
+        break;
+    case PS3_STOR_USB:
+        if (num > 0) {
+            return -5;
+        }
+        /* A USB stick is a host directory here, so it has no geometry. */
+        break;
+    default:
+        return PS3_LV2_ENOENT;
+    }
+
+    memset(info, 0, sizeof(info));
+    memcpy(info, "unnamed", 7);
+    ps3_put_be64(info + 0x28, sectors);
+    ps3_put_be32(info + 0x30, size);
+    ps3_put_be32(info + 0x34, 1);
+    memcpy(info + 0x38, flags, 8);
+    memcpy(ram + ptr, info, sizeof(info));
+
+    return 0;
+}
+
+static bool ps3_lv2_storage(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
+                            uint64_t ram_size, uint32_t nr, int32_t *ret)
+{
+    uint64_t a0 = env->gpr[3];
+    uint64_t a1 = env->gpr[4];
+    uint64_t a2 = env->gpr[5];
+    uint64_t a3 = env->gpr[6];
+    uint64_t a4 = env->gpr[7];
+    uint64_t a5 = env->gpr[8];
+    uint64_t a6 = env->gpr[9];
+
+    switch (nr) {
+    case 0x258: {               /* sys_storage_open(device, mode, fd*,
+                                 * flags) */
+        unsigned n;
+
+        if (a0 == 0) {
+            *ret = PS3_LV2_ENOENT;
+            return true;
+        }
+        if (!a2 || a2 + 4 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        for (n = 0; n < PS3_STOR_MAX; n++) {
+            if (!s->stor[n].used) {
+                break;
+            }
+        }
+        if (n == PS3_STOR_MAX) {
+            *ret = PS3_LV2_EAGAIN;
+            return true;
+        }
+        s->stor[n].used = true;
+        s->stor[n].device = a0;
+        ps3_put_be32(ram + a2, n + 1);
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: sys_storage_open(0x%" PRIX64
+                        ", mode 0x%" PRIX64 ") -> handle %u", a0, a1, n + 1);
+        }
+        *ret = 0;
+        return true;
+    }
+    case 0x259: {               /* sys_storage_close(fd) */
+        int i = ps3_stor_index(s, a0);
+
+        if (i < 0) {
+            *ret = PS3_LV2_ESRCH;
+            return true;
+        }
+        memset(&s->stor[i], 0, sizeof(s->stor[i]));
+        *ret = 0;
+        return true;
+    }
+    case 0x25A:                 /* sys_storage_read(fd, mode, start, count,
+                                 * buf, got*, flags) */
+    case 0x25B: {               /* sys_storage_write(...) */
+        int i = ps3_stor_index(s, a0);
+        bool bd = i >= 0 && ps3_stor_base(s->stor[i].device) == PS3_STOR_BDVD;
+        BlockBackend *blk = bd ? s->disc : s->hdd;
+        uint32_t sect = bd ? PS3_STOR_SECT_BD : PS3_LV2_SECTOR;
+        uint64_t bytes, off, media;
+        uint32_t n;
+        bool write = nr == 0x25B;
+
+        if (i < 0) {
+            *ret = PS3_LV2_ESRCH;
+            return true;
+        }
+        if (!a4 || a4 + 8 > ram_size || !a5 || a5 + 4 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        n = (uint32_t)a3;
+        if (n > (ram_size - a4) / sect) {
+            n = (ram_size - a4) / sect;
+        }
+        bytes = (uint64_t)n * sect;
+        off = (uint64_t)(uint32_t)a2 * sect;
+        media = bd ? s->disc_size : s->hdd_size;
+
+        /* An empty drawer, a write to a read-only disc: nothing moves. */
+        if (!blk || (write && bd) || off >= media) {
+            ps3_put_be32(ram + a5, 0);
+            *ret = 0;
+            return true;
+        }
+        /* A read that runs past the media stops at its end. */
+        if (!write && off + bytes > media) {
+            n = (media - off) / sect;
+            bytes = (uint64_t)n * sect;
+        }
+        if (write ? blk_pwrite(blk, off, bytes, ram + a4, 0) < 0
+                  : blk_pread(blk, off, bytes, ram + a4, 0) < 0) {
+            *ret = PS3_LV2_EIO;
+            return true;
+        }
+        ps3_put_be32(ram + a5, n);
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: storage %s sector 0x%X, %u sector(s)",
+                        write ? "write" : "read", (uint32_t)a2, n);
+        }
+        *ret = 0;
+        return true;
+    }
+    case 0x25C:                 /* sys_storage_send_device_command(handle, cmd,
+                                 * in, inlen, out, outlen) */
+    case 0x268: {               /* sys_storage_execute_device_command(...) */
+        /* A SCSI pass-through.  lv2 forwards it to the drive and the drive's
+         * own firmware answers; there is no firmware here, so the reply is
+         * a zeroed buffer and success, which is what every caller that only
+         * needs the drive to be present expects. */
+        uint64_t out = nr == 0x25C ? a4 : a6;
+        uint64_t outlen = nr == 0x25C ? a5 : a6;
+
+        if (nr == 0x268) {
+            out = a4;
+            outlen = a5;
+        }
+        if (out && outlen && out + outlen <= ram_size) {
+            memset(ram + out, 0, MIN(outlen, ram_size - out));
+        }
+        if (nr == 0x268 && a6 && a6 + 4 <= ram_size) {
+            ps3_put_be32(ram + a6, 0);
+        }
+        *ret = 0;
+        return true;
+    }
+    case 0x25D:                 /* sys_storage_async_configure(fd, io_buf,
+                                 * eq, unk) */
+    case 0x25E:                 /* sys_storage_async_read */
+    case 0x25F:                 /* sys_storage_async_write */
+    case 0x260:                 /* sys_storage_async_cancel */
+    case 0x264:                 /* sys_storage_configure_medium_event */
+    case 0x265:                 /* sys_storage_set_medium_polling_interval */
+    case 0x266:                 /* sys_storage_create_region */
+    case 0x267:                 /* sys_storage_delete_region */
+    case 0x269:                 /* sys_storage_check_region_acl */
+    case 0x26A:                 /* sys_storage_set_region_acl */
+    case 0x26B:                 /* sys_storage_async_send_device_command */
+    case 0x26E:                 /* sys_storage_get_region_offset */
+    case 0x26F:                 /* sys_storage_set_emulated_speed */
+    case 0x2BB:                 /* sys_bdemu_send_command */
+        *ret = 0;
+        return true;
+    case 0x261:                 /* sys_storage_get_device_info(device, info*) */
+        *ret = ps3_stor_info(s, ram, ram_size, a0, (uint32_t)a1);
+        return true;
+    case 0x262:                 /* sys_storage_get_device_config(storages*,
+                                 * devices*) */
+        if (!a0 || a0 + 4 > ram_size || !a1 || a1 + 4 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        ps3_put_be32(ram + a0, 6);              /* storages lv2 reports */
+        ps3_put_be32(ram + a1, PS3_STOR_DEVICES);
+        if (!s->lv2_storage_reported) {
+            s->lv2_storage_reported = true;
+            info_report("ps3-ppu: lv2: sys_storage: 6 storage(s), %u device(s); "
+                        "BD drive %s", PS3_STOR_DEVICES,
+                        s->disc_size ? "has media" : "is empty");
+        }
+        *ret = 0;
+        return true;
+    case 0x263: {               /* sys_storage_report_devices(storages, start,
+                                 * count, ids*) */
+        uint32_t n;
+
+        if (!a3 || a3 + 8 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        if ((uint32_t)a1 >= PS3_STOR_DEVICES ||
+            (uint32_t)a2 > PS3_STOR_DEVICES - (uint32_t)a1) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+        for (n = 0; n < (uint32_t)a2; n++) {
+            ps3_put_be64(ram + a3 + 8 * (uint64_t)n,
+                         ps3_stor_all[(uint32_t)a1 + n]);
+        }
+        *ret = 0;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 static bool ps3_lv2_rsx(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
                         uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
                         uint32_t a3, uint32_t a4, uint32_t a5, int32_t *ret)
@@ -7153,6 +7551,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
     /* The wired link: lv2's sys_net calls run on the host's sockets. */
     if (ps3_lv2_net(s, ram, ram_size, nr, a0, a1, a2, a3,
                     cpu->env.gpr[7], cpu->env.gpr[8], &ret)) {
+        goto publish;
+    }
+
+    /* The drives: the BD drive and the disk behind lv2's sys_storage. */
+    if (ps3_lv2_storage(s, &cpu->env, ram, ram_size, nr, &ret)) {
         goto publish;
     }
 
@@ -7433,6 +7836,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
         int m = -1;
 
         if ((uint64_t)a0 + 4 > ram_size) {
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: mutex_create: out 0x%X is outside "
+                            "RAM (lr=0x%" PRIX64 ")", a0,
+                            (uint64_t)cpu->env.lr);
+            }
             ret = PS3_LV2_EFAULT;
             break;
         }
@@ -7478,6 +7886,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
         uint32_t tid = s->thr_cur >= 0 ? s->thr[s->thr_cur].id : 1;
 
         if (m < 0) {
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: mutex_lock: no mutex 0x%X "
+                            "(lr=0x%" PRIX64 ")", a0,
+                            (uint64_t)cpu->env.lr);
+            }
             ret = PS3_LV2_ESRCH;
             break;
         }
@@ -7551,6 +7964,13 @@ static void ps3_lv2_service(PS3BootROMState *s)
         int m = ps3_mutex_index(s, a1);
 
         if (c < 0 || m < 0) {
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: cond_wait: cond 0x%X %s, "
+                            "mutex 0x%X %s (lr=0x%" PRIX64 ")",
+                            a0, c < 0 ? "missing" : "ok", a1,
+                            m < 0 ? "missing" : "ok",
+                            (uint64_t)cpu->env.lr);
+            }
             ret = PS3_LV2_ESRCH;
             break;
         }
@@ -7743,7 +8163,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
      * and the map/unmap calls simply succeed.  This is the range the library
      * keeps its mapped surfaces in, so it starts above the guest's own heap.
      */
-#define PS3_LV2_MMAP_BASE   0x10000000u
+#define PS3_LV2_MMAP_BASE   0x08000000u
 #define PS3_LV2_MMAP_ALIGN  0x00001000u
     case 0x146:                 /* sys_mmapper_allocate_fixed_address */
     case 0x147:                 /* sys_mmapper_enable_page_fault_notification */
@@ -7771,15 +8191,31 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EFAULT;
             break;
         }
-        if (!s->lv2_mmap_next) {
-            s->lv2_mmap_next = PS3_LV2_MMAP_BASE;
-        }
-        if ((uint64_t)s->lv2_mmap_next + size > ram_size) {
+        /*
+         * The guest asks for a virtual range, but this model has no MMU and
+         * only flat RAM, so the address handed back has to be inside RAM.
+         * The range is therefore clamped to the room that is left: the guest
+         * has only the address, and every byte it touches has to land
+         * somewhere.  Handing back the old base at 0x10000000 did not: that
+         * is exactly ram_size, so the VSH's heap was outside the machine and
+         * the pointers it built from it faulted.
+         */
+        if (!s->lv2_mmap_next || s->lv2_mmap_next >= ram_size) {
             s->lv2_mmap_next = PS3_LV2_MMAP_BASE;
         }
         addr = s->lv2_mmap_next;
-        s->lv2_mmap_next = (addr + size + PS3_LV2_MMAP_ALIGN - 1) &
-                           ~(PS3_LV2_MMAP_ALIGN - 1);
+        {
+            uint64_t room = (ram_size - addr) &
+                            ~(uint64_t)(PS3_LV2_MMAP_ALIGN - 1);
+            uint64_t step = MIN(size, room);
+
+            s->lv2_mmap_next = (addr + step + PS3_LV2_MMAP_ALIGN - 1) &
+                               ~(PS3_LV2_MMAP_ALIGN - 1);
+            if (step < size) {
+                /* A second reservation starts over at the bottom. */
+                s->lv2_mmap_next = PS3_LV2_MMAP_BASE;
+            }
+        }
         ps3_put_be32(ram + a3, addr);
         info_report("ps3-ppu: lv2: mmapper %s: 0x%" PRIX64 " at 0x%X",
                     nr == 0x14A ? "address" : "search_and_map", size, addr);
@@ -7919,14 +8355,22 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     case 0x15F: {               /* sys_memory_get_page_attribute(addr, attr*) */
-        if (!a1 || (uint64_t)a1 + 0x40 > ram_size) {
+        if (!a1 || (uint64_t)a1 + 0x18 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
         }
-        /* ScePageInfo: 64 KiB pages, read/write/execute, no flag set. */
-        memset(ram + a1, 0, 0x40);
-        ps3_put_be32(ram + a1, 0x00010000);
-        ps3_put_be32(ram + a1 + 0x04, 0x00000007);
+        /*
+         * lv2's sys_page_attr_t, in the order the guest reads it:
+         * { u64 attribute; u64 access_right; u32 page_size; u32 pad; }.
+         * Writing the page size into the first word (as this did) left
+         * `page_size' reading 0 - the caller that sizes a mapping from it then
+         * walked off into nothing - and made `attribute' a page size instead
+         * of a protection value.
+         */
+        memset(ram + a1, 0, 0x18);
+        ps3_put_be64(ram + a1, 0x0000000000040000ULL);      /* read/write */
+        ps3_put_be64(ram + a1 + 8, 0x8ULL);                 /* PPU thread */
+        ps3_put_be32(ram + a1 + 0x10, 4096);                /* page size */
         ret = 0;
         break;
     }
@@ -8451,6 +8895,89 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
+    case 0x02A:                 /* sys_ppu_thread_yield */
+        s->sched_pending = true;
+        ret = 0;
+        break;
+    case 0x02D: {               /* sys_ppu_thread_detach(thread_id) */
+        for (i = 0; i < PS3_THREAD_MAX; i++) {
+            if (s->thr[i].used && s->thr[i].id == a0) {
+                break;
+            }
+        }
+        if (i == PS3_THREAD_MAX) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (s->thr[i].dead) {
+            ret = PS3_LV2_EAGAIN;       /* already exited */
+            break;
+        }
+        if (s->thr[i].detached) {
+            ret = PS3_LV2_EINVAL;
+            break;
+        }
+        s->thr[i].detached = true;
+        ret = 0;
+        break;
+    }
+    case 0x02E: {               /* sys_ppu_thread_get_join_state(u32 *joinable) */
+        uint32_t tid = s->thr_cur >= 0 ? s->thr[s->thr_cur].id : 0;
+        bool detach = s->thr_cur >= 0 && s->thr[s->thr_cur].detached;
+
+        if (!a0 || (uint64_t)a0 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        (void)tid;
+        /* lv2 answers 1 while the thread can still be joined. */
+        ps3_put_be32(ram + a0, detach ? 0 : 1);
+        ret = 0;
+        break;
+    }
+    case 0x02F:                 /* sys_ppu_thread_set_priority(id, prio) */
+        for (i = 0; i < PS3_THREAD_MAX; i++) {
+            if (s->thr[i].used && s->thr[i].id == a0) {
+                s->thr[i].prio = (int32_t)a1;
+                break;
+            }
+        }
+        ret = i == PS3_THREAD_MAX ? PS3_LV2_ESRCH : 0;
+        break;
+    case 0x030: {               /* sys_ppu_thread_get_priority(id, s32 *prio) */
+        if (!a1 || (uint64_t)a1 + 4 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (i = 0; i < PS3_THREAD_MAX; i++) {
+            if (s->thr[i].used && s->thr[i].id == a0) {
+                break;
+            }
+        }
+        if (i == PS3_THREAD_MAX) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ps3_put_be32(ram + a1, (uint32_t)s->thr[i].prio);
+        ret = 0;
+        break;
+    }
+    case 0x031: {               /* sys_ppu_thread_get_stack_information(
+                                 * sys_ppu_thread_stack_t *info) */
+        /* { u32 addr; u32 size; } for the calling thread. */
+        if (!a0 || (uint64_t)a0 + 8 > ram_size) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        if (s->thr_cur < 0) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ps3_put_be32(ram + a0, s->thr[s->thr_cur].stack_base);
+        ps3_put_be32(ram + a0 + 4, s->thr[s->thr_cur].stack_size);
+        ret = 0;
+        break;
+    }
     case 0x32:                  /* sys_ppu_thread_stop(thread_id) */
     case 0x33:                  /* sys_ppu_thread_restart(thread_id) */
     case 0x35:                  /* sys_ppu_thread_start(thread_id) */
@@ -8495,7 +9022,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
         {
             uint32_t tid = ps3_lv2_thread_created(s, ram, ram_size,
                                                   &cpu->env, entry, tls, a2,
-                                                  a5, name);
+                                                  a5, (int32_t)a4, name);
 
             if (!tid) {
                 if (s->ppu_trace) {
@@ -9722,6 +10249,41 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     /* No guest thread has been created yet; the first switch registers one. */
     kbd_s->thr_cur = -1;
 
+    /*
+     * The Blu-ray drive's media, for lv2's storage layer.  An image that is a
+     * decrypted ISO is served exactly the way a drive serves a disc: 2048-byte
+     * sectors of the image, so the VSH's x3 layer can mount /dev_bdvd and read
+     * the game's files.  Without one the drawer is empty and every read
+     * reports no sectors, which is what a console with no disc says.
+     *
+     * It is a second, read-only block backend on the same file the ATAPI
+     * device was given: the legacy drive is already connected to that device
+     * and cannot be attached twice, and a disc is read-only anyway.
+     */
+    if (kbd_s->disc_file && !kbd_s->disc) {
+        QDict *opts = qdict_new();
+        Error *derr = NULL;
+        int64_t disc_len;
+
+        qdict_put_str(opts, "driver", "raw");
+        /* No write flag: the drive is read-only media. */
+        kbd_s->disc = blk_new_open(kbd_s->disc_file, NULL, opts, 0, &derr);
+        if (!kbd_s->disc) {
+            error_setg(errp, "ps3-boot-rom: cannot open BD image %s: %s",
+                       kbd_s->disc_file,
+                       derr ? error_get_pretty(derr) : "unknown error");
+            error_free(derr);
+            return;
+        }
+        disc_len = blk_getlength(kbd_s->disc);
+        kbd_s->disc_size = disc_len > 0 ? (uint64_t)disc_len : 0;
+        info_report("ps3-boot-rom: BD drive: %s, %" PRIu64 " sector(s) of "
+                    "2048 byte(s) (%" PRIu64 " MiB)", kbd_s->disc_file,
+                    kbd_s->disc_size / PS3_STOR_SECT_BD,
+                    kbd_s->disc_size / MiB);
+    }
+    memset(kbd_s->stor, 0, sizeof(kbd_s->stor));
+
     /* No sockets are open until the guest asks for one. */
     for (net_i = 0; net_i < PS3_NET_MAX; net_i++) {
         kbd_s->net_used[net_i] = false;
@@ -10521,6 +11083,68 @@ static void ps3_ppu_tick(void *opaque)
     s->ppu_tick_count++;
 
     /*
+     * A thread that lands on an exception vector has nowhere to go: this
+     * model installs no handler, so it spins there and every slice the
+     * scheduler gives it is wasted.  Say so once and retire a worker; the
+     * process's main thread is left in place, because its fault is the run's
+     * own answer and not something to hide.
+     */
+    if (s->thr_cur >= 0 && s->thr[s->thr_cur].used) {
+        PS3Thread *t = &s->thr[s->thr_cur];
+        const char *vector = ps3_ppu_vector_name(cpu->env.nip);
+
+        if (vector && cpu->env.nip != 0xC00) {      /* 0xC00 is the `sc` path */
+            if (!t->fault_reported) {
+                t->fault_reported = true;
+                info_report("ps3-ppu: thread 0x%X took the %s vector at "
+                            "0x%" PRIX64 " (lr=0x%" PRIX64 ")", t->id, vector,
+                            (uint64_t)cpu->env.nip, (uint64_t)cpu->env.lr);
+                /*
+                 * A vector is where a run dies, and the nested fault that
+                 * follows immediately overwrites SRR0 with the vector's own
+                 * address, so the interesting thing is what the thread was
+                 * doing: its stack pointer, the words around the frame and the
+                 * registers the ABI uses to return.
+                 */
+                {
+                    uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+                    uint64_t ram_size = memory_region_size(s->ram);
+                    uint32_t sp = (uint32_t)cpu->env.gpr[1];
+
+                    info_report("ps3-ppu:   r1=0x%X r2=0x%X r3=0x%" PRIX64
+                                " r11=0x%" PRIX64 " r12=0x%" PRIX64
+                                " r29=0x%" PRIX64 " r30=0x%" PRIX64
+                                " r31=0x%" PRIX64 " ctr=0x%" PRIX64,
+                                sp, (uint32_t)cpu->env.gpr[2],
+                                (uint64_t)cpu->env.gpr[3],
+                                (uint64_t)cpu->env.gpr[11],
+                                (uint64_t)cpu->env.gpr[12],
+                                (uint64_t)cpu->env.gpr[29],
+                                (uint64_t)cpu->env.gpr[30],
+                                (uint64_t)cpu->env.gpr[31],
+                                (uint64_t)cpu->env.ctr);
+                    if ((uint64_t)sp + 0x40 <= ram_size) {
+                        char words[256];
+                        size_t at = 0;
+                        unsigned n;
+
+                        for (n = 0; n < 8; n++) {
+                            at += snprintf(words + at, sizeof(words) - at,
+                                           " %08X",
+                                           ps3_be32(ram + sp + 4 * n));
+                        }
+                        info_report("ps3-ppu:   frame%s", words);
+                    }
+                }
+            }
+            if (!t->main && t->exit_stub) {
+                t->dead = true;
+                s->sched_pending = true;
+            }
+        }
+    }
+
+    /*
      * A fault leaves the core at a vector with SRR0 naming the instruction and
      * SRR1 the interrupt cause.  Report the first one once: it is the only
      * useful thing a bring-up run can say about a vector it has no handler for.
@@ -10542,6 +11166,32 @@ static void ps3_ppu_tick(void *opaque)
                         (uint64_t)cpu->env.gpr[3], (uint64_t)cpu->env.gpr[4],
                         (uint64_t)cpu->env.gpr[31],
                         (uint64_t)cpu->env.msr);
+            /*
+             * The frame a thread died in is only half the story: a return
+             * address that came out of a clobbered linkage area is the
+             * symptom, and the frames above it name the caller that built the
+             * bad slot.  Walk the back chain and print each frame's saved LR,
+             * which is what a `blr` out of it would use.
+             */
+            if (s->ppu_last_pc == 0x700 && s->ppu_trace) {
+                uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+                uint64_t ram_size = memory_region_size(s->ram);
+                uint32_t sp = (uint32_t)cpu->env.gpr[1];
+                unsigned depth;
+
+                for (depth = 0; depth < 6 && (uint64_t)sp + 0x20 <= ram_size;
+                     depth++) {
+                    info_report("ps3-ppu:   chain[%u] sp=0x%X lr=0x%" PRIX64
+                                " back=0x%X", depth, sp,
+                                ps3_be64(ram + sp + 0x10),
+                                ps3_be32(ram + sp));
+                    if (!ps3_be32(ram + sp) || ps3_be32(ram + sp) <= sp) {
+                        break;
+                    }
+                    sp = ps3_be32(ram + sp);
+                }
+            }
+
             if (s->ppu_last_pc == 0x700 && s->ppu_trace) {
                 unsigned n;
 
@@ -11110,6 +11760,7 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
 
 static const Property ps3_rom_properties[] = {
     DEFINE_PROP_DRIVE("drive", PS3BootROMState, blk),
+    DEFINE_PROP_STRING("disc-file", PS3BootROMState, disc_file),
     DEFINE_PROP_STRING("stage-elf", PS3BootROMState, stage_elf),
     DEFINE_PROP_LINK("ram", PS3BootROMState, ram, TYPE_MEMORY_REGION,
                      MemoryRegion *),
@@ -11355,7 +12006,7 @@ static void rs6000_ps3_init(MachineState *machine)
     MemoryRegion *boot = g_new(MemoryRegion, 1);
     PowerPCCPU *cpu;
     DeviceState *mic, *rom, *vga;
-    DriveInfo *dinfo;
+    DriveInfo *dinfo, *disc_drive;
 
     /*
      * Hardware acceleration runs the host's CPU, so on this target it can only
@@ -11456,13 +12107,13 @@ static void rs6000_ps3_init(MachineState *machine)
     {
         ISABus *isabus = isa_bus_new(NULL, get_system_memory(),
                                      get_system_io(), &error_fatal);
-        DriveInfo *disc = drive_get(IF_IDE, 0, 0);
 
+        disc_drive = drive_get(IF_IDE, 0, 0);
         isa_bus_register_input_irqs(isabus,
                                     qemu_allocate_irqs(ps3_isa_noop, NULL, 16));
-        isa_ide_init(isabus, 0x1F0, 0x3F6, 14, disc, NULL);
+        isa_ide_init(isabus, 0x1F0, 0x3F6, 14, disc_drive, NULL);
         info_report("rs6000-ps3: disc: IDE/ATAPI channel at 0x1F0%s",
-                    disc ? " with the image attached" : " (no image)");
+                    disc_drive ? " with the image attached" : " (no image)");
     }
 
     rom = qdev_new(TYPE_PS3_BOOT_ROM);
@@ -11476,6 +12127,19 @@ static void rs6000_ps3_init(MachineState *machine)
 
     if (dinfo) {
         qdev_prop_set_drive(rom, "drive", blk_by_legacy_dinfo(dinfo));
+    }
+
+    if (disc_drive) {
+        /*
+         * lv2's storage layer reads the same media the ATAPI device serves,
+         * so both the guest's own ATA driver and the VSH's x3 layer see one
+         * disc instead of two views of it.
+         */
+        const char *disc_path = qemu_opt_get(disc_drive->opts, "file");
+
+        if (disc_path) {
+            qdev_prop_set_string(rom, "disc-file", disc_path);
+        }
     }
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(rom), &error_fatal);
