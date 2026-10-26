@@ -75,6 +75,7 @@ jobs:
               mingw-w64-ucrt-x86_64-pixman
               mingw-w64-ucrt-x86_64-python
               mingw-w64-ucrt-x86_64-SDL2
+              mingw-w64-ucrt-x86_64-git
           - arch: arm64
             runs-on: windows-11-arm
             msystem: CLANGARM64
@@ -86,6 +87,7 @@ jobs:
               mingw-w64-clang-aarch64-pixman
               mingw-w64-clang-aarch64-python
               mingw-w64-clang-aarch64-SDL2
+              mingw-w64-clang-aarch64-git
     steps:
       - uses: actions/checkout@v4
 
