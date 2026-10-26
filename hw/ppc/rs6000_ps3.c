@@ -12973,14 +12973,26 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
         return false;
     }
 
-    info_report("ps3-boot-rom: HDD: %s, %" PRIu64 " GiB raw%s%s",
-                s->hdd_file, s->hdd_size / GiB,
+    /*
+     * The image on disk decides the disk: `hdd-size' only sizes one the model
+     * creates, and lv2's block geometry has to agree with what the guest can
+     * actually read, or a smaller image reports a capacity it cannot reach.
+     */
+    s->hdd_size = blk_getlength(s->hdd);
+
+    info_report("ps3-boot-rom: HDD: %s, %" PRIu64 " bytes raw%s%s",
+                s->hdd_file, s->hdd_size,
                 s->hdd_created ? " (created)" : "",
                 s->hdd_keyed ? ", ATA keys from the EID root key" : ", unkeyed");
 
     if (s->hdd_keyed) {
-        ps3_vga_printf("HDD: %" PRIu64 " GIB RAW, ATA KEYS FROM EID ROOT KEY",
-                       s->hdd_size / GiB);
+        if (s->hdd_size >= GiB) {
+            ps3_vga_printf("HDD: %" PRIu64 " GIB RAW, ATA KEYS FROM EID "
+                           "ROOT KEY", s->hdd_size / GiB);
+        } else {
+            ps3_vga_printf("HDD: %" PRIu64 " MIB RAW, ATA KEYS FROM EID "
+                           "ROOT KEY", s->hdd_size / MiB);
+        }
     }
 
     if (!s->hdd_keyed) {

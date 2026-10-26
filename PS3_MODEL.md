@@ -37,6 +37,33 @@ Nothing here is needed to build or use the rest of QEMU.
 - bguerville
 - and last but not least... Anonymous
 
+### BIOS / mask-ROM credits
+
+The SPU mask ROM the model replays (`-bios`) is the one published in zecoxao's
+*The (Microcode?) ROM: bits shared and an overview*
+(<https://www.psx-place.com/threads/the-microcode-rom-bits-shared-and-an-overview.49143/>),
+and the write-up that goes with it, *Glitching the "Almost" Perfect Code...*
+(<https://zecoxao.github.io/writeup/>).  The work behind those bits, as the
+write-up credits it:
+
+- Anonymous - imaging the ROM area, including the SPU pictures that held the
+  actual mask ROM
+- Proxima - decoding the bit images into the 0x400-byte ROM
+- jestero - noticed that SPU registers keep their values across executions, and
+  recovered register 7 from the channel-66 key expansion
+- anergistic and lvx - the SPU analysis and tracing tools the ROM was read with
+- wildcard, ZeroTolerance, DJ, Mina Ralwasser, golden, bguerville - the syscon
+  master keys, patches and testbench work the ROM analysis stands on
+- kafuu, esc0rtd3w, bguerville - QuasiCFW and BadWDSD, the flash-side work
+- sagemono, MikeM64, flat_z, naehrwert, mysis, skgleba, xorloser, Myria, Kafuu
+  - the remaining credits from that write-up
+
+The model's own part is the replay: the SPU interpreter runs those 0x400 bytes
+as instructions, the container opener and key ladder are a second
+implementation checked against the ROM's result, and the flash layouts above
+are the offsets those bits address.  The ROM image is the user's to supply; no
+Sony code is carried in this tree.
+
 ## Files
 
 | Path | Contents |
@@ -45,6 +72,9 @@ Nothing here is needed to build or use the rest of QEMU.
 | `hw/ppc/ps3_spu.c`, `ps3_spu.h` | SPU interpreter, channels, MFC transfers |
 | `hw/ppc/ps3_spu_isa.h` | instruction tables used by the interpreter |
 | `hw/ppc/ps3_self.c`, `ps3_self.h` | SELF opener used by stage runs (ERK/RIV key ladder, CTR sections) |
+| `hw/ppc/ps3_aes/` | AES-128/256, the ATA and encdec key ladders, XTS over HDD sectors |
+| `scripts/ps3_flash_layout.py` | NOR/NAND TOC and region map: carve a dump, place regions, regenerate the TOC |
+| `scripts/ps3_hdd_create.py` | raw HDD image with the ATA key sector wrapped under PCK1 |
 | `hw/ppc/Kconfig`, `hw/ppc/meson.build` | wiring; gated on `CONFIG_PS3` |
 
 ## Build
@@ -1819,6 +1849,71 @@ byte-identical to `lv0ldr_container.dec` (SHA-256 prefix `17db3fde46a0bf9a`).
 belong to the container is refused before a byte is written, as is a decrypted
 stage whose bytes are not the container's plaintext.
 
+### Regenerating a flash image from the layout: `scripts/ps3_flash_layout.py`
+
+The NOR/NAND notes in the ps3tools tree describe a flash in two ways: the
+image's own table of contents, and the fixed offsets the mask ROM uses before
+it has parsed anything.  This script owns both, so an image can be carved,
+edited and rebuilt without copying offsets by hand:
+
+```sh
+py scripts/ps3_flash_layout.py list nor
+py scripts/ps3_flash_layout.py dump .tmp/bootchain_flash.bin
+py scripts/ps3_flash_layout.py get  .tmp/bootchain_flash.bin --all .tmp/carve --slots
+py scripts/ps3_flash_layout.py get  .tmp/bootchain_flash.bin metldr=.tmp/metldr.bin
+py scripts/ps3_flash_layout.py build nor --base .tmp/bootchain_flash.bin \
+    --from .tmp/carve --toc -o .tmp/rebuild.bin
+```
+
+```
+.tmp/bootchain_flash.bin: 16777216 bytes (nor)
+  TOC at 0x400: 11 entries, ends at 0xF00000
+    asecure_loader   0x00000800     2E800
+    eEID             0x0002F000     10000
+    ...
+    ros0             0x000C0000    700000  ros bank
+    ros1             0x007C0000    700000  ros bank
+    cvtrm            0x00EC0000     40000
+  asecure_loader at 0x800: region 0x2E800 bytes, 1 entry
+    metldr.2         0x00000840      F9B0, container 3991 blocks + 0x40 = 0xF9B0
+  documented regions:
+  asecure_loader   0x00000800     2E800  asec header 1 entry, region 0x2E800
+  ...
+  bootldr          0x00FC0000     40000  container   11947/11947 blocks + 0x40 = 0x2EAF0, suffix B19434A33CF1C866DF420E50
+  sha256 11d64119addc40b0a791727c791f62ca4a3a1f5f5fc62ca049f783e75fd24eb1
+```
+
+What it knows:
+
+| Item | Layout |
+| --- | --- |
+| flash TOC | at 0x400 on NOR (0x200 in a NAND dump that starts at flash 0x40000): u32 magic, count, zero, end offset relative to the base; 0x30-byte entries of u64 offset (relative to the base), u64 size, name[0x20] |
+| `asecure_loader` | header at 0x800: u32 magic, count, u64 region length; 0x20-byte entries of u64 offset (relative to the header), u64 length, name; `metldr.2` first, at 0x840 |
+| stage container | encrypted blocks at 0x00, 12-byte counter suffix at 0x04, total blocks at 0x10, nonce at 0x14, KDI at 0x20, masked tag at 0x30, body at 0x40; span `total * 16 + 0x40` |
+| `ros` bank | 8 reserved bytes, size at 0x08, version 1 at 0x10, entry count at 0x14, 0x30-byte entries from 0x20 |
+| HDD key sector | sector 0, AES-256-CBC under PCK1, magic `PS3ATA01` then the two ATA keys at 0x08 and 0x28 |
+
+`--slots` carves the TOC slot rather than the region's data length, which is
+what makes a rebuild reproduce padding as well: trvk_prg0 holds a 0x2C0 record
+in a 0x20000 slot.  `--toc` regenerates the eleven NOR entries from the same
+table, and the build reads its own result back.  Round trip on the image above:
+
+```sh
+$ py scripts/ps3_flash_layout.py build nor --base .tmp/bootchain_flash.bin \
+    --from .tmp/carve --toc -o .tmp/rebuild.bin
+.tmp/rebuild.bin: 16777216 bytes, sha256 11d64119addc40b0a791727c791f62ca4a3a1f5f5fc62ca049f783e75fd24eb1
+  read back: TOC at 0x400, 11 entries, every entry has content
+```
+
+That file is byte-identical to the image it was carved from
+(`11d64119addc40b0...`), and booting it as the pflash drive prints the same
+`container verified, 191152 bytes of payload` and `selftest passed` as the
+original.  NAND tables are not rebuilt: the documented NAND table lists one
+`ros` entry of 0xE00000 bytes at an offset the notes do not pin down, so a NAND
+image keeps the base image's TOC (`build nand --base ...` without `--toc`),
+and `build nand --flash-base 0x40000` writes into a GameOS dump at its own
+base, which is what `get` already detects on its own.
+
 ### 3. Run the rest of the chain stage by stage
 
 ```sh
@@ -1983,6 +2078,46 @@ Observed on this build:
 | `boot-medium=emmc`, plaintext image made with `norbuild.py` | `eMMC: ... unkeyed`, sector 7 round trip, `container verified, 191152 bytes of payload` |
 | `boot-medium=emmc` + `erk-file`, blank image | `encdec keys from the EID root key`, sector 7 round trip, `selftest passed` |
 | `boot-medium=hdd`, unkeyed 64 MiB disk with the rebuilt image at 0 | `boot medium hdd`, `container verified, 191152 bytes of payload` |
+
+### A raw HDD: `scripts/ps3_hdd_create.py`
+
+A disk the model accepts is one the console would: sector 0 is the ATA key
+block, AES-256-CBC under PCK1, and every other sector is XTS-AES under the two
+keys it carries.  The model unwraps that sector at startup and checks the pair
+against the one PCK1 derives, so a disk made once stays portable across runs.
+The script derives those keys the same way (`ps3_ata_keys` in
+`hw/ppc/ps3_aes/`) and leaves the data area zeroed - an unformatted disk, which
+the guest formats on first boot:
+
+```sh
+py scripts/ps3_hdd_create.py --erk-file .tmp/erk48.bin -o .tmp/hdd.raw --verify
+py scripts/ps3_hdd_create.py --erk-file .tmp/erk48.bin --size 1MiB -o .tmp/test.raw --verify
+py scripts/ps3_hdd_create.py --no-key -o .tmp/plain.raw          # model runs it unkeyed
+py scripts/ps3_hdd_create.py --data-key <64 hex> --tweak-key <64 hex> \
+    --erk-file .tmp/erk48.bin -o .tmp/hdd.raw                     # keys already known
+```
+
+```
+.tmp/test.raw: 1048576 bytes, key sector written (ATA data key sha256 1f662b29334ac612, tweak key sha256 b3f93648b23797ae)
+verify: sector 0 opens under the EID root key and carries both ATA keys
+```
+
+Hand it to the model with `-global ps3-boot-rom.hdd-file=...` plus `erk-file`;
+for the image above it prints:
+
+```
+ps3-boot-rom: HDD: .tmp/test.raw, 1048576 bytes raw, ATA keys from the EID root key
+ps3-boot-rom: HDD key sector unwrapped under the EID root key; ATA keys match the ones it derives
+ps3-boot-rom: HDD sector 1: decrypt and re-encrypt reproduce the image byte for byte
+```
+
+The AES is a dependency-free AES-256 with the FIPS-197 and SP 800-38A vectors
+run on every start, so the script needs nothing but Python.  `--size` takes
+`20G`/`512M`/`1MiB` or a plain byte count and defaults to 20 GiB, the disk a
+CECH-4201A shipped with.  `hdd-size` only sizes an image the model creates -
+for an existing file the image's own length becomes the disk lv2 reports, so
+the 1 MiB test image above says `1048576 bytes` rather than 20 GiB.  No key is
+printed, only a fingerprint, because a PCK1 in a log is a console in a log.
 
 ## Expected messages
 

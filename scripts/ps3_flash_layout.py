@@ -21,7 +21,9 @@ without hand-copying offsets:
 `build --from` places those files back at their documented offsets, and
 `--toc` regenerates the flash table of contents from the same table so the
 result is self-describing again.  A region that is not in the map (e.g. a
-carved `metldr`) has to be placed with `--put` at its documented slot.
+carved `metldr`) has to be placed with `--put` at its documented slot.  A NAND
+dump made from GameOS starts at flash 0x40000, so `get` detects that base on
+its own and `build nand --flash-base 0x40000` writes at the same one.
 
 Layouts (all big-endian, from the flash section of the ps3tools notes):
 
@@ -101,10 +103,6 @@ TOC_LAYOUT = [
     ("cvtrm",          0xEC0000, 0x40000),
 ]
 
-# NAND regions the map names explicitly; the rest of a NAND is the ros bank,
-# whose offset the documentation does not pin down.
-NAND_TOC_ORDER = ["asecure_loader"]
-
 MAPS = {
     "nor": {"size": 16 * MiB,
             "toc": 0x400,
@@ -117,6 +115,14 @@ MAPS = {
 
 ALIASES = {"OCRL0200": "ocrl", "extnor_area": "extnor",
            "CELL_EXTNOR_AREA": "extnor", "trvk_prg": "trvk_prg_hdr"}
+
+
+def read_blob(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as e:
+        raise SystemExit("cannot read %s: %s" % (path, e.strerror or e))
 
 
 def be32(data, off):
@@ -272,7 +278,8 @@ def show_region(name, off, size, data, base):
 
 
 def cmd_list(args):
-    for which in ([args.map] if args.map else ["nor", "nand"]):
+    which_one = args.map or args.map_opt
+    for which in ([which_one] if which_one else ["nor", "nand"]):
         print("%s: %s, TOC at 0x%X" % (which, MAPS[which]["note"],
                                        MAPS[which]["toc"]))
         for name, nor, nand, size in REGIONS:
@@ -373,8 +380,8 @@ def cmd_get(args):
             # Every TOC slot and the bootldr slot, so `build --from' restores
             # the whole image, padding included, instead of only the regions
             # whose data length happens to equal their slot.
-            names = [name for name, off, size in TOC_LAYOUT] + \
-                    [n for n in names if n not in names]
+            toc_names = [name for name, off, size in TOC_LAYOUT]
+            names = toc_names + [n for n in names if n not in toc_names]
         for name in names:
             off, size = region_slot(name, which)
             if off - base + size > len(data):
@@ -418,6 +425,7 @@ def build_toc(data, which, base):
 def cmd_build(args):
     which = args.map
     size = MAPS[which]["size"]
+    fbase = int(args.flash_base, 0) if args.flash_base else 0
     if args.base:
         data = bytearray(open(args.base, "rb").read())
         if len(data) < size:
@@ -450,18 +458,26 @@ def cmd_build(args):
             raise SystemExit("--put wants NAME=FILE")
         rname = ALIASES.get(name, name)
         off, size_ = region_slot(rname, which)
-        blob = open(path, "rb").read()
+        at = off - fbase
+        if at < 0:
+            raise SystemExit("%s is at flash 0x%X, below the dump base 0x%X" %
+                             (rname, off, fbase))
+        blob = read_blob(path)
         if len(blob) > size_:
             raise SystemExit("%s is 0x%X bytes, region %s holds 0x%X" %
                              (path, len(blob), rname, size_))
-        data[off:off + len(blob)] = blob
-        print("  %-16s 0x%08X  %8X  <- %s" % (rname, off, len(blob), path))
+        data[at:at + len(blob)] = blob
+        print("  %-16s 0x%08X  %8X  <- %s" % (rname, at, len(blob), path))
 
     for name in args.erase or []:
         rname = ALIASES.get(name, name)
         off, size_ = region_slot(rname, which)
-        data[off:off + size_] = b"\xFF" * size_
-        print("  %-16s 0x%08X  %8X  erased" % (rname, off, size_))
+        at = off - fbase
+        if at < 0:
+            raise SystemExit("%s is at flash 0x%X, below the dump base 0x%X" %
+                             (rname, off, fbase))
+        data[at:at + size_] = b"\xFF" * size_
+        print("  %-16s 0x%08X  %8X  erased" % (rname, at, size_))
 
     if args.toc:
         print("  table of contents:")
@@ -493,7 +509,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("list", help="print the documented region map")
-    p.add_argument("--map", choices=sorted(MAPS))
+    p.add_argument("map", nargs="?", choices=sorted(MAPS))
+    p.add_argument("--map", dest="map_opt", choices=sorted(MAPS))
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("dump", help="TOC, asecure table and regions")
@@ -519,6 +536,9 @@ def main(argv=None):
                    help="directory of region files, one per region name")
     p.add_argument("--put", action="append", metavar="NAME=FILE")
     p.add_argument("--erase", action="append", metavar="NAME")
+    p.add_argument("--flash-base", metavar="BYTES",
+                   help="flash offset the image's first byte carries (a "
+                        "GameOS NAND dump is 0x40000; default 0)")
     p.add_argument("--toc", action="store_true",
                    help="regenerate the flash table of contents")
     p.add_argument("-o", "--output", required=True)
