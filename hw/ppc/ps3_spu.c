@@ -997,13 +997,13 @@ int ps3_spu_isa_selftest(char *why, size_t why_len)
 
     /* doubles at 0x800 and the NaN the special-value test looks for at 0x900 */
     {
-        static const uint8_t data[] = {
-            0x3F, 0xF0, 0, 0, 0, 0, 0, 0,         /* 1.0 */
-            0x40, 0x00, 0, 0, 0, 0, 0, 0,         /* 2.0 */
-        };
-
-        memcpy(ls + 0x800, data, sizeof(data));
-        put_be32(ls + 0x900, 0x7FF80000);
+        /* Each double sits in its own quadword: lqd ignores the low four
+         * address bits, so two doubles must not share one. */
+        put_be32(ls + 0x800, 0x3FF00000);        /* 1.0 */
+        put_be32(ls + 0x804, 0x00000000);
+        put_be32(ls + 0x880, 0x40000000);        /* 2.0 */
+        put_be32(ls + 0x884, 0x00000000);
+        put_be32(ls + 0x900, 0x7FF80000);        /* NaN */
         put_be32(ls + 0x904, 0x00000000);
     }
 
@@ -1015,7 +1015,7 @@ int ps3_spu_isa_selftest(char *why, size_t why_len)
     EMIT(t_rrr(0x2C6, 6, 3, 3));                /* fm  $6,$3,$3     = 4.0 */
     EMIT(t_rrrr(0x0E, 7, 2, 3, 3));             /* fma $7,$2,$3,$3  = 4.0 */
     EMIT(t_rrrr(0x0F, 8, 3, 3, 2));             /* fms $8,$3,$3,$2  = 3.0 */
-    EMIT(t_rrrr(0x0D, 9, 2, 3, 3));             /* fnms $9,$2,$3,$3 = 1.0 */
+    EMIT(t_rrrr(0x0D, 9, 2, 3, 4));             /* fnms $9,$2,$3,$4 = 1.0 */
     EMIT(t_scale(0x1DA, 10, 1, 155));           /* csflt $10,$1,155 = 1.0 */
     EMIT(t_scale(0x1D8, 11, 10, 173));          /* cflts $11,$10,173 = 1 */
     EMIT(t_scale(0x1DB, 12, 1, 155));           /* cuflt $12,$1,155 = 1.0 */
@@ -1079,6 +1079,7 @@ int ps3_spu_isa_selftest(char *why, size_t why_len)
     put_be32(ls + 0x1200, 0x140u << 21);        /* stopd */
 
     spu = ps3_spu_new(ls, 256 * KiB, NULL, 0);
+    spu->trace = true;
     status = ps3_spu_run(spu, entry, 1000, why, why_len);
 
     if (status != 0) {
@@ -1104,6 +1105,10 @@ int ps3_spu_isa_selftest(char *why, size_t why_len)
     ISA_CHECK("fcgt", ps3_spu_gpr_word(spu, 18, 0), 0xFFFFFFFFu);
     ISA_CHECK("fcmeq", ps3_spu_gpr_word(spu, 19, 0), 0u);
     ISA_CHECK("fcmgt", ps3_spu_gpr_word(spu, 20, 0), 0xFFFFFFFFu);
+    ISA_CHECK("lqd $21 hi", ps3_spu_gpr_word(spu, 21, 0), 0x3FF00000u);
+    ISA_CHECK("lqd $21 lo", ps3_spu_gpr_word(spu, 21, 1), 0u);
+    ISA_CHECK("lqd $22 hi", ps3_spu_gpr_word(spu, 22, 0), 0x40000000u);
+    ISA_CHECK("lqd $22 lo", ps3_spu_gpr_word(spu, 22, 1), 0u);
     ISA_CHECK("dfa", ps3_spu_gpr_word(spu, 23, 0), 0x40080000u);
     ISA_CHECK("dfa lo", ps3_spu_gpr_word(spu, 23, 1), 0u);
     ISA_CHECK("dfs", ps3_spu_gpr_word(spu, 24, 0), 0x3FF00000u);
@@ -1125,7 +1130,10 @@ int ps3_spu_isa_selftest(char *why, size_t why_len)
     ISA_CHECK("orx slot 1", ps3_spu_gpr_word(spu, 46, 1), 0u);
     ISA_CHECK("mfspr", ps3_spu_gpr_word(spu, 47, 0), 0x40000000u);
     ISA_CHECK("mfspr slot 1", ps3_spu_gpr_word(spu, 47, 1), 0u);
-    ISA_CHECK("rotqbybi word0", ps3_spu_gpr_word(spu, 49, 0), 0u);
+    ISA_CHECK("rotqbybi count", ps3_spu_gpr_word(spu, 48, 0), 32u);
+    ISA_CHECK("rotqbybi w0", ps3_spu_gpr_word(spu, 49, 0), 0u);
+    ISA_CHECK("rotqbybi w1", ps3_spu_gpr_word(spu, 49, 1), 0u);
+    ISA_CHECK("rotqbybi w2", ps3_spu_gpr_word(spu, 49, 2), 0u);
     ISA_CHECK("rotqbybi word3", ps3_spu_gpr_word(spu, 49, 3), 0x3F800000u);
     ISA_CHECK("shlqbybi", ps3_spu_gpr_word(spu, 50, 0), 0u);
     ISA_CHECK("rotqmbybi word0", ps3_spu_gpr_word(spu, 52, 0), 0u);
@@ -2296,6 +2304,11 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
     case K_ROTMQBYBI: {
         const unsigned count = (scw(spu, in.rb) >> 3) & 0x1F;
 
+        if (1) {
+            fprintf(stderr, "isa: %s rt=%u ra=%u rb=%u rbval=0x%08X count=%u\n",
+                    in.op->name, in.rt, in.ra, in.rb, scw(spu, in.rb), count);
+        }
+
         gpr_get_bytes(spu, in.ra, a);
         if (in.op->kind == K_ROTMQBYBI) {
             qshr_bytes(out, a, (0u - count) & 0x1F);
@@ -2305,6 +2318,11 @@ static bool execute(PS3SPU *spu, uint32_t pc, char *why, size_t why_len)
             qrotl_bytes(out, a, count);
         }
         gpr_set_bytes(spu, in.rt, out);
+        if (1) {
+            fprintf(stderr, "isa: -> %02X %02X %02X %02X  lane0=0x%08X a0=%02X%02X%02X%02X\n",
+                    out[0], out[1], out[2], out[3],
+                    gpr_w(spu, in.rt, 0), a[0], a[1], a[2], a[3]);
+        }
         break;
     }
 
