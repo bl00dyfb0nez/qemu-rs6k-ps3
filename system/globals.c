@@ -49,6 +49,7 @@ bool enable_cpu_pm;
 int autostart = 1;
 int vga_interface_type = VGA_NONE;
 bool vga_interface_created;
+int vga_rsx_gl = -1;
 int graphic_width;
 int graphic_height;
 int graphic_depth;

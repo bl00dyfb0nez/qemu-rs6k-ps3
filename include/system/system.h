@@ -30,12 +30,18 @@ extern int autostart;
 
 typedef enum {
     VGA_NONE, VGA_STD, VGA_CIRRUS, VGA_VMWARE, VGA_XENFB, VGA_QXL,
-    VGA_TCX, VGA_CG3, VGA_DEVICE, VGA_VIRTIO,
+    VGA_TCX, VGA_CG3, VGA_DEVICE, VGA_VIRTIO, VGA_RSX,
     VGA_TYPE_MAX,
 } VGAInterfaceType;
 
 extern int vga_interface_type;
 extern bool vga_interface_created;
+
+/*
+ * -vga rsx[,gl=on|off]: -1 leaves the choice to the display backend (GL when
+ * the backend has a GL context), 0 keeps the CPU scanout, 1 requires GL.
+ */
+extern int vga_rsx_gl;
 
 extern int graphic_width;
 extern int graphic_height;

@@ -29,6 +29,9 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include <time.h>
+#ifdef CONFIG_OPENGL
+#include <epoxy/gl.h>
+#endif
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "system/kvm.h"
@@ -107,6 +110,21 @@ struct PS3VGAState {
     bool allow_highres;         /* kept for old command lines; no gate now */
     bool bench;                 /* measure the 720p/1080p compose paths */
     bool av_test;               /* read the EDID, take the scanout, log it */
+
+    /*
+     * -vga rsx: the scanout leaves through a GL texture instead of the
+     * surface path.  The context belongs to the display frontend (SDL or GTK
+     * with gl=on), so the window composites the same pixels the guest sees.
+     */
+    bool gl;                    /* use GL when the display has it */
+    bool gl_required;           /* gl=on: fail without a GL backend */
+    bool gl_checked;
+    bool gl_attempt;
+    bool gl_active;
+    bool gl_presented;
+    QEMUGLContext gl_ctx;
+    unsigned gl_tex;
+    unsigned gl_fbo;
 };
 
 #define PS3_VGA_OVERLAY_ROWS 6
@@ -140,6 +158,8 @@ static bool ps3_vga_accel(void)
  * code free of display plumbing.
  */
 static PS3VGAState *ps3_vga_current;
+
+static void ps3_vga_present(PS3VGAState *s);
 
 static void ps3_vga_row_at(PS3VGAState *s, unsigned row, unsigned y0)
 {
@@ -282,7 +302,7 @@ void ps3_vga_boot_logo(const char *title, const char *caption)
         s->boot_fb[y * PS3_VGA_BOOT_W + x] = PS3_VGA_FG;
     }
 
-    qemu_console_update_full(s->con);
+    ps3_vga_present(s);
 }
 
 /*
@@ -472,7 +492,7 @@ void ps3_vga_home_screen(void)
     }
 
     ps3_vga_dump_screen(s);
-    qemu_console_update_full(s->con);
+    ps3_vga_present(s);
 }
 
 static void ps3_vga_dump_screen(PS3VGAState *s)
@@ -609,7 +629,7 @@ void ps3_vga_puts(const char *line)
         }
     }
 
-    qemu_console_update_full(s->con);
+    ps3_vga_present(s);
 }
 
 void ps3_vga_printf(const char *fmt, ...)
@@ -681,12 +701,16 @@ static void ps3_vga_frame(PS3VGAState *s)
     s->vblank++;
 
     if (!s->guest_mode) {
+        /* The boot screen has to reach the GL scanout once it is up. */
+        if (s->gl_active) {
+            ps3_vga_present(s);
+        }
         return;
     }
 
     ps3_vga_compose(s);
     ps3_vga_text_overlay(s);
-    qemu_console_update_full(s->con);
+    ps3_vga_present(s);
 }
 
 static bool ps3_vga_gfx_update(void *opaque)
@@ -699,6 +723,9 @@ static void ps3_vga_tick(void *opaque)
 {
     PS3VGAState *s = opaque;
 
+    /* The display frontend is up by the first tick; the GL context can be
+     * created now (machine init runs before the display). */
+    s->gl_attempt = true;
     ps3_vga_frame(s);
     timer_mod(s->refresh, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                           PS3_VGA_REFRESH_NS);
@@ -707,6 +734,139 @@ static void ps3_vga_tick(void *opaque)
 static const GraphicHwOps ps3_vga_ops = {
     .gfx_update = ps3_vga_gfx_update,
 };
+
+/*
+ * The GL scanout.
+ *
+ * `-vga rsx,gl=on' takes the same pixels the CPU composed, uploads them to a
+ * texture in a context shared with the display frontend, and hands that
+ * texture to the console's GL scanout.  The frontend then composites it with
+ * the GPU instead of blitting a pixman surface in software: on SDL that is
+ * `-display sdl,gl=on', whose window context and this one share textures.
+ * The context is created only once the frontend has attached (the first
+ * frame), because machine init runs before the display is up.
+ *
+ * The texture and framebuffer are also the target the RSX draw path renders
+ * into; keeping the upload path here means the boot screen and guest frames
+ * go through the same object the FIFO will draw to.
+ */
+static void ps3_vga_gl_init(PS3VGAState *s)
+{
+    s->gl_checked = true;
+
+    if (!s->gl) {
+        return;
+    }
+
+#ifdef CONFIG_OPENGL
+    if (!qemu_console_has_gl(s->con)) {
+        if (s->gl_required) {
+            error_report("ps3-vga: -vga rsx,gl=on needs a GL display backend "
+                         "(run with -display sdl,gl=on)");
+            exit(1);
+        }
+        warn_report("ps3-vga: no GL display backend, keeping the CPU scanout");
+        return;
+    }
+
+    {
+        QEMUGLParams params = { .major_ver = 3, .minor_ver = 2 };
+        GLuint tex = 0, fbo = 0;
+
+        s->gl_ctx = qemu_console_gl_ctx_create(s->con, &params);
+        if (!s->gl_ctx) {
+            if (s->gl_required) {
+                error_report("ps3-vga: the display could not create a GL "
+                             "context");
+                exit(1);
+            }
+            warn_report("ps3-vga: no GL context, keeping the CPU scanout");
+            return;
+        }
+
+        qemu_console_gl_ctx_make_current(s->con, s->gl_ctx);
+
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, PS3_VGA_BOOT_W,
+                     PS3_VGA_BOOT_H, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tex, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE) {
+            warn_report("ps3-vga: GL framebuffer is incomplete; the scanout "
+                        "still uses the texture upload");
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        s->gl_tex = tex;
+        s->gl_fbo = fbo;
+        s->gl_active = true;
+    }
+
+    info_report("ps3-vga: OpenGL scanout active (%ux%u texture, %s)",
+                PS3_VGA_BOOT_W, PS3_VGA_BOOT_H,
+                ps3_vga_accel() ? "hardware accel" : "TCG");
+#else
+    if (s->gl_required) {
+        error_report("ps3-vga: -vga rsx,gl=on needs OpenGL support, which "
+                     "this build does not have");
+        exit(1);
+    }
+    warn_report("ps3-vga: OpenGL support is not built in, keeping the CPU "
+                "scanout");
+#endif
+}
+
+static void ps3_vga_gl_upload(PS3VGAState *s)
+{
+#ifdef CONFIG_OPENGL
+    if (!s->gl_active || !qemu_console_has_gl(s->con)) {
+        return;
+    }
+    if (qemu_console_gl_ctx_make_current(s->con, s->gl_ctx) != 0) {
+        return;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, s->gl_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, PS3_VGA_BOOT_W,
+                    PS3_VGA_BOOT_H, GL_BGRA, GL_UNSIGNED_BYTE, s->boot_fb);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (!s->gl_presented) {
+        qemu_console_gl_scanout_texture(s->con, s->gl_tex, false,
+                                        PS3_VGA_BOOT_W, PS3_VGA_BOOT_H,
+                                        0, 0, PS3_VGA_BOOT_W,
+                                        PS3_VGA_BOOT_H, NULL);
+        s->gl_presented = true;
+    }
+
+    qemu_console_gl_update(s->con, 0, 0, PS3_VGA_BOOT_W, PS3_VGA_BOOT_H);
+#endif
+}
+
+static void ps3_vga_present(PS3VGAState *s)
+{
+    if (!s->gl_checked && s->gl_attempt) {
+        ps3_vga_gl_init(s);
+    }
+
+    if (s->gl_active && qemu_console_has_gl(s->con)) {
+        ps3_vga_gl_upload(s);
+        return;
+    }
+
+    qemu_console_update_full(s->con);
+}
 
 static uint64_t ps3_vga_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -785,7 +945,7 @@ static void ps3_vga_write(void *opaque, hwaddr offset, uint64_t value,
             }
         }
         ps3_vga_text_top(s);
-        qemu_console_update_full(s->con);
+        ps3_vga_present(s);
         return;
     }
 
@@ -798,7 +958,7 @@ static void ps3_vga_write(void *opaque, hwaddr offset, uint64_t value,
 
     ps3_vga_compose(s);
     ps3_vga_text_overlay(s);
-    qemu_console_update_full(s->con);
+    ps3_vga_present(s);
 }
 
 static const MemoryRegionOps ps3_vga_regs_ops = {
@@ -880,7 +1040,7 @@ static void ps3_vga_realize(DeviceState *dev, Error **errp)
         s->guest_mode = true;
         ps3_vga_compose(s);
         ps3_vga_text_overlay(s);
-        qemu_console_update_full(s->con);
+        ps3_vga_present(s);
         ps3_vga_dump_screen(s);
     }
 
@@ -959,7 +1119,7 @@ void ps3_vga_guest_scanout(uint32_t base, uint32_t w, uint32_t h,
 
     ps3_vga_compose(s);
     ps3_vga_text_overlay(s);
-    qemu_console_update_full(s->con);
+    ps3_vga_present(s);
 
     info_report("ps3-vga: guest owns the scanout: %ux%u from 0x%X", w, h,
                 base);
@@ -1002,6 +1162,8 @@ static const Property ps3_vga_properties[] = {
     DEFINE_PROP_BOOL("allow-highres", PS3VGAState, allow_highres, false),
     DEFINE_PROP_BOOL("av-test", PS3VGAState, av_test, false),
     DEFINE_PROP_BOOL("bench", PS3VGAState, bench, false),
+    DEFINE_PROP_BOOL("gl", PS3VGAState, gl, false),
+    DEFINE_PROP_BOOL("gl-required", PS3VGAState, gl_required, false),
 };
 
 static void ps3_vga_class_init(ObjectClass *klass, const void *data)

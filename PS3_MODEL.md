@@ -289,39 +289,107 @@ emer_init read a stale `0xFF`.
 `0x6003` and `0x6011` report firmware 3.01 in the `0xVVVRRRPP` form RPCS3 writes
 (`0x3001000000000000`), and `0x6007`/`0x6008` (flash initialized) succeed.
 
-### The RSX front end
+### sys_rsx and the RSX front end
 
 cellGcmSys.sprx is real code: it does not call a modelled `cellGcmInit`, it asks
-lv2 for the device through `sys_rsx` and writes methods into a FIFO in RSX local
-memory.  That front end now exists, with the semantics RPCS3's `sys_rsx`
-documents:
+lv2 for the device through `sys_rsx`, maps its command buffer through lv2, and
+pushes methods into that buffer.  The whole lv2 side is implemented, with
+RPCS3's `sys_rsx` as the reference:
 
 | Syscall | What it does here |
 | --- | --- |
-| `0x29A`/`0x29B` device open/close | succeed |
-| `0x29C` memory allocate | one 240 MiB region, handle 1, at local base `0x40000000` |
-| `0x29E` context allocate | context `0x55555555`, three 4 KiB areas from the lv2 heap (DMA control, driver info, reports) |
-| `0x2A0`/`0x2A1` iomap/iounmap | succeed; the local region is real RAM |
-| `0x2A2` context attribute | `0x001` FIFO get/put, `0x102` flip, `0x103` queued buffer, `0x104` display buffer; anything else is accepted |
-| `0x2A3` device map | writes the register window base `0x40000000` |
+| `0x29A`/`0x29B` device open/close | the one RSX is always present |
+| `0x29C` memory allocate | validates the size (1 MiB aligned, at most 256 MiB), hands out handle `0x5A5A5A5B` and local base `0x40000000` |
+| `0x29D` memory free | only with no context alive, as lv2 requires |
+| `0x29E` context allocate | context `0x55555555`; three areas one MiB apart from the lv2 heap: DMA control, driver info (`RsxDriverInfo`, version 2.11, GPU `0x5C`, memory size, 500/650 MHz, report offsets, system mode), reports (labels, notify and report tables initialized as RPCS3 does).  It also creates the context's event port and queue and puts the queue id in the driver info |
+| `0x29F` context free | destroys that port and queue and stops the display clock |
+| `0x2A0`/`0x2A1` iomap/iounmap | validates (1 MiB alignment, at most 512 MiB of io) and records io page to EA page in the context's map |
+| `0x2A2` context attribute | `0x001` FIFO doorbell, `0x100` mode, `0x101` vsync, `0x102` flip, `0x103` queue, `0x104` display buffer, `0x105`/`0x106`, `0x108` vblank frequency, `0x10A` flip status, `0x10B`-`0x10D` cursor, `0x300` tiles, `0x301` zcull, `0x302`, `0x600`-`0x603` frame buffer, `0xFEC` flip notification, `0xFED` vblank (display only, a PPU call is `EINVAL` as in RPCS3), `0xFEF` user command |
+| `0x2A3`/`0x2A4` device map/unmap | a 1 MiB register window from the lv2 heap, `dev_id` 8 only |
+| `0x2A5` attribute | accepted |
 
 Local memory is a real 256 MiB `MemoryRegion` at `0x40000000`, so the offsets
 `cellGcmSetDisplayBuffer` names are readable.  A flip (`0x102`) resolves the
-buffer id and hands `0x40000000 + offset` to `ps3_vga_guest_scanout()`, which is
-the same path the modelled `cellGcmSetFlip` used.  The FIFO front end at `0x001`
-decodes packets, logs the first 24 method ids under `ppu-trace` and advances
-get to put.
+buffer id from the head's queued id, or from the offset the library passed, and
+hands `0x40000000 + offset` to `ps3_vga_guest_scanout()`.
 
-The method handlers behind the FIFO — surfaces, clear, blit, draws, the shader
-pipeline and the DCP — are still missing, and no VSH run has reached `sys_rsx`
-at all: with every syscall in its bring-up answered, vsh.self now sits in a
-`sys_mutex_lock`/`sys_mutex_unlock` loop at `0x5390B8`/`0x52CA08`.  It is waiting
-for a worker thread, and the model's scheduler still does not run one, so the
-GPU work never starts.  That is the next wall, not the RSX syscalls.
+### The FIFO, and why it needs no tick
 
-A running window can be dumped from the monitor
-(`-monitor tcp:127.0.0.1:55555,server,nowait`, then `screendump file.ppm`),
-which is how the two screenshots in this section were taken.
+The FIFO is the RSX's only clock: the PPU writes packets into a ring, publishes
+`put` in the DMA control block, and calls attribute `0x001` with the io offsets
+of `get` and `put`.  That call is the doorbell.  `ps3_rsx_fifo()` then reads
+packets through the context's io map from `get` to `put` and writes the new
+`get` back into the DMA control block, so everything the RSX does happens on the
+guest's own call - no timer advances it.
+
+The packet decoder covers all four packet kinds: methods (with the count in
+bits 18..28, the non-increment flag, and zero-count NOPs), new- and old-style
+jumps, calls and returns.  A jump to `get` itself is the library's idle marker:
+consumption stops there until the next doorbell.  Methods whose result is
+visible on the display are executed: `SET_SURFACE_FORMAT` (log2 width/height and
+colour format), `SET_SURFACE_PITCH_A`, `SET_SURFACE_COLOR_AOFFSET`,
+`SET_SURFACE_COLOR_TARGET`, `SET_COLOR_CLEAR_VALUE`, `CLEAR_SURFACE` and
+`SET_BEGIN_END`.  The clear fills surface A with the clear colour for the 32-bit
+formats, in local memory when the offset names it and through the io map when
+it does not, always bounds-checked.  Every other method is counted, and the
+first 24 are named under `ppu-trace`.
+
+The display's own clock is separate from the FIFO: a 59.94 Hz timer raises the
+vblank event (`0xFED`'s job in RPCS3) and updates `lastVTime`, the second
+vblank time and `vBlankCount` in the head's driver-info entry.  Events are only
+queued for handlers the library enabled in `handlers` (`0x12C0`): vblank, flip
+notification, queue and user command.  Queue (`0x103`) and flip notification
+(`0xFEC`) are raised by the attribute call itself, so a thread waiting in
+`sys_event_queue_receive` wakes from that call, not from a scheduler tick.
+
+What the front end does not have is the rendering pipeline: no shader, no copy
+engine, no tiled surface decode.  A draw is counted (`rsx_draws`) but nothing is
+rasterized, and `0x600`-`0x603` are recorded rather than performed, exactly as
+RPCS3 leaves them.  Cursor packages are accepted so a library that sets a cursor
+runs; the hardware cursor is not drawn.
+
+No VSH run reaches `sys_rsx` yet: a console starts
+`/dev_flash/sys/internal/sys_init_osd.self` first, and that image's process
+imports are not linked by `ps3_lv2_link_process` (it finds no PRX stub entries),
+so it faults at `0x700` before its first syscall.  The syscall itself is
+exercised end to end by a guest test, `.tmp/sys_rsx_test.S`, built with the PPU
+toolchain and run through `vsh-run` as if it were the application:
+
+```sh
+bash /c/msys64/home/Thewoodsman/ps3shim/ppu-gcc -nostdlib \
+  -Wl,-Ttext=0x02000000 -Wl,-e,_start \
+  -o .tmp/sys_rsx_test.elf .tmp/sys_rsx_test.S
+./build-ps3/qemu-system-ppc64.exe -M rs6000-ps3 -display none \
+  -global ps3-boot-rom.vsh-self=.tmp/sys_rsx_test.elf \
+  -global ps3-boot-rom.vsh-run=on \
+  -global ps3-boot-rom.ppu-trace=on \
+  -icount shift=6,sleep=off
+```
+
+The program allocates local memory and a context, maps io `0x00100000` to EA
+`0x09000000`, writes a six-method FIFO into it that clears a 256x256 surface to
+magenta (`0x00FF00FF`), rings the doorbell, registers and queues display buffer
+0, calls
+`0x103` to raise the queue event and receives it, flips head 0, sends the flip
+notification, checks the clear wrote `0x00FF00FF` into local memory, and exits
+with a bit mask (0 when every check passed).  Expected log:
+
+```
+ps3-rsx: local memory 0xF900000 bytes at 0x40000000 (handle 0x5A5A5A5B)
+ps3-rsx: context 0x55555555: dma 0x1000000, driver info 0x1100000, reports 0x1200000; handler queue 0x1
+ps3-rsx: iomap ctx 0x55555555: io 0x100000 <- ea 0x9000000, 0x100000 bytes
+ps3-rsx: display buffer 0: 256x256, pitch 0x400, offset 0x200000
+ps3-rsx: clear 0x00FF00FF: 256x256 at 0x200000, pitch 0x400
+ps3-ppu: lv2: event_queue_receive 0x1: source 0x0, d1 0x0, d2 0x20, d3 0x0
+ps3-rsx: flip head 0 buffer 0x80000000 -> 0
+ps3-rsx: flip head 0 buffer 0: 0x200000, 256x256, pitch 0x400
+ps3-vga: guest owns the scanout: 256x256 from 0x40200000
+ps3-ppu: process exited with status 0
+```
+
+A GUI build's window can be captured with the monitor's `screendump`
+(`-monitor tcp:127.0.0.1:55555,server,nowait`, then `screendump file.ppm`);
+the headless build here has no display, so it has no `screendump` either.
 
 ## Run
 

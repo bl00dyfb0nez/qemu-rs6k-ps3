@@ -870,7 +870,7 @@ struct PS3BootROMState {
     uint32_t rsx_mem_handle;
     bool rsx_mem_allocated;
     uint32_t rsx_local_size;
-    uint32_t rsx_dma, rsx_driver, rsx_reports;
+    uint32_t rsx_dma, rsx_driver, rsx_reports, rsx_device;
     uint32_t rsx_event_port, rsx_event_queue;
     uint32_t rsx_get, rsx_put;      /* io offsets from the last doorbell */
     uint32_t rsx_iomap_ea[PS3_RSX_IO_PAGES];
@@ -7987,78 +7987,387 @@ static void ps3_syscon_write(PS3BootROMState *s, uint32_t off, uint8_t val)
 /*
  * The RSX front end.
  *
- * The console's graphics library (cellGcmSys.sprx) is real code: it does not
- * call a modelled cellGcmInit, it asks lv2 for the device through sys_rsx and
- * then writes methods into a FIFO in RSX local memory.  So the lv2 side is
- * where the RSX has to exist.  The syscall semantics and the display-buffer
- * attribute numbers here follow RPCS3's sys_rsx, which is the only public
- * description of them:
+ * This is lv2's sys_rsx, not a modelled graphics library: cellGcmSys.sprx is
+ * real guest code and reaches the GPU through these calls alone.  Their
+ * semantics follow RPCS3's sys_rsx, which is the only public description of
+ * them, so a library that works there sees the same answers here:
  *
- *   0x001 FIFO get/put      0x102 flip        0x103 queued buffer id
- *   0x104 display buffer    0x600 fb setup    0x601 fb blit
+ *   device open/close      0x29A 0x29B   the device is always present
+ *   memory allocate/free   0x29C 0x29D   local memory, handle 0x5A5A5A5B
+ *   context allocate/free  0x29E 0x29F   DMA, driver info and report areas
+ *   iomap/iounmap          0x2A0 0x2A1   the io window the FIFO lives in
+ *   context attribute      0x2A2         FIFO, display, tiles, zcull, events
+ *   device map/unmap       0x2A3 0x2A4   the register window
+ *   attribute              0x2A5         accepted
+ *
+ * The FIFO is a packet ring in main memory.  The graphics library writes
+ * packets, publishes put in the DMA control block and calls attribute 0x001:
+ * that call is the doorbell.  This handler then consumes packets from get to
+ * put - following jump, call and return packets - dispatching each method to
+ * the display-side handler and writing get back, so the RSX runs entirely off
+ * the guest's own calls.  Nothing here needs a tick.
  *
  * Local memory is a real 256 MiB RAM region at PS3_RSX_LOCAL_BASE, so the
  * display buffers cellGcmSetDisplayBuffer names are readable by the scanout.
- * The FIFO path decodes packets and advances get; the method handlers behind
- * it (surfaces, clear, blit, draws) are the part of RPCS3's RSX that is still
- * missing - there is no shader pipeline or DCP here.
+ * The method handler executes the surface, clear and synchronisation methods
+ * that decide what a flip shows; the shader pipeline and the copy engine are
+ * what this front end still does not have.
  */
-#define PS3_RSX_LOCAL_BASE  0x40000000u
-#define PS3_RSX_LOCAL_SIZE  0x10000000u
-#define PS3_RSX_CONTEXT_ID  0x55555555u
+#define PS3_RSX_LV1_ILLEGAL_PARAM (-17)
 
-static void ps3_rsx_fifo(PS3BootROMState *s)
+static uint64_t ps3_rsx_timebase(void)
 {
-    uint8_t *local;
-    uint32_t get = s->rsx_get;
-    unsigned steps = 0;
-
-    if (!s->rsx_ready || s->rsx_put == get) {
-        return;
-    }
-    local = memory_region_get_ram_ptr(&s->rsx_local);
-
-    while (get != s->rsx_put && steps++ < 8192) {
-        uint32_t w = ps3_be32(local + (get & (PS3_RSX_LOCAL_SIZE - 1)));
-        unsigned count, method;
-
-        if ((w & 3) == 1) {                 /* jump packet */
-            get = w & ~3u;
-            continue;
-        }
-        count = (w >> 18) & 0x7FF;
-        method = (w >> 2) & 0x1FFF;
-        if (s->ppu_trace && s->rsx_methods_logged < 24) {
-            info_report("ps3-rsx: method 0x%X x%u at 0x%X", method, count,
-                        get);
-            s->rsx_methods_logged++;
-        }
-        get += 4 + count * 4;
-    }
-
-    /* The consumer runs behind the producer; a stalled FIFO would wedge GCM. */
-    s->rsx_get = s->rsx_put;
+    /* The console's timebase runs at 79.8 MHz, as the CPU's does. */
+    return (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) * 798ull) / 10000ull;
 }
 
-static void ps3_rsx_flip(PS3BootROMState *s, unsigned id)
+/* An io offset through the context's map; 0xFFFFFFFF when it is not mapped. */
+static uint32_t ps3_rsx_io_ea(PS3BootROMState *s, uint32_t io)
 {
-    if (id >= ARRAY_SIZE(s->rsx_db_w) || !s->rsx_db_w[id]) {
+    uint32_t page = io >> 20;
+
+    if (page >= PS3_RSX_IO_PAGES || !s->rsx_iomap_used[page]) {
+        return 0xFFFFFFFFu;
+    }
+    return s->rsx_iomap_ea[page] | (io & 0xFFFFFu);
+}
+
+/*
+ * Colour target clear.
+ *
+ * NV4097_SET_SURFACE_FORMAT packs the render target's log2 width and height
+ * (bits 16..23 and 24..31) with its colour format; the clear walks the pixels
+ * the surface describes.  Only surface A is filled: it is the target a single
+ * render target uses, and every other target is reported rather than guessed
+ * at.  A surface offset below the local memory size names local memory; any
+ * other is an io offset and is resolved through the context map.  Both paths
+ * are bounds checked before a single word is written.
+ */
+static void ps3_rsx_clear(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
+                          uint32_t target, uint32_t color)
+{
+    uint32_t fmt = s->rsx_surface_format;
+    unsigned lw = (fmt >> 16) & 0xFF, lh = (fmt >> 24) & 0xFF;
+    unsigned width, height, pitch, off, y;
+    uint8_t *base;
+    uint64_t limit;
+
+    if (!(target & 1) || !fmt) {
         return;
     }
 
-    info_report("ps3-rsx: flip buffer %u: 0x%X, %ux%u, pitch 0x%X", id,
-                s->rsx_db_offset[id], s->rsx_db_w[id], s->rsx_db_h[id],
-                s->rsx_db_pitch[id]);
+    switch (fmt & 0x1F) {
+    case 4:                     /* X8R8G8B8_Z8R8G8B8 */
+    case 5:                     /* X8R8G8B8_O8R8G8B8 */
+    case 8:                     /* A8R8G8B8 */
+    case 12:                    /* F_W32Z32Y32X32 */
+    case 13:                    /* F_X32 */
+    case 14:                    /* X8B8G8R8_Z8B8G8R8 */
+    case 15:                    /* X8B8G8R8_O8B8G8R8 */
+    case 16:                    /* A8B8G8R8 */
+        break;
+    default:
+        if (s->ppu_trace) {
+            info_report("ps3-rsx: clear: colour format 0x%X is not a 32-bit "
+                        "target, left as is", fmt & 0x1F);
+        }
+        return;
+    }
+
+    if (lw > 12 || lh > 12) {
+        if (s->ppu_trace) {
+            info_report("ps3-rsx: clear: implausible surface %ux%u",
+                        1u << lw, 1u << lh);
+        }
+        return;
+    }
+
+    width = 1u << lw;
+    height = 1u << lh;
+    pitch = s->rsx_surface_pitch ? s->rsx_surface_pitch : width * 4;
+    off = s->rsx_surface_offset & ~3u;
+
+    if (pitch < width * 4) {
+        return;
+    }
+
+    if (off < s->rsx_local_size) {
+        base = memory_region_get_ram_ptr(&s->rsx_local) + off;
+        limit = s->rsx_local_size - off;
+    } else {
+        uint32_t ea = ps3_rsx_io_ea(s, off);
+
+        if (ea == 0xFFFFFFFFu || (uint64_t)ea + 4 > ram_size) {
+            return;
+        }
+        base = ram + ea;
+        limit = ram_size - ea;
+    }
+
+    if ((uint64_t)pitch * height > limit) {
+        return;
+    }
+
+    for (y = 0; y < height; y++) {
+        uint32_t x;
+        uint8_t *row = base + (uint64_t)y * pitch;
+
+        for (x = 0; x < width; x++) {
+            ps3_put_be32(row + 4 * x, color);
+        }
+    }
+
+    s->rsx_draws++;
+    if (s->ppu_trace) {
+        info_report("ps3-rsx: clear 0x%08X: %ux%u at 0x%X, pitch 0x%X",
+                    color, width, height, off, pitch);
+    }
+}
+
+/*
+ * One graphics method.
+ *
+ * The register number is the FIFO's method field shifted down; the arguments
+ * arrive in order.  Methods that change what a flip shows are executed, the
+ * rest are counted (and logged under ppu-trace), which is the boundary of the
+ * front end: there is no shader or copy engine behind it.
+ */
+static void ps3_rsx_method(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
+                           uint32_t reg, uint32_t value)
+{
+    uint32_t method = reg >> 2;
+
+    s->rsx_methods++;
+
+    switch (method) {
+    case PS3_RSX_SET_FORMAT:            /* NV4097_SET_SURFACE_FORMAT */
+        s->rsx_surface_format = value;
+        return;
+    case PS3_RSX_SET_PITCH_A:           /* NV4097_SET_SURFACE_PITCH_A */
+        s->rsx_surface_pitch = value;
+        return;
+    case PS3_RSX_SET_OFFSET_A:          /* NV4097_SET_SURFACE_COLOR_AOFFSET */
+        s->rsx_surface_offset = value;
+        return;
+    case PS3_RSX_SET_TARGET:            /* NV4097_SET_SURFACE_COLOR_TARGET */
+        s->rsx_surface_target = value;
+        return;
+    case PS3_RSX_SET_CLEAR:             /* NV4097_SET_COLOR_CLEAR_VALUE */
+        s->rsx_clear_color = value;
+        return;
+    case PS3_RSX_SET_BEGIN_END:         /* NV4097_SET_BEGIN_END */
+        if (value) {
+            s->rsx_begin_end = value;
+        } else {
+            s->rsx_draws++;
+        }
+        return;
+    case PS3_RSX_CLEAR_SURFACE:         /* NV4097_CLEAR_SURFACE */
+        if (value & 0xF0) {
+            ps3_rsx_clear(s, ram, ram_size, s->rsx_surface_target & 0xF,
+                          s->rsx_clear_color);
+        }
+        return;
+    default:
+        break;
+    }
+
+    if (s->ppu_trace && s->rsx_methods_logged < 24) {
+        info_report("ps3-rsx: method 0x%X <- 0x%X", method, value);
+        s->rsx_methods_logged++;
+    }
+}
+
+/*
+ * The FIFO consumer.
+ *
+ * get and put are io offsets, as the graphics library writes them into the
+ * DMA control block.  Each word is translated through the context map before
+ * it is read.  A method packet carries a count of arguments (a count of zero
+ * is a NOP); jump, call and return packets move get without consuming
+ * arguments.  A jump to get itself is the library's idle marker: the ring is
+ * empty, so the consumer stops there until the next doorbell.
+ */
+static void ps3_rsx_fifo(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size)
+{
+    uint32_t get, put, ret = PS3_RSX_CALL_EMPTY;
+    unsigned steps = 0;
+
+    if (!s->rsx_context) {
+        return;
+    }
+
+    get = s->rsx_get;
+    put = s->rsx_put;
+
+    while (get != put && steps++ < 65536) {
+        uint32_t ea = ps3_rsx_io_ea(s, get);
+        uint32_t w;
+
+        if (ea == 0xFFFFFFFFu || (uint64_t)ea + 4 > ram_size) {
+            break;
+        }
+        w = ps3_be32(ram + ea);
+
+        if ((w & 0xE0030003u) == 0) {                   /* method packet */
+            unsigned count = (w >> 18) & 0x7FF;
+            uint32_t method = w & 0xFFFCu;
+            unsigned inc = (w & 0x40000000u) ? 0 : 4;
+            unsigned i;
+
+            if (!count) {                               /* NOP */
+                get += 4;
+                continue;
+            }
+            for (i = 0; i < count; i++) {
+                uint32_t aea = ps3_rsx_io_ea(s, get + 4 + 4 * i);
+
+                if (aea == 0xFFFFFFFFu || (uint64_t)aea + 4 > ram_size) {
+                    break;
+                }
+                ps3_rsx_method(s, ram, ram_size, method + i * inc,
+                               ps3_be32(ram + aea));
+            }
+            get += 4 + count * 4;
+            continue;
+        }
+
+        if ((w & 0xE0000003u) == 0x00000001u) {         /* new-style jump */
+            uint32_t to = w & 0xFFFFFFFCu;
+
+            if (to == get) {
+                break;
+            }
+            get = to;
+            continue;
+        }
+
+        if ((w & 0xE0000003u) == 0x20000000u) {         /* old-style jump */
+            get = w & 0x1FFFFFFCu;
+            continue;
+        }
+
+        if ((w & 3u) == 2u) {                           /* call */
+            ret = get + 4;
+            get = w & 0x1FFFFFFCu;
+            continue;
+        }
+
+        if ((w & 0xFFFF0003u) == 0x00020000u) {         /* return */
+            if (ret == PS3_RSX_CALL_EMPTY) {
+                break;
+            }
+            get = ret;
+            ret = PS3_RSX_CALL_EMPTY;
+            continue;
+        }
+
+        break;                                          /* malformed packet */
+    }
+
+    s->rsx_get = get;
+    if (s->rsx_dma) {
+        ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_GET, get);
+    }
+}
+
+/*
+ * One handler event.
+ *
+ * The driver info page carries the mask of handlers the library installed and
+ * the id of the queue that owns them, so an event is only queued for a
+ * handler that asked for it, exactly as RPCS3's send_event filters it.
+ */
+static void ps3_rsx_event(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
+                          uint64_t data1, uint64_t flags, uint64_t data3)
+{
+    uint32_t drv = s->rsx_driver;
+    PS3Event ev;
+    int q;
+
+    if (!s->rsx_context || !drv || (uint64_t)drv + PS3_RSX_DI_SIZE > ram_size) {
+        return;
+    }
+
+    flags &= ps3_be32(ram + drv + PS3_RSX_DI_HANDLERS) | (0xFFFFFFFFull << 32);
+    if (!flags) {
+        return;
+    }
+
+    q = ps3_eq_index(s, ps3_be32(ram + drv + PS3_RSX_DI_QUEUE));
+    if (q < 0) {
+        return;
+    }
+
+    ev.source = 0;
+    ev.data1 = data1;
+    ev.data2 = flags;
+    ev.data3 = data3;
+    ps3_eq_push(&s->eq[q], &ev);
+    ps3_eq_wake(s, ram, ram_size, q);
+}
+
+/* The display circuit's vblank for one head. */
+static void ps3_rsx_vblank(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
+                           unsigned head)
+{
+    uint32_t h = s->rsx_driver + PS3_RSX_DI_HEAD +
+                 head * PS3_RSX_DI_HEAD_STRIDE;
+    uint64_t tb = ps3_rsx_timebase();
+    uint64_t flags = PS3_RSX_EVENT_VBLANK;
+
+    ps3_put_be32(ram + h + PS3_RSX_HEAD_VTLOW, (uint32_t)tb);
+    ps3_put_be32(ram + h + PS3_RSX_HEAD_VTHIGH, (uint32_t)(tb >> 32));
+    ps3_put_be64(ram + h + PS3_RSX_HEAD_SECONDT,
+                 ps3_be64(ram + h + PS3_RSX_HEAD_SECONDT) + 1);
+    ps3_put_be64(ram + h + PS3_RSX_HEAD_VCOUNT,
+                 ps3_be64(ram + h + PS3_RSX_HEAD_VCOUNT) + 1);
+
+    if (s->rsx_second_vhandler) {
+        flags |= PS3_RSX_EVENT_SECOND_BASE << head;
+    }
+
+    s->rsx_vblanks++;
+    ps3_rsx_event(s, ram, ram_size, 0, flags, 0);
+}
+
+/*
+ * The display's own clock: 59.94 Hz of virtual time, which is what carries
+ * vblank to a guest waiting on the RSX queue.  It is display timing, not a
+ * scheduler tick; the FIFO and the flips are driven by the guest's doorbell.
+ */
+static void ps3_rsx_vblank_tick(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+    uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+    uint64_t ram_size = memory_region_size(s->ram);
+
+    if (!s->rsx_context) {
+        return;
+    }
+
+    ps3_rsx_vblank(s, ram, ram_size, 0);
+    ps3_rsx_vblank(s, ram, ram_size, 1);
+
+    timer_mod(s->rsx_vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PS3_RSX_VBLANK_NS);
+}
+
+static void ps3_rsx_flip(PS3BootROMState *s, unsigned head, unsigned id)
+{
+    if (head > 1 || id >= ARRAY_SIZE(s->rsx_db_w) || !s->rsx_db_w[id]) {
+        return;
+    }
+
+    s->rsx_flips++;
+    info_report("ps3-rsx: flip head %u buffer %u: 0x%X, %ux%u, pitch 0x%X",
+                head, id, s->rsx_db_offset[id], s->rsx_db_w[id],
+                s->rsx_db_h[id], s->rsx_db_pitch[id]);
     ps3_vga_guest_scanout(PS3_RSX_LOCAL_BASE + s->rsx_db_offset[id],
                           s->rsx_db_w[id], s->rsx_db_h[id],
                           s->rsx_db_pitch[id]);
 }
 
-/*
- * sys_rsx_context_attribute's package ids.  Anything not modelled is accepted
- * with success: the library treats a failure here as a broken RSX, not as an
- * optional feature.
- */
 /*
  * sys_storage, the way lv2 presents the drives to the application layer.
  *
@@ -8386,147 +8695,590 @@ static bool ps3_lv2_storage(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
     }
 }
 
+/*
+ * The three areas lv2 keeps for the context.  They come out of the same heap
+ * as everything else lv2 allocates, one MiB apart as RPCS3 lays them out, and
+ * their contents are what the library reads: the DMA control block, the
+ * driver info page and the report table.
+ */
+static void ps3_rsx_init_driver(PS3BootROMState *s, uint8_t *ram,
+                                uint32_t system_mode)
+{
+    uint32_t d = s->rsx_driver, r = s->rsx_reports, i;
+
+    memset(ram + d, 0, PS3_RSX_DI_SIZE);
+    ps3_put_be32(ram + d + PS3_RSX_DI_VERSION, 0x211);      /* driver 2.11 */
+    ps3_put_be32(ram + d + PS3_RSX_DI_GPU, 0x5C);           /* RSX 0x5C */
+    ps3_put_be32(ram + d + PS3_RSX_DI_MEM_SIZE, s->rsx_local_size);
+    ps3_put_be32(ram + d + PS3_RSX_DI_CHANNEL, 1);
+    ps3_put_be32(ram + d + PS3_RSX_DI_NVCORE, 500000000);
+    ps3_put_be32(ram + d + PS3_RSX_DI_MEMFREQ, 650000000);
+    ps3_put_be32(ram + d + PS3_RSX_DI_NOTIFY, PS3_RSX_NOTIFY_OFF);
+    ps3_put_be32(ram + d + PS3_RSX_DI_REPORTS, 0);
+    ps3_put_be32(ram + d + PS3_RSX_DI_REPTABLE, PS3_RSX_REPORT_OFF);
+    ps3_put_be32(ram + d + PS3_RSX_DI_SYSMODE, system_mode);
+
+    memset(ram + r, 0, PS3_RSX_REPORTS_SIZE);
+    for (i = 0; i < 64; i++) {
+        ps3_put_be64(ram + r + PS3_RSX_NOTIFY_OFF + 16 * i, ~0ull);
+    }
+    for (i = 0; i < 1024; i += 4) {
+        ps3_put_be32(ram + r + 4 * (i + 0), 0x1337C0D3u);
+        ps3_put_be32(ram + r + 4 * (i + 1), 0x1337BABEu);
+        ps3_put_be32(ram + r + 4 * (i + 2), 0x1337BEEFu);
+        ps3_put_be32(ram + r + 4 * (i + 3), 0x1337F001u);
+    }
+    for (i = 0; i < 2048; i++) {
+        uint32_t p = r + PS3_RSX_REPORT_OFF + 16 * i;
+
+        ps3_put_be64(ram + p, ~0ull);           /* timestamp */
+        ps3_put_be32(ram + p + 8, 0);           /* value */
+        ps3_put_be32(ram + p + 12, 0xFFFFFFFFu); /* pad */
+    }
+
+    ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_PUT, 0);
+    ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_GET, 0);
+    ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_REF, 0);
+}
+
 static bool ps3_lv2_rsx(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
-                        uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
-                        uint32_t a3, uint32_t a4, uint32_t a5, int32_t *ret)
+                        uint32_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+                        uint64_t a3, uint64_t a4, uint64_t a5, int32_t *ret)
 {
     switch (nr) {
     case 0x29A:                 /* sys_rsx_device_open */
     case 0x29B:                 /* sys_rsx_device_close */
-    case 0x29D:                 /* sys_rsx_memory_free(handle) */
-    case 0x29F:                 /* sys_rsx_context_free(context) */
-    case 0x2A1:                 /* sys_rsx_context_iounmap(...) */
-    case 0x2A4:                 /* sys_rsx_device_unmap(dev) */
-    case 0x2A5:                 /* sys_rsx_attribute(...) */
+        /* There is one RSX and it is always there. */
         *ret = 0;
         return true;
-    case 0x29C: {               /* memory_allocate(handle*, addr*, size, ..) */
-        if ((uint64_t)a0 + 4 > ram_size || (uint64_t)a1 + 4 > ram_size) {
-            *ret = PS3_LV2_EFAULT;
-            return true;
-        }
-        /* One region, the whole 256 MiB of local memory, at the console's
-         * local base.  cellGcmInit's io address is handed out by the library
-         * from this. */
-        ps3_put_be32(ram + a0, 1);              /* mem handle */
-        ps3_put_be32(ram + a1, PS3_RSX_LOCAL_BASE);
-        info_report("ps3-rsx: local memory 0x%X bytes at 0x%X (handle 1)",
-                    0x0F000000, PS3_RSX_LOCAL_BASE);
-        *ret = 0;
-        return true;
-    }
-    case 0x29E: {               /* context_allocate(ctx*, dma*, drv*,
-                                 * reports*, mem_handle, system_mode) */
-        uint32_t base;
 
-        if ((uint64_t)a0 + 4 > ram_size || (uint64_t)a1 + 4 > ram_size ||
-            (uint64_t)a2 + 4 > ram_size || (uint64_t)a3 + 4 > ram_size) {
+    case 0x29C: {               /* sys_rsx_memory_allocate(handle*, addr*,
+                                 * size, flags, a5, a6, a7) */
+        uint64_t size = a2;
+
+        if ((uint64_t)a0 + 4 > ram_size || (uint64_t)a1 + 8 > ram_size) {
             *ret = PS3_LV2_EFAULT;
             return true;
         }
-        /*
-         * lv2 hands the library three areas it keeps for the lifetime of the
-         * context: the DMA control block, the driver info (put/get live here)
-         * and the report area.  They come out of the same heap as everything
-         * else lv2 allocates, 4 KiB apart, rather than being fixed addresses
-         * the guest might already be using.
-         */
-        base = (s->lv2_heap + 0xFFFu) & ~0xFFFu;
-        if ((uint64_t)base + 0x4000 > ram_size) {
+        if (!size || (size & 0xFFFFF) || size > PS3_RSX_LOCAL_SIZE) {
+            *ret = PS3_RSX_LV1_ILLEGAL_PARAM;
+            return true;
+        }
+        if (s->rsx_mem_allocated || s->rsx_context) {
             *ret = PS3_LV2_ENOMEM;
             return true;
         }
-        s->lv2_heap = base + 0x3000;
-        ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
-        ps3_put_be32(ram + a0, PS3_RSX_CONTEXT_ID);
-        s->rsx_context = PS3_RSX_CONTEXT_ID;
-        ps3_put_be32(ram + a1, base);
-        ps3_put_be32(ram + a2, base + 0x1000);
-        ps3_put_be32(ram + a3, base + 0x2000);
-        info_report("ps3-rsx: context 0x%X: dma 0x%X, driver info 0x%X, "
-                    "reports 0x%X", PS3_RSX_CONTEXT_ID, base, base + 0x1000,
-                    base + 0x2000);
+
+        s->rsx_mem_allocated = true;
+        s->rsx_mem_handle = PS3_RSX_MEM_HANDLE;
+        s->rsx_local_size = (uint32_t)size;
+        ps3_put_be32(ram + a0, PS3_RSX_MEM_HANDLE);
+        ps3_put_be64(ram + a1, PS3_RSX_LOCAL_BASE);
+        info_report("ps3-rsx: local memory 0x%X bytes at 0x%X (handle 0x%X)",
+                    (uint32_t)size, PS3_RSX_LOCAL_BASE, PS3_RSX_MEM_HANDLE);
         *ret = 0;
         return true;
     }
-    case 0x2A0:                 /* context_iomap(ctx, io, ea, size, flags) */
-        info_report("ps3-rsx: iomap ctx 0x%X: io 0x%X <- ea 0x%X, 0x%X bytes",
-                    a0, a1, a2, a3);
+
+    case 0x29D:                 /* sys_rsx_memory_free(handle) */
+        if (!s->rsx_mem_allocated || a0 != s->rsx_mem_handle ||
+            s->rsx_context) {
+            *ret = PS3_LV2_ENOMEM;
+            return true;
+        }
+        s->rsx_mem_allocated = false;
+        s->rsx_local_size = 0;
         *ret = 0;
         return true;
-    case 0x2A2: {               /* context_attribute(ctx, package, a3..a6) */
-        if (a0 != PS3_RSX_CONTEXT_ID) {
+
+    case 0x29E: {               /* context_allocate(ctx*, dma*, driver*,
+                                 * reports*, mem_ctx, system_mode) */
+        uint32_t base, d, i;
+        int qi = -1, pi = -1;
+
+        if ((uint64_t)a0 + 4 > ram_size || (uint64_t)a1 + 8 > ram_size ||
+            (uint64_t)a2 + 8 > ram_size || (uint64_t)a3 + 8 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        if (!s->rsx_mem_allocated || a4 != PS3_RSX_MEM_HANDLE ||
+            s->rsx_context) {
             *ret = PS3_LV2_EINVAL;
             return true;
         }
+        for (i = 0; i < PS3_EQ_MAX; i++) {
+            if (!s->eq[i].used) {
+                qi = i;
+                break;
+            }
+        }
+        for (i = 0; i < PS3_EP_MAX; i++) {
+            if (!s->ep[i].used) {
+                pi = i;
+                break;
+            }
+        }
+        if (qi < 0 || pi < 0) {
+            *ret = PS3_LV2_EAGAIN;
+            return true;
+        }
+
+        base = (s->lv2_heap + 0xFFFFF) & ~0xFFFFFu;
+        if ((uint64_t)base + 0x300000 > ram_size) {
+            *ret = PS3_LV2_ENOMEM;
+            return true;
+        }
+        s->lv2_heap = base + 0x300000;
+        ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
+
+        s->rsx_dma = base;
+        s->rsx_driver = base + 0x100000;
+        s->rsx_reports = base + 0x200000;
+        d = s->rsx_driver;
+
+        /* The context's handler queue, which the library receives from. */
+        memset(&s->eq[qi], 0, sizeof(s->eq[qi]));
+        s->eq[qi].used = true;
+        s->eq[qi].id = ++s->lv2_next_id;
+        s->eq[qi].size = 0x20;
+        memset(&s->ep[pi], 0, sizeof(s->ep[pi]));
+        s->ep[pi].used = true;
+        s->ep[pi].id = ++s->lv2_next_id;
+        s->ep[pi].type = 1;             /* SYS_EVENT_PORT_LOCAL */
+        s->ep[pi].eq = qi;
+        s->rsx_event_port = s->ep[pi].id;
+        s->rsx_event_queue = s->eq[qi].id;
+
+        ps3_rsx_init_driver(s, ram, (uint32_t)a5);
+        ps3_put_be32(ram + d + PS3_RSX_DI_QUEUE, s->rsx_event_queue);
+
+        s->rsx_context = PS3_RSX_CONTEXT_ID;
+        s->rsx_get = 0;
+        s->rsx_put = 0;
+        ps3_put_be32(ram + a0, PS3_RSX_CONTEXT_ID);
+        ps3_put_be64(ram + a1, s->rsx_dma);
+        ps3_put_be64(ram + a2, s->rsx_driver);
+        ps3_put_be64(ram + a3, s->rsx_reports);
+
+        if (!s->rsx_vblank_timer) {
+            s->rsx_vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                               ps3_rsx_vblank_tick, s);
+        }
+        timer_mod(s->rsx_vblank_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PS3_RSX_VBLANK_NS);
+
+        info_report("ps3-rsx: context 0x%X: dma 0x%X, driver info 0x%X, "
+                    "reports 0x%X; handler queue 0x%X",
+                    PS3_RSX_CONTEXT_ID, s->rsx_dma, s->rsx_driver,
+                    s->rsx_reports, s->rsx_event_queue);
+        *ret = 0;
+        return true;
+    }
+
+    case 0x29F: {               /* sys_rsx_context_free(context) */
+        int qi, pi;
+
+        if (a0 != PS3_RSX_CONTEXT_ID || !s->rsx_context) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+
+        qi = ps3_eq_index(s, s->rsx_event_queue);
+        pi = ps3_ep_index(s, s->rsx_event_port);
+        if (qi >= 0) {
+            memset(&s->eq[qi], 0, sizeof(s->eq[qi]));
+        }
+        if (pi >= 0) {
+            memset(&s->ep[pi], 0, sizeof(s->ep[pi]));
+        }
+
+        if (s->rsx_vblank_timer) {
+            timer_del(s->rsx_vblank_timer);
+        }
+        s->rsx_context = 0;
+        s->rsx_event_port = 0;
+        s->rsx_event_queue = 0;
+        s->rsx_dma = 0;
+        s->rsx_driver = 0;
+        s->rsx_reports = 0;
+        s->rsx_head_queued[0] = s->rsx_head_queued[1] = 0;
+        s->rsx_head_flags[0] = s->rsx_head_flags[1] = 0;
+        *ret = 0;
+        return true;
+    }
+
+    case 0x2A0: {               /* context_iomap(ctx, io, ea, size, flags) */
+        uint64_t io = a1, ea = a2, size = a3;
+        uint32_t page, first;
+
+        if (!size || (io & 0xFFFFF) || (size & 0xFFFFF) || (ea & 0xFFFFF) ||
+            size > 0x20000000 || size > ~io || size > ~ea) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+        if (a0 != PS3_RSX_CONTEXT_ID || PS3_RSX_MAIN_SIZE < io + size ||
+            ea + size > ram_size) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+
+        first = io >> 20;
+        for (page = 0; page < (size >> 20); page++) {
+            s->rsx_iomap_ea[first + page] = (uint32_t)(ea + ((uint64_t)page << 20));
+            s->rsx_iomap_used[first + page] = 1;
+        }
+        if (s->ppu_trace) {
+            info_report("ps3-rsx: iomap ctx 0x%X: io 0x%" PRIX64
+                        " <- ea 0x%" PRIX64 ", 0x%" PRIX64 " bytes",
+                        (uint32_t)a0, io, ea, size);
+        }
+        *ret = 0;
+        return true;
+    }
+
+    case 0x2A1: {               /* context_iounmap(ctx, io, size) */
+        uint64_t io = a1, size = a2;
+        uint32_t page, first;
+
+        if (!size || (io & 0xFFFFF) || (size & 0xFFFFF) ||
+            size > 0x20000000 || size > ~io) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+        if (a0 != PS3_RSX_CONTEXT_ID || PS3_RSX_MAIN_SIZE < io + size) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+
+        first = io >> 20;
+        for (page = 0; page < (size >> 20); page++) {
+            s->rsx_iomap_used[first + page] = 0;
+            s->rsx_iomap_ea[first + page] = 0;
+        }
+        *ret = 0;
+        return true;
+    }
+
+    case 0x2A2: {               /* context_attribute(ctx, package, a3..a6) */
+        uint32_t drv, h;
+
+        if (a0 != PS3_RSX_CONTEXT_ID || !s->rsx_context) {
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+        drv = s->rsx_driver;
+
         switch (a1) {
-        case 0x001:             /* FIFO: get, put */
+        case 0x001:             /* FIFO get/put: the doorbell */
             s->rsx_get = a2;
             s->rsx_put = a3;
-            ps3_rsx_fifo(s);
+            ps3_rsx_fifo(s, ram, ram_size);
             break;
-        case 0x102: {           /* flip: head, buffer */
+
+        case 0x100:             /* display mode set */
+            break;
+
+        case 0x101:             /* display sync: 2 is vsync, 1 is hsync */
+            s->rsx_vsync = (a3 == 2);
+            break;
+
+        case 0x102: {           /* display flip: head, buffer */
+            uint32_t head = a2;
             unsigned id;
 
+            if (head > 1) {
+                *ret = PS3_LV2_EINVAL;
+                return true;
+            }
             if (a3 & 0x80000000u) {
-                id = a3 & 0xFu;
-                if (id > 7) {
-                    id = s->rsx_db_last_queued;
+                unsigned idx = a3 & 0xFu;
+
+                id = idx > 7 ? s->rsx_head_queued[head] : idx;
+                if (!(s->rsx_head_flags[head] & (1u << id)) ||
+                    !(s->rsx_head_flags[head] & 0x40000000u)) {
+                    info_report("ps3-rsx: flip of buffer %u, which was not "
+                                "queued", id);
                 }
             } else {
                 unsigned i;
 
-                id = s->rsx_db_last_queued;
-                for (i = 0; i < ARRAY_SIZE(s->rsx_db_offset); i++) {
+                id = s->rsx_head_queued[head];
+                for (i = 0; i < s->rsx_db_count; i++) {
                     if (s->rsx_db_offset[i] == a3) {
                         id = i;
+                        break;
                     }
+                }
+                if (i == s->rsx_db_count) {
+                    info_report("ps3-rsx: flip: no display buffer at 0x%X, "
+                                "flipping %u", (uint32_t)a3, id);
                 }
             }
             if (s->ppu_trace) {
                 info_report("ps3-rsx: flip head %u buffer 0x%X -> %u",
-                            a2, a3, id);
+                            head, (uint32_t)a3, id);
             }
-            ps3_rsx_flip(s, id);
+            ps3_rsx_flip(s, head, id);
             break;
         }
-        case 0x103:             /* display queue */
-            s->rsx_db_last_queued = a3;
+
+        case 0x103:             /* display queue: head, buffer */
+            if (a2 > 1 || a3 > 31) {
+                *ret = PS3_LV2_EINVAL;
+                return true;
+            }
+            s->rsx_head_queued[a2] = a3;
+            s->rsx_head_flags[a2] |= 0x40000000u | (1u << a3);
+            h = drv + PS3_RSX_DI_HEAD + a2 * PS3_RSX_DI_HEAD_STRIDE;
+            ps3_put_be32(ram + h + PS3_RSX_HEAD_QUEUED, a3);
+            ps3_put_be32(ram + h + PS3_RSX_HEAD_FLAGS,
+                         ps3_be32(ram + h + PS3_RSX_HEAD_FLAGS) |
+                         0x40000000u | (1u << a3));
+            ps3_rsx_event(s, ram, ram_size, 0,
+                          PS3_RSX_EVENT_QUEUE_BASE << a2, 0);
             break;
+
         case 0x104: {           /* display buffer: id, h<<32|w, p<<32|off */
             unsigned id = a2 & 0xFFu;
 
-            if (id < ARRAY_SIZE(s->rsx_db_w)) {
-                s->rsx_db_w[id] = (a3 >> 32) & 0xFFFFFFFFu;
-                s->rsx_db_h[id] = a3 & 0xFFFFFFFFu;
-                s->rsx_db_pitch[id] = (a4 >> 32) & 0xFFFFFFFFu;
-                s->rsx_db_offset[id] = a4 & 0xFFFFFFFFu;
-                info_report("ps3-rsx: display buffer %u: %ux%u, pitch 0x%X, "
-                            "offset 0x%X", id, s->rsx_db_w[id],
-                            s->rsx_db_h[id], s->rsx_db_pitch[id],
-                            s->rsx_db_offset[id]);
+            if (id > 7) {
+                *ret = PS3_RSX_LV1_ILLEGAL_PARAM;
+                return true;
             }
+            s->rsx_db_w[id] = (a3 >> 32) & 0xFFFFFFFFu;
+            s->rsx_db_h[id] = a3 & 0xFFFFFFFFu;
+            s->rsx_db_pitch[id] = (a4 >> 32) & 0xFFFFFFFFu;
+            s->rsx_db_offset[id] = a4 & 0xFFFFFFFFu;
+            if (id + 1 > s->rsx_db_count) {
+                s->rsx_db_count = id + 1;
+            }
+            info_report("ps3-rsx: display buffer %u: %ux%u, pitch 0x%X, "
+                        "offset 0x%X", id, s->rsx_db_w[id], s->rsx_db_h[id],
+                        s->rsx_db_pitch[id], s->rsx_db_offset[id]);
             break;
         }
-        default:
-            if (s->ppu_trace) {
-                info_report("ps3-rsx: attribute ctx 0x%X package 0x%X "
-                            "(0x%X, 0x%X, 0x%X)", a0, a1, a2, a3, a4);
+
+        case 0x105:             /* destroy buffer */
+        case 0x106:             /* cellGcmInitPerfMon */
+            break;
+
+        case 0x108:             /* vblank frequency */
+            if (a4 == 1) {
+                s->rsx_vsync = true;
+            } else if (a4 == 2) {
+                s->rsx_second_vhandler = (a3 != 4);
             }
             break;
+
+        case 0x10A:             /* flip status: (flags & a3) | a4 */
+            if (a2 > 7) {
+                *ret = PS3_RSX_LV1_ILLEGAL_PARAM;
+                return true;
+            }
+            if (a2 > 1) {
+                *ret = PS3_LV2_EINVAL;
+                return true;
+            }
+            s->rsx_head_flags[a2] =
+                (s->rsx_head_flags[a2] & a3) | a4;
+            h = drv + PS3_RSX_DI_HEAD + a2 * PS3_RSX_DI_HEAD_STRIDE;
+            ps3_put_be32(ram + h + PS3_RSX_HEAD_FLAGS, s->rsx_head_flags[a2]);
+            break;
+
+        case 0x10B:             /* cursor position or image */
+        case 0x10C:             /* cursor enable/disable */
+        case 0x10D:             /* cursor init */
+            break;
+
+        case 0x300: {           /* tiles */
+            uint32_t id = a2;
+            uint32_t location, offset, size, pitch, comp, base_;
+            uint64_t lo = a3, hi = a4;
+            bool bound = ((uint32_t)(lo >> 32) & 0x3) != 0;
+
+            if (id >= PS3_RSX_TILES) {
+                *ret = PS3_RSX_LV1_ILLEGAL_PARAM;
+                return true;
+            }
+
+            location = ((uint32_t)(lo >> 32) & 0x3) - 1;
+            offset = (((uint32_t)((lo >> 32) & 0x7FFFFFFF)) >> 16) * 0x10000;
+            size = ((((uint32_t)(lo & 0x7FFFFFFF) >> 16) + 1) * 0x10000) -
+                   offset;
+            pitch = ((uint32_t)(hi >> 32) >> 8) * 0x100;
+            comp = ((uint32_t)hi >> 26) & 0xF;
+            base_ = (uint32_t)hi & 0x7FF;
+
+            if (bound) {
+                uint32_t limit;
+
+                if (!size || !pitch || offset + size < offset) {
+                    *ret = PS3_LV2_EINVAL;
+                    return true;
+                }
+                if (location == 0) {
+                    limit = PS3_RSX_MAIN_SIZE;
+                } else if (location == 1) {
+                    limit = s->rsx_local_size;
+                } else {
+                    *ret = PS3_LV2_EINVAL;
+                    return true;
+                }
+                if (offset + size > limit) {
+                    *ret = PS3_LV2_EINVAL;
+                    return true;
+                }
+                if (!(hi & (1u << 30))) {
+                    /* GCM hardcodes this bit; a clear without it is a bug. */
+                    *ret = PS3_LV2_EINVAL;
+                    return true;
+                }
+                if (location == 0) {
+                    uint32_t page;
+
+                    for (page = offset >> 20;
+                         page <= (offset + size - 1) >> 20; page++) {
+                        if (page >= PS3_RSX_IO_PAGES ||
+                            !s->rsx_iomap_used[page]) {
+                            *ret = PS3_LV2_EINVAL;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            s->rsx_tiles[id].bound = bound;
+            s->rsx_tiles[id].location = location;
+            s->rsx_tiles[id].offset = offset;
+            s->rsx_tiles[id].size = size;
+            s->rsx_tiles[id].pitch = pitch;
+            s->rsx_tiles[id].comp = comp;
+            s->rsx_tiles[id].base = base_;
+            break;
+        }
+
+        case 0x301: {           /* depth buffer (zcull) */
+            uint32_t id = a2;
+            uint32_t width, height, cull_start, offset;
+            bool bound = a5 != 0;
+
+            if (id >= PS3_RSX_ZCULLS) {
+                *ret = PS3_RSX_LV1_ILLEGAL_PARAM;
+                return true;
+            }
+
+            width = ((a3 & 0xFFFFFFFFu) >> 22) << 6;
+            height = ((a3 & 0xFFFFu) >> 6) << 6;
+            cull_start = (uint32_t)(a4 >> 32) & ~0xFFFu;
+            offset = (uint32_t)a4 & 0x0FFFFFFFu;
+
+            if (bound) {
+                if (!width || !height ||
+                    (uint64_t)cull_start + (uint64_t)width * height > 3u << 20 ||
+                    offset >= s->rsx_local_size) {
+                    *ret = PS3_LV2_EINVAL;
+                    return true;
+                }
+                if (!(a3 & (1ull << 32)) ||
+                    (a5 & 0xFFFFFFFFu) != ((0x2000u << 0) | (0x20u << 16))) {
+                    *ret = PS3_LV2_EINVAL;
+                    return true;
+                }
+            }
+
+            s->rsx_zculls[id].bound = bound;
+            s->rsx_zculls[id].width = width;
+            s->rsx_zculls[id].height = height;
+            s->rsx_zculls[id].cull_start = cull_start;
+            s->rsx_zculls[id].offset = offset;
+            s->rsx_zculls[id].z_format = ((uint32_t)(a3 >> 32) >> 4) & 0xF;
+            s->rsx_zculls[id].aa_format = ((uint32_t)(a3 >> 32) >> 8) & 0xF;
+            s->rsx_zculls[id].dir = ((uint32_t)(a5 >> 32) >> 1) & 1;
+            s->rsx_zculls[id].format = ((uint32_t)(a5 >> 32) >> 2) & 0x3FF;
+            s->rsx_zculls[id].func = ((uint32_t)(a5 >> 32) >> 12) & 0xF;
+            s->rsx_zculls[id].ref = ((uint32_t)(a5 >> 32) >> 16) & 0xFF;
+            s->rsx_zculls[id].mask = ((uint32_t)(a5 >> 32) >> 24) & 0xFF;
+            break;
+        }
+
+        case 0x302:             /* zcull state */
+        case 0x600:             /* framebuffer setup */
+        case 0x601:             /* framebuffer blit */
+        case 0x602:             /* framebuffer blit sync */
+        case 0x603:             /* framebuffer close */
+            break;
+
+        case 0xFEC:             /* flip event notification */
+            h = drv + PS3_RSX_DI_HEAD + PS3_RSX_DI_HEAD_STRIDE;  /* head 1 */
+            s->rsx_head_flags[1] |= 0x80000000u;
+            ps3_put_be32(ram + h + PS3_RSX_HEAD_FLAGS, s->rsx_head_flags[1]);
+            ps3_put_be64(ram + h + PS3_RSX_HEAD_FLIPTIME, ps3_rsx_timebase());
+            ps3_put_be32(ram + h + PS3_RSX_HEAD_FLIPID, a2);
+            /* cellGcmWaitLabel watches this semaphore: every flip clears it. */
+            memset(ram + s->rsx_reports + 0x10, 0, 16);
+            ps3_rsx_event(s, ram, ram_size, 0,
+                          PS3_RSX_EVENT_FLIP_BASE << 1, 0);
+            break;
+
+        case 0xFED:             /* vblank: raised by the display, not by a PPU */
+            *ret = PS3_LV2_EINVAL;
+            return true;
+
+        case 0xFEF:             /* user command */
+            ps3_put_be32(ram + drv + PS3_RSX_DI_USERCMD, a3);
+            ps3_rsx_event(s, ram, ram_size, 0, PS3_RSX_EVENT_USER_CMD, 0);
+            break;
+
+        default:
+            if (s->ppu_trace) {
+                info_report("ps3-rsx: attribute package 0x%X (0x%X, 0x%X, "
+                            "0x%X, 0x%X) is not modelled", (uint32_t)a1,
+                            (uint32_t)a2, (uint32_t)a3, (uint32_t)a4,
+                            (uint32_t)a5);
+            }
+            *ret = PS3_LV2_EINVAL;
+            return true;
         }
         *ret = 0;
         return true;
     }
-    case 0x2A3:                 /* device_map(dev_addr*, unused*, dev_id) */
-        if ((uint64_t)a0 + 4 > ram_size) {
+
+    case 0x2A3: {               /* device_map(dev_addr*, unused*, dev_id) */
+        uint32_t base;
+
+        if ((uint64_t)a0 + 8 > ram_size) {
             *ret = PS3_LV2_EFAULT;
             return true;
         }
-        /* The RSX register window: the same local base the library maps. */
-        ps3_put_be32(ram + a0, PS3_RSX_LOCAL_BASE);
+        if (a2 != 8) {
+            /* lv1 only hands out the RSX's own window for dev 8. */
+            *ret = PS3_LV2_EINVAL;
+            return true;
+        }
+        if (!s->rsx_device) {
+            base = (s->lv2_heap + 0xFFFFFu) & ~0xFFFFFu;
+            if ((uint64_t)base + 0x100000 > ram_size) {
+                *ret = PS3_LV2_ENOMEM;
+                return true;
+            }
+            s->lv2_heap = base + 0x100000;
+            ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
+            s->rsx_device = base;
+            info_report("ps3-rsx: device window 0x%X", base);
+        }
+        ps3_put_be64(ram + a0, s->rsx_device);
         *ret = 0;
         return true;
+    }
+
+    case 0x2A4:                 /* device_unmap(dev_id) */
+        *ret = 0;
+        return true;
+
+    case 0x2A5:                 /* attribute(package, a2..a5) */
+        *ret = 0;
+        return true;
+
     default:
         return false;
     }
@@ -8572,8 +9324,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         goto publish;
     }
 
-    /* The RSX: device, local memory, context, FIFO and display. */
-    if (ps3_lv2_rsx(s, ram, ram_size, nr, a0, a1, a2, a3, a4, a5, &ret)) {
+    /*
+     * The RSX: device, local memory, context, FIFO and display.  Its arguments
+     * are the full 64-bit registers, because the graphics library packs two
+     * 32-bit values into several of them (a display buffer is w<<32|h).
+     */
+    if (ps3_lv2_rsx(s, ram, ram_size, nr, cpu->env.gpr[3], cpu->env.gpr[4],
+                    cpu->env.gpr[5], cpu->env.gpr[6], cpu->env.gpr[7],
+                    cpu->env.gpr[8], &ret)) {
         goto publish;
     }
 
@@ -8684,6 +9442,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
         PS3Event ev;
 
         if (q < 0) {
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: event_queue_receive: no queue "
+                            "0x%X (lr=0x%" PRIX64 ")", a0,
+                            (uint64_t)cpu->env.lr);
+            }
             ret = PS3_LV2_ESRCH;
             break;
         }
@@ -8693,6 +9456,12 @@ static void ps3_lv2_service(PS3BootROMState *s)
             cpu->env.gpr[5] = ev.data1;
             cpu->env.gpr[6] = ev.data2;
             cpu->env.gpr[7] = ev.data3;
+            if (s->ppu_trace) {
+                info_report("ps3-ppu: lv2: event_queue_receive 0x%X: source "
+                            "0x%" PRIX64 ", d1 0x%" PRIX64 ", d2 0x%" PRIX64
+                            ", d3 0x%" PRIX64, a0, ev.source, ev.data1,
+                            ev.data2, ev.data3);
+            }
             ret = 0;
             break;
         }
@@ -11420,6 +12189,21 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
                                 &kbd_s->rsx_local);
     kbd_s->rsx_ready = true;
     kbd_s->rsx_context = 0;
+    kbd_s->rsx_mem_allocated = false;
+    kbd_s->rsx_mem_handle = 0;
+    kbd_s->rsx_local_size = 0;
+    kbd_s->rsx_dma = 0;
+    kbd_s->rsx_driver = 0;
+    kbd_s->rsx_reports = 0;
+    kbd_s->rsx_device = 0;
+    kbd_s->rsx_event_port = 0;
+    kbd_s->rsx_event_queue = 0;
+    memset(kbd_s->rsx_iomap_used, 0, sizeof(kbd_s->rsx_iomap_used));
+    memset(kbd_s->rsx_iomap_ea, 0, sizeof(kbd_s->rsx_iomap_ea));
+    memset(kbd_s->rsx_tiles, 0, sizeof(kbd_s->rsx_tiles));
+    memset(kbd_s->rsx_zculls, 0, sizeof(kbd_s->rsx_zculls));
+    kbd_s->rsx_db_count = 0;
+    kbd_s->rsx_vblank_timer = NULL;
 
     /* No guest thread has been created yet; the first switch registers one. */
     kbd_s->thr_cur = -1;
@@ -13284,6 +14068,17 @@ static void rs6000_ps3_init(MachineState *machine)
      * boot ROM device so the ROM's own progress lines land on the screen.
      */
     vga = qdev_new("ps3-vga");
+    if (vga_interface_type == VGA_RSX) {
+        /*
+         * -vga rsx: the RSX display.  `gl=on' requires a GL backend (SDL or
+         * GTK with gl=on); `gl=off' keeps the CPU scanout, and no gl= leaves
+         * it to whether the display has a GL context.  The check runs after
+         * the display frontend attaches, in ps3-vga itself.
+         */
+        qdev_prop_set_bit(vga, "gl", vga_rsx_gl != 0);
+        qdev_prop_set_bit(vga, "gl-required", vga_rsx_gl == 1);
+        vga_interface_created = true;
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(vga), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(vga), 0, PS3_VGA_MMIO_BASE);
 

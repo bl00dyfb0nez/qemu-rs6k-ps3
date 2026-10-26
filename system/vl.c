@@ -976,6 +976,11 @@ static const VGAInterfaceInfo vga_interfaces[VGA_TYPE_MAX] = {
         .name = "Virtio VGA",
         .class_names = { "virtio-vga" },
     },
+    [VGA_RSX] = {
+        .opt_name = "rsx",
+        .name = "PS3 RSX display",
+        .class_names = { "ps3-vga" },
+    },
     [VGA_QXL] = {
         .opt_name = "qxl",
         .name = "QXL VGA",
@@ -1088,6 +1093,21 @@ static void select_vgahw(const MachineClass *machine_class, const char *p)
             else if (strstart(opts, "precise", &nextopt))
                 vga_retrace_method = VGA_RETRACE_PRECISE;
             else goto invalid_vga;
+        } else if (strstart(opts, ",gl=", &nextopt)) {
+            /* Only the PS3 display has a GL scanout to turn on. */
+            if (vga_interface_type != VGA_RSX) {
+                goto invalid_vga;
+            }
+            opts = nextopt;
+            if (strstart(opts, "on", &nextopt)) {
+                vga_rsx_gl = 1;
+            } else if (strstart(opts, "off", &nextopt)) {
+                vga_rsx_gl = 0;
+            } else if (strstart(opts, "auto", &nextopt)) {
+                vga_rsx_gl = -1;
+            } else {
+                goto invalid_vga;
+            }
         } else goto invalid_vga;
         opts = nextopt;
     }
