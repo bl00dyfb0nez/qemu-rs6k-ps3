@@ -864,6 +864,15 @@ struct PS3BootROMState {
     bool idle_off_reported;
     int lv2_fd[PS3_LV2_FD_MAX];     /* guest handle -> host descriptor */
     bool lv2_fd_open[PS3_LV2_FD_MAX];
+    /*
+     * A directory handle is a GDir of the host tree, opened on the guest's
+     * behalf.  The console's lv2 hands out the same fd numbering to files and
+     * directories, so these slots share it and only the matching array says
+     * which kind a handle is.
+     */
+    GDir *lv2_dir[PS3_LV2_FD_MAX];
+    gchar *lv2_dir_path[PS3_LV2_FD_MAX];
+    unsigned lv2_dir_step[PS3_LV2_FD_MAX];
 
     /*
      * The HDD: one raw image, the size a superslim ships with.  Its sectors
@@ -1060,6 +1069,7 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
 #define PS3_LV2_EIO     ((int32_t)0x8001002B)
 #define PS3_LV2_ENOTDIR ((int32_t)0x8001002E)
 #define PS3_LV2_ENOTMOUNTED ((int32_t)0x8001003A)
+#define PS3_LV2_EBADF   ((int32_t)0x8001002A)
 
 
 /*
@@ -2067,7 +2077,16 @@ static gchar *ps3_lv2_host_path(PS3BootROMState *s, const char *guest)
     const char *root;
     const char *rest;
 
-    if (!strncmp(guest, "/dev_flash/", 11)) {
+    if (!strcmp(guest, "/dev_flash")) {
+        root = s->dev_flash;
+        rest = "";
+    } else if (!strcmp(guest, "/dev_flash2")) {
+        root = s->dev_flash2;
+        rest = "";
+    } else if (!strcmp(guest, "/dev_flash3")) {
+        root = s->dev_flash3;
+        rest = "";
+    } else if (!strncmp(guest, "/dev_flash/", 11)) {
         root = s->dev_flash;
         rest = guest + 11;
     } else if (!strncmp(guest, "/dev_flash2/", 12)) {
@@ -6787,6 +6806,557 @@ static bool ps3_pad_defaults(PS3BootROMState *s, Error **errp)
 /* call runs against the host, so the guest sees the same tree it would on  */
 /* the console.                                                            */
 
+/* ---------------------------------------------------------------------- */
+/* sysPrxForUser: the helpers lv2's own libraries and the VSH's libc are    */
+/* built on.  The light-weight mutex and condition are the primitives lv2    */
+/* itself builds the heavier sync objects from, and _sys_printf is how the   */
+/* VSH writes to its debug console - the text goes through the same UART    */
+/* sys_tty_write feeds, so it lands in the log and on the screen.           */
+/*                                                                          */
+/* The printf family reads its arguments over the guest's calling           */
+/* convention: the first eight integers are in r3..r10, the rest in the      */
+/* caller's parameter area at 0x20(r1), and doubles take f1..f13.  Every     */
+/* conversion consumes one argument of its own class, exactly as the         */
+/* console's own libc would, so a format string means the same thing here.   */
+/* ---------------------------------------------------------------------- */
+
+#define PS3_NID_SYS_PRINTF           0x9F04F7AFu
+#define PS3_NID_SYS_SNPRINTF         0x06574237u
+#define PS3_NID_SYS_SPRINTF          0xA1F9EAFEu
+#define PS3_NID_SYS_VSNPRINTF        0x0618936Bu
+#define PS3_NID_SYS_VSPRINTF         0x791B9219u
+#define PS3_NID_SYS_VPRINTF          0xFA7F693Du
+#define PS3_NID_SYS_LWMUTEX_CREATE   0x2F85C0EFu
+#define PS3_NID_SYS_LWMUTEX_DESTROY  0xC3476D0Cu
+#define PS3_NID_SYS_LWMUTEX_LOCK     0x1573DC3Fu
+#define PS3_NID_SYS_LWMUTEX_UNLOCK   0x1BC200F4u
+#define PS3_NID_SYS_LWMUTEX_TRYLOCK  0xAEB78725u
+#define PS3_NID_SYS_LWCOND_CREATE    0xDA0EB71Au
+#define PS3_NID_SYS_LWCOND_DESTROY   0x1C9A942Cu
+#define PS3_NID_SYS_LWCOND_WAIT      0x2A6D9D51u
+#define PS3_NID_SYS_LWCOND_SIGNAL    0xEF87A695u
+#define PS3_NID_SYS_LWCOND_SIGNAL_ALL 0xE9A1BD84u
+#define PS3_NID_SYS_LWCOND_SIGNAL_TO 0x52AADADFu
+
+typedef struct PS3Printf {
+    CPUPPCState *env;
+    uint8_t *ram;
+    uint64_t ram_size;
+    unsigned gpr;                   /* register mode: r3 is slot 0 */
+    unsigned fpr;
+    bool va;                        /* the arguments come from a va_list */
+    uint32_t tag;                   /* and this is where that tag lives */
+} PS3Printf;
+
+/*
+ * The next integer argument, in either calling convention.
+ *
+ * A PPC64 va_list is the ELFv1 `__va_list_tag`: the byte offset of the next
+ * integer argument in the register save area, the same for the float argument
+ * area, then the address of the caller's parameter area and the save area
+ * itself.  Arguments beyond the eight register slots come from the parameter
+ * area, one 8-byte slot at a time, which is what the guest's own libc does.
+ */
+static uint64_t ps3_printf_word(PS3Printf *p)
+{
+    if (p->va) {
+        uint8_t *tag = p->ram + p->tag;
+        uint64_t save, spill, value;
+        unsigned off;
+
+        if ((uint64_t)p->tag + 0x18 > p->ram_size) {
+            return 0;
+        }
+        off = tag[0];
+        save = ps3_be64(tag + 8);
+        spill = ps3_be64(tag + 16);
+
+        if (off < 8 * 8) {
+            tag[0] = off + 8;
+            if (save + off + 8 > p->ram_size) {
+                return 0;
+            }
+            return ps3_be64(p->ram + save + off);
+        }
+        if (spill + 8 > p->ram_size) {
+            return 0;
+        }
+        value = ps3_be64(p->ram + spill);
+        ps3_put_be64(tag + 16, spill + 8);
+        return value;
+    }
+
+    {
+        unsigned slot = p->gpr++;
+        uint64_t at;
+
+        if (slot < 8) {
+            return p->env->gpr[3 + slot];
+        }
+        at = (uint64_t)(uint32_t)p->env->gpr[1] + 0x20 +
+             (uint64_t)(slot - 8) * 8;
+        if (at + 8 > p->ram_size) {
+            return 0;
+        }
+        return ps3_be64(p->ram + at);
+    }
+}
+
+static double ps3_printf_double(PS3Printf *p)
+{
+    union {
+        uint64_t u;
+        double d;
+    } bits;
+
+    if (p->va) {
+        uint8_t *tag = p->ram + p->tag;
+        uint64_t save;
+        unsigned off;
+
+        if ((uint64_t)p->tag + 0x18 > p->ram_size) {
+            return 0;
+        }
+        off = tag[1];
+        save = ps3_be64(tag + 8);
+        tag[1] = off + 8;
+        /* f1..f13 are saved after the eight integer registers. */
+        if (save + 0x40 + off + 8 > p->ram_size) {
+            return 0;
+        }
+        bits.u = ps3_be64(p->ram + save + 0x40 + off);
+        return bits.d;
+    }
+
+    if (p->fpr >= 13) {
+        return 0;
+    }
+    /* The FPRs are the low double of the first 32 VSRs. */
+    bits.u = p->env->vsr[p->fpr++].VsrD(0);
+    return bits.d;
+}
+
+/* One number, with the sign, prefix, width, precision and fill it asked for. */
+static void ps3_printf_number(GString *out, uint64_t value, bool negative,
+                              unsigned base, bool upper, int width,
+                              int precision, bool left, bool zero,
+                              const char *prefix)
+{
+    char digits[32], body[96];
+    const char *set = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    unsigned n = 0, len = 0, zeros = 0, pad, i;
+
+    do {
+        digits[n++] = set[value % base];
+        value /= base;
+    } while (value);
+
+    if (negative) {
+        body[len++] = '-';
+    }
+    while (prefix && *prefix) {
+        body[len++] = *prefix++;
+    }
+    if (precision > (int)n) {
+        zeros = (unsigned)precision - n;
+    }
+    if (zero && !left && precision < 0) {
+        pad = width > (int)(len + n) ? (unsigned)width - len - n : 0;
+        zeros = MAX(zeros, pad);
+    }
+    for (i = 0; i < zeros; i++) {
+        body[len++] = '0';
+    }
+    for (i = 0; i < n; i++) {
+        body[len++] = digits[n - 1 - i];
+    }
+    body[len] = 0;
+
+    pad = width > (int)len ? (unsigned)width - len : 0;
+    if (!left) {
+        for (i = 0; i < pad; i++) {
+            g_string_append_c(out, ' ');
+        }
+    }
+    g_string_append(out, body);
+    if (left) {
+        for (i = 0; i < pad; i++) {
+            g_string_append_c(out, ' ');
+        }
+    }
+}
+
+static void ps3_printf_text(GString *out, const char *text, int width,
+                            int precision, bool left)
+{
+    size_t len = strlen(text), pad, i;
+
+    if (precision >= 0 && (size_t)precision < len) {
+        len = (size_t)precision;
+    }
+    pad = width > (int)len ? (size_t)width - len : 0;
+    if (!left) {
+        for (i = 0; i < pad; i++) {
+            g_string_append_c(out, ' ');
+        }
+    }
+    g_string_append_len(out, text, len);
+    if (left) {
+        for (i = 0; i < pad; i++) {
+            g_string_append_c(out, ' ');
+        }
+    }
+}
+
+/* %ls: the console's wchar_t is a 32-bit code point, stored big-endian. */
+static void ps3_printf_wide(GString *out, uint64_t addr, uint64_t ram_size,
+                            const uint8_t *ram)
+{
+    while (addr && addr + 4 <= ram_size) {
+        uint32_t ch = ps3_be32(ram + addr);
+
+        if (!ch) {
+            break;
+        }
+        if (ch < 0x80) {
+            g_string_append_c(out, (char)ch);
+        } else {
+            char utf8[8];
+            int len = g_unichar_to_utf8(g_unichar_validate(ch) ? ch : '?',
+                                        utf8);
+
+            g_string_append_len(out, utf8, len);
+        }
+        addr += 4;
+    }
+}
+
+/* The format string, expanded into `out'. */
+static void ps3_printf_format(PS3Printf *p, uint32_t fmt, GString *out)
+{
+    char text[1024];
+    unsigned i;
+
+    if (!ps3_lv2_guest_string(p->ram, p->ram_size, fmt, text, sizeof(text))) {
+        return;
+    }
+
+    for (i = 0; text[i]; i++) {
+        const char *q;
+        bool left = false, plus = false, space = false, alt = false;
+        bool zero = false;
+        int width = 0, precision = -1, length = 0;
+        char conv;
+
+        if (text[i] != '%') {
+            g_string_append_c(out, text[i]);
+            continue;
+        }
+        q = text + i + 1;
+        if (*q == '%') {
+            g_string_append_c(out, '%');
+            i = q - text;
+            continue;
+        }
+        for (;; q++) {
+            if (*q == '-') {
+                left = true;
+            } else if (*q == '+') {
+                plus = true;
+            } else if (*q == ' ') {
+                space = true;
+            } else if (*q == '#') {
+                alt = true;
+            } else if (*q == '0') {
+                zero = true;
+            } else {
+                break;
+            }
+        }
+        if (*q == '*') {
+            width = (int)(int32_t)ps3_printf_word(p);
+            if (width < 0) {
+                left = true;
+                width = -width;
+            }
+            q++;
+        } else {
+            while (g_ascii_isdigit(*q)) {
+                width = width * 10 + (*q++ - '0');
+            }
+        }
+        if (*q == '.') {
+            q++;
+            precision = 0;
+            if (*q == '*') {
+                precision = (int)(int32_t)ps3_printf_word(p);
+                q++;
+            } else {
+                while (g_ascii_isdigit(*q)) {
+                    precision = precision * 10 + (*q++ - '0');
+                }
+            }
+        }
+        if (*q == 'h') {
+            q++;
+            length = *q == 'h' ? (q++, -2) : -1;
+        } else if (*q == 'l') {
+            q++;
+            length = *q == 'l' ? (q++, 2) : 1;
+        } else if (*q == 'z' || *q == 'j' || *q == 't') {
+            length = 3;
+            q++;
+        } else if (*q == 'L') {
+            q++;
+        }
+        conv = *q;
+        i = q - text;
+
+        switch (conv) {
+        case 'd': case 'i': {
+            int64_t v = (int64_t)ps3_printf_word(p);
+
+            switch (length) {
+            case -2:
+                v = (int8_t)v;
+                break;
+            case -1:
+                v = (int16_t)v;
+                break;
+            case 0:
+            case 3:
+                v = (int32_t)v;
+                break;
+            default:
+                break;      /* long and long long are 64 bits here */
+            }
+            ps3_printf_number(out, v < 0 ? (uint64_t)-v : (uint64_t)v,
+                              v < 0, 10, false, width, precision, left, zero,
+                              v < 0 ? NULL : plus ? "+" : space ? " " : NULL);
+            break;
+        }
+        case 'u': case 'o': case 'x': case 'X': {
+            uint64_t v = ps3_printf_word(p);
+
+            switch (length) {
+            case -2:
+                v = (uint8_t)v;
+                break;
+            case -1:
+                v = (uint16_t)v;
+                break;
+            case 0:
+            case 3:
+                v = (uint32_t)v;
+                break;
+            default:
+                break;
+            }
+            ps3_printf_number(out, v, false,
+                              conv == 'o' ? 8 : conv == 'u' ? 10 : 16,
+                              conv == 'X', width, precision, left, zero,
+                              alt && v ? (conv == 'o' ? "0" :
+                                          conv == 'X' ? "0X" : "0x") : NULL);
+            break;
+        }
+        case 'c': {
+            char one[2] = { (char)(ps3_printf_word(p) & 0xFF), 0 };
+
+            ps3_printf_text(out, one, width, precision, left);
+            break;
+        }
+        case 's': {
+            uint64_t addr = ps3_printf_word(p);
+
+            if (!addr) {
+                ps3_printf_text(out, "(null)", width, precision, left);
+            } else if (length == 1) {
+                g_autoptr(GString) wide = g_string_new(NULL);
+
+                ps3_printf_wide(wide, addr, p->ram_size, p->ram);
+                ps3_printf_text(out, wide->str, width, precision, left);
+            } else {
+                char str[512];
+
+                if (!ps3_lv2_guest_string(p->ram, p->ram_size, (uint32_t)addr,
+                                          str, sizeof(str))) {
+                    str[0] = 0;
+                }
+                ps3_printf_text(out, str, width, precision, left);
+            }
+            break;
+        }
+        case 'p':
+            ps3_printf_number(out, ps3_printf_word(p), false, 16, false,
+                              width, precision, left, zero, "0x");
+            break;
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+            char spec[16];
+            g_autofree gchar *text_out = NULL;
+
+            g_snprintf(spec, sizeof(spec), "%%%s*.*%c", left ? "-" : "",
+                       conv == 'F' ? 'f' : g_ascii_tolower(conv));
+            text_out = g_strdup_printf(spec, width,
+                                       precision < 0 ? 6 : precision,
+                                       ps3_printf_double(p));
+            g_string_append(out, text_out);
+            break;
+        }
+        case 'n': {
+            uint64_t where = ps3_printf_word(p);
+
+            if (where && where + 4 <= p->ram_size) {
+                ps3_put_be32(p->ram + where, (uint32_t)out->len);
+            }
+            break;
+        }
+        case '\0':
+            return;
+        default:
+            g_string_append_c(out, '%');
+            g_string_append_c(out, conv);
+            break;
+        }
+    }
+}
+
+/* Put `text' at a guest address, NUL-terminated, never longer than `room'. */
+static uint32_t ps3_lv2_put_string(uint8_t *ram, uint64_t ram_size,
+                                   uint32_t addr, const char *text,
+                                   uint64_t room, bool *ok)
+{
+    uint64_t len;
+
+    *ok = false;
+    if (!addr || addr >= ram_size || !room) {
+        return 0;
+    }
+    room = MIN(room, ram_size - addr);
+    len = MIN(strlen(text), room - 1);
+    memcpy(ram + addr, text, len);
+    ram[addr + len] = 0;
+    *ok = true;
+    return len;
+}
+
+static bool ps3_lv2_prx_user(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
+                             uint64_t ram_size, uint32_t nid, int32_t *ret)
+{
+    uint32_t a0 = env->gpr[3];
+    uint32_t a1 = env->gpr[4];
+    uint32_t a2 = env->gpr[5];
+    uint32_t a3 = env->gpr[6];
+    int32_t r = 0;
+
+    switch (nid) {
+    case PS3_NID_SYS_PRINTF: {          /* (fmt, ...) */
+        PS3Printf p = { env, ram, ram_size, 1, 0, false, 0 };
+        g_autoptr(GString) text = g_string_new(NULL);
+        size_t i;
+
+        ps3_printf_format(&p, a0, text);
+        for (i = 0; i < text->len; i++) {
+            ps3_uart_putc(s, text->str[i]);
+        }
+        break;
+    }
+    case PS3_NID_SYS_SNPRINTF:          /* (dst, count, fmt, ...) */
+    case PS3_NID_SYS_SPRINTF:           /* (dst, fmt, ...) */
+    case PS3_NID_SYS_VSNPRINTF:         /* (dst, count, fmt, va_list) */
+    case PS3_NID_SYS_VSPRINTF:          /* (dst, fmt, va_list) */
+    case PS3_NID_SYS_VPRINTF: {         /* (fmt, va_list) */
+        bool to_console = nid == PS3_NID_SYS_VPRINTF;
+        bool va = nid == PS3_NID_SYS_VSNPRINTF ||
+                  nid == PS3_NID_SYS_VSPRINTF ||
+                  nid == PS3_NID_SYS_VPRINTF;
+        uint32_t dst = to_console ? 0 : a0;
+        uint64_t room = ram_size;
+        uint32_t fmt, tag = 0;
+        unsigned named;
+        PS3Printf p = { env, ram, ram_size, 0, 0, va, 0 };
+        g_autoptr(GString) text = g_string_new(NULL);
+        bool ok;
+        uint32_t len;
+
+        switch (nid) {
+        case PS3_NID_SYS_SNPRINTF:
+            fmt = a2;
+            room = a1;
+            named = 3;
+            break;
+        case PS3_NID_SYS_SPRINTF:
+            fmt = a1;
+            named = 2;
+            break;
+        case PS3_NID_SYS_VSNPRINTF:
+            fmt = a2;
+            room = a1;
+            tag = a3;
+            named = 0;
+            break;
+        case PS3_NID_SYS_VSPRINTF:
+            fmt = a1;
+            tag = a2;
+            named = 0;
+            break;
+        default:                /* _sys_vprintf */
+            fmt = a0;
+            tag = a1;
+            named = 0;
+            break;
+        }
+        if (va) {
+            p.tag = tag;
+        } else {
+            p.gpr = named;
+        }
+        ps3_printf_format(&p, fmt, text);
+
+        if (to_console) {
+            size_t i;
+
+            for (i = 0; i < text->len; i++) {
+                ps3_uart_putc(s, text->str[i]);
+            }
+            break;
+        }
+
+        len = ps3_lv2_put_string(ram, ram_size, dst, text->str, room, &ok);
+        r = ok ? (int32_t)len : PS3_LV2_EFAULT;
+        break;
+    }
+    case PS3_NID_SYS_LWMUTEX_CREATE:    /* (u32 *id, attribute *) */
+    case PS3_NID_SYS_LWCOND_CREATE:     /* (u32 *id, attribute *, lwmutex) */
+        if (!a0 || (uint64_t)a0 + 4 > ram_size) {
+            r = PS3_LV2_EFAULT;
+            break;
+        }
+        ps3_put_be32(ram + a0, ++s->lv2_next_id);
+        break;
+    case PS3_NID_SYS_LWMUTEX_LOCK:      /* (id, timeout) */
+    case PS3_NID_SYS_LWMUTEX_TRYLOCK:   /* (id) */
+    case PS3_NID_SYS_LWMUTEX_UNLOCK:    /* (id) */
+    case PS3_NID_SYS_LWMUTEX_DESTROY:   /* (id) */
+    case PS3_NID_SYS_LWCOND_WAIT:       /* (id, lwmutex, timeout) */
+    case PS3_NID_SYS_LWCOND_SIGNAL:     /* (id) */
+    case PS3_NID_SYS_LWCOND_SIGNAL_ALL:
+    case PS3_NID_SYS_LWCOND_SIGNAL_TO:
+    case PS3_NID_SYS_LWCOND_DESTROY:
+        /*
+         * The scheduler runs one guest thread at a time, so no thread can
+         * hold a light-weight lock against another: a lock is always granted,
+         * a wait is a wake-up that has already happened, and the ids are kept
+         * so the callers' bookkeeping stays consistent.
+         */
+        break;
+    default:
+        return false;
+    }
+
+    *ret = r;
+    return true;
+}
+
 static int32_t ps3_lv2_fs_error(int err)
 {
     switch (err) {
@@ -6866,6 +7436,273 @@ static void ps3_lv2_stat(uint8_t *out, bool is_dir, int64_t atime,
     ps3_put_be64(out + 0x24, size);
     ps3_put_be64(out + 0x2C, 4096);
 }
+
+/*
+ * The directory side of sys_fs.
+ *
+ * A listing on a console starts with "." and "..", and both the readdir
+ * shape (a CellFsDirent per call) and the packed shape (CellFsDirectoryEntry:
+ * the stat, then the name) are used by the VSH's own file library.  The two
+ * dot entries are synthesised because a host directory does not carry them.
+ */
+#define PS3_FS_TYPE_UNKNOWN     0
+#define PS3_FS_TYPE_DIRECTORY   1
+#define PS3_FS_TYPE_REGULAR     2
+#define PS3_FS_DIRENT_SIZE      0x102u   /* type, namlen, name[256] */
+#define PS3_FS_DIRENTRY_SIZE    0x138u   /* stat 0x34, then the dirent */
+
+static int ps3_lv2_dir_alloc(PS3BootROMState *s, GDir *dir, const gchar *path)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_LV2_FD_MAX; i++) {
+        if (!s->lv2_fd_open[i]) {
+            s->lv2_fd_open[i] = true;
+            s->lv2_fd[i] = -1;
+            s->lv2_dir[i] = dir;
+            s->lv2_dir_path[i] = g_strdup(path);
+            s->lv2_dir_step[i] = 0;
+            return (int)i + 3;
+        }
+    }
+
+    return -1;
+}
+
+static GDir *ps3_lv2_dir_host(PS3BootROMState *s, uint32_t guest, int *index)
+{
+    unsigned i;
+
+    if (guest < 3) {
+        return NULL;
+    }
+    i = guest - 3;
+    if (i >= PS3_LV2_FD_MAX || !s->lv2_fd_open[i] || !s->lv2_dir[i]) {
+        return NULL;
+    }
+    if (index) {
+        *index = (int)i;
+    }
+    return s->lv2_dir[i];
+}
+
+/* The next entry of a listing, with its host stat when there is one. */
+static bool ps3_lv2_dir_entry(PS3BootROMState *s, int i, char *name,
+                              size_t len, bool *is_dir, GStatBuf *st,
+                              bool *have_st)
+{
+    unsigned step = s->lv2_dir_step[i]++;
+    const char *entry;
+
+    *have_st = false;
+    if (step == 0) {
+        g_strlcpy(name, ".", len);
+        *is_dir = true;
+        if (s->lv2_dir_path[i] &&
+            g_stat(s->lv2_dir_path[i], st) == 0) {
+            *have_st = true;
+        }
+        return true;
+    }
+    if (step == 1) {
+        g_autofree gchar *parent = s->lv2_dir_path[i] ?
+            g_path_get_dirname(s->lv2_dir_path[i]) : NULL;
+
+        g_strlcpy(name, "..", len);
+        *is_dir = true;
+        if (parent && g_stat(parent, st) == 0) {
+            *have_st = true;
+        }
+        return true;
+    }
+
+    entry = g_dir_read_name(s->lv2_dir[i]);
+    if (!entry) {
+        return false;
+    }
+    g_strlcpy(name, entry, len);
+    *is_dir = false;
+    if (s->lv2_dir_path[i]) {
+        g_autofree gchar *child =
+            g_build_filename(s->lv2_dir_path[i], entry, NULL);
+
+        if (g_stat(child, st) == 0) {
+            *have_st = true;
+            *is_dir = S_ISDIR(st->st_mode);
+        }
+    }
+    return true;
+}
+
+static void ps3_lv2_dirent(uint8_t *out, const char *name, bool is_dir)
+{
+    size_t len = MIN(strlen(name), (size_t)255);
+
+    out[0] = is_dir ? PS3_FS_TYPE_DIRECTORY : PS3_FS_TYPE_REGULAR;
+    out[1] = (uint8_t)len;
+    memcpy(out + 2, name, len);
+    memset(out + 2 + len, 0, 256 - len);
+}
+
+static int32_t ps3_lv2_fs_opendir(PS3BootROMState *s, uint8_t *ram,
+                                  uint64_t ram_size, uint32_t path,
+                                  uint32_t out)
+{
+    g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, path);
+    GDir *dir;
+    int fd;
+
+    if (s->ppu_trace) {
+        char guest[512];
+
+        if (ps3_lv2_guest_string(ram, ram_size, path, guest, sizeof(guest))) {
+            info_report("ps3-ppu: lv2: opendir(%s) -> %s", guest,
+                        host ? host : "unmapped");
+        }
+    }
+    if (!host) {
+        return PS3_LV2_ENOENT;
+    }
+    if (!out || (uint64_t)out + 4 > ram_size) {
+        return PS3_LV2_EFAULT;
+    }
+    if (g_file_test(host, G_FILE_TEST_IS_REGULAR)) {
+        return PS3_LV2_ENOTDIR;
+    }
+    dir = g_dir_open(host, 0, NULL);
+    if (!dir) {
+        return g_file_test(host, G_FILE_TEST_IS_DIR) ?
+            PS3_LV2_EACCES : PS3_LV2_ENOENT;
+    }
+    fd = ps3_lv2_dir_alloc(s, dir, host);
+    if (fd < 0) {
+        g_dir_close(dir);
+        return PS3_LV2_EIO;
+    }
+
+    ps3_put_be32(ram + out, fd);
+    if (s->ppu_trace) {
+        info_report("ps3-ppu: lv2: opendir %s -> fd %d", host, fd);
+    }
+    return 0;
+}
+
+static int32_t ps3_lv2_fs_readdir(PS3BootROMState *s, uint8_t *ram,
+                                  uint64_t ram_size, uint32_t guest,
+                                  uint32_t dirent, uint32_t nread)
+{
+    char name[256];
+    GStatBuf st;
+    bool is_dir = false, have_st = false;
+    int i = 0;
+
+    if (!ps3_lv2_dir_host(s, guest, &i)) {
+        return PS3_LV2_EBADF;
+    }
+    if (!dirent || (uint64_t)dirent + PS3_FS_DIRENT_SIZE > ram_size ||
+        !nread || (uint64_t)nread + 8 > ram_size) {
+        return PS3_LV2_EFAULT;
+    }
+
+    if (ps3_lv2_dir_entry(s, i, name, sizeof(name), &is_dir, &st, &have_st)) {
+        ps3_lv2_dirent(ram + dirent, name, is_dir);
+        ps3_put_be64(ram + nread, PS3_FS_DIRENT_SIZE);
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: readdir fd %u -> %s%s", guest, name,
+                        is_dir ? "/" : "");
+        }
+    } else {
+        /* The end of a listing is an empty entry, not an error. */
+        memset(ram + dirent, 0, PS3_FS_DIRENT_SIZE);
+        ps3_put_be64(ram + nread, 0);
+    }
+
+    return 0;
+}
+
+static int32_t ps3_lv2_fs_closedir(PS3BootROMState *s, uint32_t guest)
+{
+    int i = 0;
+
+    if (!ps3_lv2_dir_host(s, guest, &i)) {
+        return PS3_LV2_EBADF;
+    }
+
+    if (s->ppu_trace) {
+        info_report("ps3-ppu: lv2: closedir fd %u", guest);
+    }
+    g_dir_close(s->lv2_dir[i]);
+    g_free(s->lv2_dir_path[i]);
+    s->lv2_dir[i] = NULL;
+    s->lv2_dir_path[i] = NULL;
+    s->lv2_fd_open[i] = false;
+    return 0;
+}
+
+/* The sys_fs library exports the VSH's file layer imports by name. */
+#define PS3_NID_FS_OPENDIR       0x3F61245Cu
+#define PS3_NID_FS_READDIR       0x5C74903Du
+#define PS3_NID_FS_CLOSEDIR      0xFF42DCC3u
+#define PS3_NID_FS_GET_ENTRIES   0x9B882495u
+
+static bool ps3_lv2_fs_lib(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
+                           uint64_t ram_size, uint32_t nid, int32_t *ret)
+{
+    uint32_t a0 = env->gpr[3];
+    uint32_t a1 = env->gpr[4];
+    uint32_t a2 = env->gpr[5];
+    uint32_t a3 = env->gpr[6];
+
+    switch (nid) {
+    case PS3_NID_FS_OPENDIR:
+        *ret = ps3_lv2_fs_opendir(s, ram, ram_size, a0, a1);
+        return true;
+    case PS3_NID_FS_READDIR:
+        *ret = ps3_lv2_fs_readdir(s, ram, ram_size, a0, a1, a2);
+        return true;
+    case PS3_NID_FS_CLOSEDIR:
+        *ret = ps3_lv2_fs_closedir(s, a0);
+        return true;
+    case PS3_NID_FS_GET_ENTRIES: {
+        char name[256];
+        GStatBuf st;
+        bool is_dir = false, have_st = false;
+        uint32_t room, count = 0;
+        int i = 0;
+
+        if (!ps3_lv2_dir_host(s, a0, &i)) {
+            *ret = PS3_LV2_EBADF;
+            return true;
+        }
+        if (!a1 || !a3 || (uint64_t)a3 + 4 > ram_size ||
+            (uint64_t)a1 + a2 > ram_size) {
+            *ret = PS3_LV2_EFAULT;
+            return true;
+        }
+        room = a2 / PS3_FS_DIRENTRY_SIZE;
+        while (count < room &&
+               ps3_lv2_dir_entry(s, i, name, sizeof(name), &is_dir, &st,
+                                 &have_st)) {
+            uint8_t *at = ram + a1 + (uint64_t)count * PS3_FS_DIRENTRY_SIZE;
+
+            if (have_st) {
+                ps3_lv2_stat(at, is_dir, st.st_atime, st.st_mtime,
+                             st.st_ctime, st.st_size);
+            } else {
+                ps3_lv2_stat(at, is_dir, 0, 0, 0, 0);
+            }
+            ps3_lv2_dirent(at + 0x34, name, is_dir);
+            count++;
+        }
+        ps3_put_be32(ram + a3, count);
+        *ret = 0;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 
 /*
  * The lv2 services vsh-run answers, in the order the VSH asks for them.
@@ -8308,6 +9145,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         if (ps3_lv2_mic(s, &cpu->env, ram, ram_size, nid, &ret)) {
             break;
         }
+        /* The directory side of sys_fs, which the VSH's file layer imports. */
+        if (ps3_lv2_fs_lib(s, &cpu->env, ram, ram_size, nid, &ret)) {
+            break;
+        }
+        /* sysPrxForUser's miscellany: printf and the light-weight waits. */
+        if (ps3_lv2_prx_user(s, &cpu->env, ram, ram_size, nid, &ret)) {
+            break;
+        }
 
         /*
          * A worker that calls a service the model does not have cannot be
@@ -9582,6 +10427,15 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     }
+    case 0x325:                 /* sys_fs_opendir(path, fd*) */
+        ret = ps3_lv2_fs_opendir(s, ram, ram_size, a0, a1);
+        break;
+    case 0x326:                 /* sys_fs_readdir(fd, dirent*, nread*) */
+        ret = ps3_lv2_fs_readdir(s, ram, ram_size, a0, a1, a2);
+        break;
+    case 0x327:                 /* sys_fs_closedir(fd) */
+        ret = ps3_lv2_fs_closedir(s, a0);
+        break;
     case 0x328: {               /* sys_fs_stat(path, stat*) */
         g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
         GStatBuf st;

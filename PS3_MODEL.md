@@ -1164,6 +1164,83 @@ With both fixed the run reaches `tick 688` instead of `tick 30`: the `x3`
 workers park in `sys_cond_wait` instead of failing it, the media threads start,
 and the console is past `Registry initialization ... done`.
 
+### The miscellany the VSH's libc and file layer need
+
+Three families of calls sat in `sysPrxForUser` and `sys_fs` with no answer,
+and the model returned `-1` for each of them.  None of them is a kernel
+service, but all three are on the VSH's own startup path.
+
+**`_sys_printf` (0x9F04F7AF) is the console's debug output.**  The VSH called
+it from `0x14EE5B8` and `0x14C4594` and got `-1`, so everything it was trying
+to say was lost - which is why a run could only be read through the model's
+registers rather than the guest's words.  The whole family is implemented
+now (`_sys_printf`, `_sys_snprintf`, `_sys_sprintf`, `_sys_vprintf`,
+`_sys_vsnprintf`, `_sys_vsprintf`), with the conversions a debug print uses:
+`%d %i %u %o %x %X %c %s %ls %p %f %e %g`, the flags, `*` or numeric width,
+precision and the `h`/`hh`/`l`/`ll`/`z`/`j`/`t` length modifiers.
+
+The arguments are read over the guest's own calling convention: the first
+eight integers are in `r3..r10`, the ninth and later in the caller's
+parameter area at `0x20(r1)`, and doubles take `f1..f13` (the low half of
+`vsr[0..31]` in this CPU state).  A `va_list` is the ELFv1 `__va_list_tag`:
+the byte offset of the next integer argument into the register save area,
+the same for the float area, then the parameter area and the save area
+itself, and each argument advances the offset it came from.
+
+The text goes through `ps3_uart_putc`, the same character path `sys_tty_write`
+feeds, so it lands in the log as `ps3-ppu console: ...` and on the display's
+console at the same time.  With that in place the VSH says what it is doing:
+
+```
+ps3-ppu console: InitializeMediaEjectTrackerCollection failed: 80031252
+ps3-ppu console: Registry initialization start:............ done
+```
+
+Both lines are `%s` plus a `%x`-family value, and the second is the first
+time the run's own idea of its state could be read at all.
+
+**The light-weight mutex and condition** (`sys_lwmutex_create/lock/unlock/`
+`trylock/destroy`, `sys_lwcond_create/wait/signal/signal_all/signal_to/`
+`destroy`) are the primitives lv2 builds the heavier objects from, and
+`libfs_utility2` imports them.  The scheduler runs one guest thread at a
+time, so no thread can hold one against another: a lock is always granted, a
+wait is a wake-up that has already happened, and the ids are kept so the
+callers' bookkeeping stays consistent.
+
+**Directories** are the third: `cellFsOpendir` (0x3F61245C) is the first
+thing `libfs_utility2`'s start routine asks for, and returning `-1` there
+left its initialiser with an unmapped directory.  `cellFsOpendir`,
+`cellFsReaddir`, `cellFsClosedir` and `cellFsGetDirectoryEntries` are
+answered, as are the `sys_fs_opendir`/`readdir`/`closedir` syscalls
+(`0x325..0x327`) they sit on.  A console listing starts with `.` and `..`,
+which a host directory does not carry, so those two are synthesised; the
+entry itself is a `CellFsDirent` (`d_type`, `d_namlen`, `d_name[256]`, 0x102
+bytes) and the packed form is a `CellFsDirectoryEntry` (the 0x34-byte stat,
+then the name, 0x138 bytes), which is what the VSH's file layer walks.
+
+That turned up a path bug of its own: the VSH asks for `/dev_flash2` - the
+bare mount point, not a file under it - and the mapper only knew the
+`/dev_flash2/...` form, so the fallback mapped it to
+`dev_flash\dev_flash2` and the open failed with `0x80010006`.  `/dev_flash`,
+`/dev_flash2` and `/dev_flash3` are now roots in their own right, like
+`/dev_hdd0` already was:
+
+```
+lv2: opendir(/dev_flash2) -> C:/Users/Thewoodsman/Documents/rs3/dev_flash2
+lv2: opendir C:/Users/Thewoodsman/Documents/rs3/dev_flash2 -> fd 3
+lv2: closedir fd 3
+```
+
+What that run exercises end to end is `opendir` and `closedir` on a real
+host directory, with the handle coming back in the console's fd numbering and
+`libfs_utility2`'s start routine completing (`0x7FF` returns 0 instead of
+`0x80010006`).  `readdir` and `cellFsGetDirectoryEntries` are implemented but
+not yet exercised: the start routine only probes the mount point and closes
+it, and a listing is what the file browser asks for once the XMB is reached.
+With the three families in place a `vsh-run` reports **no unresolved imports
+at all**, and the run's remaining stop is the same one as before - the main
+thread returning through an LR that is no longer an address.
+
 ### Where that run stops now
 
 With the drive connected the boot goes much further: the BD enumerates,
