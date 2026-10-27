@@ -1370,8 +1370,23 @@ struct PS3BootROMState {
     bool hdd_created;
     char *erk_prop;                 /* the EID root key, hex */
     char *erk_file;                 /* or a 48-byte file */
+    char *pck1_prop;                /* the same key under the console's name */
+    char *pck1_file;
     uint8_t erk[48];                /* 32 bytes of key, 16 of IV */
     bool has_erk;
+    /*
+     * The ladder seeds, read out of the console's own loader rather than the
+     * model's table: lv1ldr carries the four static seeds (encdec and SB-indiv,
+     * data and tweak) and PCK1 is what makes the keys per-console.  A NOR
+     * console's loader and a NAND one's sit at different offsets in different
+     * media, so both images are accepted and both must carry the same block.
+     */
+    char *lv1ldr_file;              /* the NOR console's lv1ldr.self */
+    char *nand_loader_file;         /* the NAND console's loader, bank or dump */
+    uint8_t ladder_seeds[128];      /* four 32-byte seeds, canonical order */
+    bool has_ladder_seeds;
+    uint32_t ladder_off[2];         /* where each image carried the block */
+    const char *ladder_medium[2];
     char *pck2_prop;                /* per-console root key 2, hex */
     char *pck2_file;                /* or a 48-byte file */
     uint8_t pck2[48];
@@ -18761,6 +18776,44 @@ static bool ps3_emmc_write(PS3BootROMState *s, uint64_t sector, void *buf,
                       sectors * PS3_LV2_SECTOR, buf, 0) >= 0;
 }
 
+/*
+ * The ATA and flash ladders, from the loader's seeds when the caller supplied
+ * one and from the model's copy of the published constants otherwise.  Both
+ * are AES-256-CBC under PCK1, so a loader image only ever changes *where* the
+ * seeds come from, never the shape of the derivation.
+ */
+static void ps3_ata_keys_for(PS3BootROMState *s, uint8_t data_key[32],
+                             uint8_t tweak_key[32])
+{
+    if (s->has_ladder_seeds) {
+        ps3_ata_keys_seeds(s->erk, s->ladder_seeds, data_key, tweak_key);
+    } else {
+        ps3_ata_keys(s->erk, data_key, tweak_key);
+    }
+}
+
+static void ps3_encdec_keys_for(PS3BootROMState *s, uint8_t data_key[32],
+                                uint8_t tweak_key[32])
+{
+    if (s->has_ladder_seeds) {
+        ps3_encdec_keys_seeds(s->erk, s->ladder_seeds, data_key, tweak_key);
+    } else {
+        ps3_encdec_keys(s->erk, data_key, tweak_key);
+    }
+}
+
+static void ps3_hex(const uint8_t *in, size_t n, char *out)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        out[2 * i] = digits[in[i] >> 4];
+        out[2 * i + 1] = digits[in[i] & 15];
+    }
+    out[2 * n] = 0;
+}
+
 static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
 {
     Error *err = NULL;
@@ -18806,7 +18859,7 @@ static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
     }
 
     if (s->has_erk) {
-        ps3_encdec_keys(s->erk, s->emmc_data_key, s->emmc_tweak_key);
+        ps3_encdec_keys_for(s, s->emmc_data_key, s->emmc_tweak_key);
         s->emmc_keyed = true;
     }
 
@@ -18950,52 +19003,184 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
     return true;
 }
 
+/*
+ * Read the ladder seed block out of the console's own loader.
+ *
+ * A NOR console keeps its loader in the flash's ros bank as lv1ldr.self; a NAND
+ * or eMMC console keeps the same ladder in the loader its ros bank carries, and
+ * the two media put the block at different offsets - which is why the block is
+ * looked for by its content and the offset is reported rather than assumed.  A
+ * SELF is opened with PCK1 first (the loader's own root-header check); anything
+ * that is not a SELF (a carve, a bank, a whole dump) is scanned as it stands.
+ * When both media's images are given they must carry the same block, which is a
+ * cross-check on the reading rather than a requirement of the format.
+ */
+static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
+{
+    const struct { const char *path; const char *medium; } images[] = {
+        { s->lv1ldr_file, "NOR lv1ldr" },
+        { s->nand_loader_file, "NAND loader" },
+    };
+    unsigned given = 0;
+
+    if (!s->lv1ldr_file && !s->nand_loader_file) {
+        return true;
+    }
+
+    if (!s->has_erk) {
+        error_setg(errp, "ps3-boot-rom: %s is the loader the ladder seeds are "
+                   "read from and PCK1 is what keys it; give pck1/pck1-file "
+                   "(or erk/erk-file)", s->lv1ldr_file ? "lv1ldr" : "nand-loader");
+        return false;
+    }
+
+    for (unsigned i = 0; i < ARRAY_SIZE(images); i++) {
+        g_autofree gchar *buf = NULL;
+        GError *gerr = NULL;
+        gsize len = 0;
+        uint8_t seeds[128];
+        size_t off = 0;
+        char key_hex[97], iv_hex[33], why[160], why2[160];
+        const char *opened_by = NULL;
+
+        if (!images[i].path) {
+            continue;
+        }
+
+        if (!g_file_get_contents(images[i].path, &buf, &len, &gerr)) {
+            error_setg(errp, "ps3-boot-rom: cannot read %s: %s",
+                       images[i].path, gerr->message);
+            g_error_free(gerr);
+            return false;
+        }
+        if (len < 0x200) {
+            error_setg(errp, "ps3-boot-rom: %s is %u byte(s), too short to be "
+                       "a loader", images[i].path, (unsigned)len);
+            return false;
+        }
+
+        if (!memcmp(buf, "SCE\0", 4)) {
+            uint8_t *img = (uint8_t *)buf;
+
+            /* PCK1 first: that is the console's own copy of the loader. */
+            ps3_hex(s->erk, 32, key_hex);
+            ps3_hex(s->erk + 32, 16, iv_hex);
+            if (ps3_self_decrypt_key(img, len, key_hex, iv_hex, why,
+                                     sizeof(why))) {
+                opened_by = "PCK1";
+            } else if (ps3_self_decrypt(img, len, why2, sizeof(why2))) {
+                /*
+                 * A retail image out of a update package is sealed with the
+                 * loader's published keyset instead, and its own seed block is
+                 * the same four constants.  Say which key opened it rather
+                 * than calling a package copy the console's.
+                 */
+                opened_by = "the loader keyset (a retail image, not PCK1)";
+            } else {
+                error_setg(errp, "ps3-boot-rom: %s: neither PCK1 nor the "
+                           "loader keysets opened it (%s / %s)",
+                           images[i].path, why, why2);
+                return false;
+            }
+        } else {
+            opened_by = "nothing - the image is not a SELF";
+            info_report("ps3-boot-rom: %s is not a SELF; scanning it as it "
+                        "stands", images[i].path);
+        }
+
+        if (!ps3_ladder_seeds((const uint8_t *)buf, len, seeds, &off, why,
+                              sizeof(why))) {
+            error_setg(errp, "ps3-boot-rom: %s: %s", images[i].path, why);
+            return false;
+        }
+
+        if (s->has_ladder_seeds && memcmp(seeds, s->ladder_seeds, 128)) {
+            error_setg(errp, "ps3-boot-rom: %s and %s carry different ladder "
+                       "seeds; one of them is not this console's loader",
+                       images[0].path, images[1].path);
+            return false;
+        }
+
+        memcpy(s->ladder_seeds, seeds, sizeof(seeds));
+        s->has_ladder_seeds = true;
+        s->ladder_off[i] = (uint32_t)off;
+        s->ladder_medium[i] = images[i].medium;
+        given++;
+
+        info_report("ps3-boot-rom: %s: %s: ladder seed block at 0x%X - the "
+                    "ATA and flash ladders run on the console's own seeds",
+                    images[i].medium, opened_by, (unsigned)off);
+    }
+
+    if (given > 1) {
+        info_report("ps3-boot-rom: the NOR and NAND loaders carry the same "
+                    "four seeds (0x%X and 0x%X); the model's own table agrees",
+                    s->ladder_off[0], s->ladder_off[1]);
+    }
+
+    return true;
+}
+
 static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
 {
     Error *err = NULL;
     uint8_t sector[PS3_LV2_SECTOR], plain[PS3_LV2_SECTOR];
     QDict *opts;
     int fd;
+    const char *erk_hex = s->erk_prop ?: s->pck1_prop;
+    const char *erk_path = s->erk_file ?: s->pck1_file;
 
-    if (s->erk_prop) {
+    if (erk_hex && erk_path) {
+        error_setg(errp, "ps3-boot-rom: give the EID root key as hex (erk/pck1) "
+                   "or as a file (erk-file/pck1-file), not both");
+        return false;
+    }
+
+    if (erk_hex) {
         size_t len = 0;
 
-        if (!ps3_stage_parse_hex(s->erk_prop, s->erk, sizeof(s->erk),
+        if (!ps3_stage_parse_hex(erk_hex, s->erk, sizeof(s->erk),
                                  &len) || len != sizeof(s->erk)) {
-            error_setg(errp, "ps3-boot-rom: erk must be 96 hex digits (48 "
-                       "bytes: the EID root key, PCK1)");
+            error_setg(errp, "ps3-boot-rom: erk/pck1 must be 96 hex digits (48 "
+                       "bytes: the EID root key 1, PCK1)");
             return false;
         }
         s->has_erk = true;
-    } else if (s->erk_file) {
+    } else if (erk_path) {
         g_autofree gchar *buf = NULL;
         GError *gerr = NULL;
         gsize len = 0;
 
-        if (!g_file_get_contents(s->erk_file, &buf, &len, &gerr)) {
-            error_setg(errp, "ps3-boot-rom: cannot read %s: %s", s->erk_file,
+        if (!g_file_get_contents(erk_path, &buf, &len, &gerr)) {
+            error_setg(errp, "ps3-boot-rom: cannot read %s: %s", erk_path,
                        gerr->message);
             g_error_free(gerr);
             return false;
         }
         if (len != sizeof(s->erk)) {
             error_setg(errp, "ps3-boot-rom: %s is %u byte(s), the EID root "
-                       "key is 48", s->erk_file, (unsigned)len);
+                       "key is 48", erk_path, (unsigned)len);
             return false;
         }
         memcpy(s->erk, buf, sizeof(s->erk));
         s->has_erk = true;
     }
 
+    if (!ps3_ladder_seeds_setup(s, errp)) {
+        return false;
+    }
+
     if (s->has_erk) {
-        ps3_ata_keys(s->erk, s->hdd_data_key, s->hdd_tweak_key);
+        ps3_ata_keys_for(s, s->hdd_data_key, s->hdd_tweak_key);
         s->hdd_keyed = true;
     }
 
     if (!s->hdd_file) {
         if (s->has_erk) {
-            info_report("ps3-boot-rom: EID root key (PCK1) read; ATA data "
-                        "and tweak keys derived, no HDD image to key");
+            info_report("ps3-boot-rom: EID root key 1 (PCK1) read; ATA data "
+                        "and tweak keys derived %s, no HDD image to key",
+                        s->has_ladder_seeds ? "from the loader's own seeds"
+                                            : "from the published seeds");
         }
         return true;
     }
@@ -19069,7 +19254,7 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
         memcpy(s->hdd_data_key, plain + 0x08, 32);
         memcpy(s->hdd_tweak_key, plain + 0x28, 32);
 
-        ps3_ata_keys(s->erk, derived_data, derived_tweak);
+        ps3_ata_keys_for(s, derived_data, derived_tweak);
         same = !memcmp(derived_data, s->hdd_data_key, 32) &&
                !memcmp(derived_tweak, s->hdd_tweak_key, 32);
 
@@ -21607,6 +21792,16 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("hdd-size", PS3BootROMState, hdd_size, 20 * GiB),
     DEFINE_PROP_STRING("erk", PS3BootROMState, erk_prop),
     DEFINE_PROP_STRING("erk-file", PS3BootROMState, erk_file),
+    /* PCK1 is the console's name for the same key; either spelling works. */
+    DEFINE_PROP_STRING("pck1", PS3BootROMState, pck1_prop),
+    DEFINE_PROP_STRING("pck1-file", PS3BootROMState, pck1_file),
+    /*
+     * The loader whose own seed block keys the storage ladder: a NOR console's
+     * lv1ldr.self, a NAND/eMMC console's loader (or the bank/dump that carries
+     * it).  Both are accepted at once and must agree.
+     */
+    DEFINE_PROP_STRING("lv1ldr", PS3BootROMState, lv1ldr_file),
+    DEFINE_PROP_STRING("nand-loader", PS3BootROMState, nand_loader_file),
     DEFINE_PROP_STRING("pck2", PS3BootROMState, pck2_prop),
     DEFINE_PROP_STRING("pck2-file", PS3BootROMState, pck2_file),
     DEFINE_PROP_BOOL("vsh-run", PS3BootROMState, vsh_run, false),

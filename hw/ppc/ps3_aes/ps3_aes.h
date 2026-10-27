@@ -50,6 +50,29 @@ void ps3_ata_keys(const uint8_t erk[48], uint8_t data_key[32],
                   uint8_t tweak_key[32]);
 
 /*
+ * The same ladder over a 0x80-byte seed block the caller supplies, which is how
+ * the loader runs it: lv1ldr carries the four seeds and feeds them through PCK1.
+ * A block read out of the console's own lv1ldr therefore keys the disk from the
+ * console's own image, with nothing baked into the model.  The block is in
+ * `ps3_ladder_seeds' order, whatever order it was found in.
+ */
+void ps3_ata_keys_seeds(const uint8_t erk[48], const uint8_t seeds[128],
+                        uint8_t data_key[32], uint8_t tweak_key[32]);
+void ps3_encdec_keys_seeds(const uint8_t erk[48], const uint8_t seeds[128],
+                           uint8_t data_key[32], uint8_t tweak_key[32]);
+
+/*
+ * Find the loader's ladder seed block in an image and hand it back in the
+ * canonical order (encdec data, SB indiv data, encdec tweak, SB indiv tweak).
+ * The four seeds are published constants, so a match is a real identification
+ * of the block rather than a guess about a position: `off' receives where it
+ * was, which is how a revision that moves it is noticed instead of assumed.
+ * Returns false when the image has no such block.
+ */
+bool ps3_ladder_seeds(const uint8_t *img, size_t len, uint8_t seeds[128],
+                      size_t *off, char *why, size_t why_len);
+
+/*
  * The flash keys: the "encdec" half of the same ladder, which is what the
  * console encrypts its eMMC sectors with.  A superslim keeps its firmware on
  * eMMC instead of the NOR, so PCK1 has to yield these as well as the ATA pair.

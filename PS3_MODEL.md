@@ -88,21 +88,40 @@ order:
    and **PCK1 is inside it**.  PCK1 is the per-console root: it is what the ATA
    and flash ladders are run on, and what the HDD image's key sector is wrapped
    under.
-2. **PCK1 opens `lv1ldr.self`**, and **the EID root key (with its RIV) is inside
-   it**.  That pair is what opens the application SELFs (`vsh.self` and the
-   rest), so it is the key the SELF opener works from, not the container key.
+2. **PCK1 opens the loader** - `lv1ldr.self` on a NOR console, the loader its ros
+   bank carries on a NAND/eMMC one - and what comes out of it is the ladder:
+   **the EID root key (with its RIV) and the four static seeds** (SB-indiv data
+   and tweak, encdec data and tweak) that PCK1 is run on for the ATA and flash
+   keys.  The same ERK/RIV pair is what opens the application SELFs
+   (`vsh.self` and the rest), so it is the key the SELF opener works from, not
+   the container key.
 
 So a NOR/NAND/eMMC dump carries the container and, inside it, that console's
 PCK1, and the next stage's SELF carries the EID root key - but never ch66
 itself, which belongs to the ROM.
 
+The loader's seed block sits at a different offset on each medium, and it is
+found by its content rather than assumed (the four seeds are published
+constants, so a match identifies the block):
+
+| Medium | Where | Offset seen |
+| --- | --- | --- |
+| NOR | `lv1ldr.self` in the ros bank | 0x1BB20 in the 4.93 image (0x1B5A0 in its ELF carve; the ATA seed is cited at 0x1D1E0 for some 4.xx revisions) |
+| NAND/eMMC | the loader the ros1 standby bank (0xC0000, records at 0x40480 / 0x100490, `lv0` extent 0x1E948) carries | 0x2E0A0 in a decrypted stage carve |
+
+A revision that moves it is reported at its own offset, and when both media's
+loaders are given they must carry the same four seeds - that is a cross-check
+on the reading, not a requirement of the format.
+
 The model follows the same order: `readout` / `readout-file` supplies the 32
 channel-66 bytes exactly as the ROM reads them (K_lo, then K_hi) and is what
-opens and verifies the container; `erk` / `erk-file` supplies the EID root key
-and RIV read out of `lv1ldr.self` (that is what `ps3_self.c` opens SELFs with,
-and it is the same value the ATA/flash ladders and an HDD image's key sector
-are built from).  No per-console key is ever written to a log, only
-fingerprints.
+opens and verifies the container; `pck1` / `pck1-file` (or the older
+`erk` / `erk-file`, the same 48 bytes under the other name) supplies PCK1, which
+is what `ps3_self.c` opens the loaders and application SELFs with and what the
+ATA/flash ladders and an HDD image's key sector are built from; `lv1ldr` and
+`nand-loader` supply the console's own loader images, whose seed block is read
+out and used for those ladders instead of the model's copy of the constants.
+No per-console key is ever written to a log, only fingerprints.
 
 ## Files
 
@@ -334,7 +353,9 @@ audiodev feed `sys_mic`'s rings.
 | Property | Default | Meaning |
 | --- | --- | --- |
 | `rom-file` / `drive` | - | set by `-bios` and `-drive if=pflash,...` |
-| `erk-file`, `readout-file` | - | the EID root key + RIV read out of `lv1ldr.self`, 48 raw bytes / the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi |
+| `erk-file`, `pck1-file`, `readout-file` | - | the EID root key + RIV read out of the loader (PCK1), 48 raw bytes / the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi |
+| `pck1`, `erk` | - | the same 48 bytes as hex (96 digits); `pck1` is the console's name for it |
+| `lv1ldr`, `nand-loader` | - | the console's loader image the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  A SELF is opened with PCK1 (the published loader keyset is accepted for a retail image, and says so); both are read and must agree |
 | `container` | `lv0ldr.2` | container to look for in the flash image |
 | `dev-flash`, `dev-flash2`, `dev-flash3` | - | firmware trees unpacked from the flash's ROS, as an alternative to an image |
 | `hdd-file`, `hdd-size` | - / 20G | raw disk image, and the size the model gives a fresh one (1 TB max) |
@@ -357,6 +378,7 @@ window's pixels can be inspected without a display.
 | --- | --- | --- |
 | device selftest + mask ROM replay | any run with `-bios` | `selftest passed (AES-128 KAT, sealed container round trip, mask ROM replayed by the SPU interpreter)` |
 | container opener | `-drive if=pflash,...` with the readout | `container verified, 191152 bytes of payload` |
+| ladder seeds from the console's own loader | `-global ps3-boot-rom.pck1=... -global ps3-boot-rom.lv1ldr=lv1ldr.self` (optionally `-global ps3-boot-rom.nand-loader=...` too) | `NOR lv1ldr: ...: ladder seed block at 0x1BB20 - the ATA and flash ladders run on the console's own seeds`, and `the NOR and NAND loaders carry the same four seeds` when both are given.  A loader with no block (or a mismatched pair) stops the run with the reason |
 | a loader stage | `-global ps3-boot-rom.stage-elf=lv2ldr.self` | exit 0, `stop 48 at ...` (the loaders' signal) |
 | lv0 and above | `-global ps3-boot-rom.ppu-elf=lv0.self` | exit 0 at the next hand-off |
 | vsh.self | `-global ps3-boot-rom.vsh-run=on` | `ps3-vsh: ... entry=0x6D5AC8 ... PPU entering it`, then `sys_prx_load_module` and the module set |
@@ -386,6 +408,15 @@ $LD -Ttext=0x02000000 -e _start -o .tmp/sys_audio_test.elf .tmp/sys_audio_test.o
 `scripts/PS3_TOOLS.md` is the index for those four: inputs, outputs, workflows
 and what each one refuses to do.  No key is ever printed: the tools report
 fingerprints only.
+
+The key chain itself has a tool on the ps3tools side, `chain_keys.py`, next to
+`bootldrdec.py` and `find_erk.py`:
+
+| Invocation | What it does |
+| --- | --- |
+| `chain_keys.py --flash dump.bin --readout ch66.bin --scan-lv0 --eid0 eEID.bin` | open the container, read PCK1 out of it (accepted only when it authenticates the EID0's CMAC) |
+| `chain_keys.py --pck1 <96 hex> --lv1ldr lv1ldr.self --nand-loader nand.bin --qemu` | open both loaders, report the seed block's offset against the NOR and NAND reference offsets, derive the ATA and encdec keys, and print the `-global` lines this model takes |
+| `chain_keys.py --selftest` | seal a container and a loader, then prove each rung on them: tag, root-header check, seed discovery at both media's offsets, the ladder against a second implementation, and the EID0 check |
 
 ## Status
 

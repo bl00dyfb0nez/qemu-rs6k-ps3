@@ -193,57 +193,112 @@ void ps3_aes_cbc256_decrypt(const uint8_t key[32], const uint8_t iv[16],
 }
 
 /*
- * The two static seeds from ps3_decrypt_tools' kgen.c: the "SB indiv" blocks
- * at 0x00 and 0x20.  Every console derives its ATA keys from these same
- * constants, so a PCK1 is enough to re-derive them after any reformat.
+ * The four seeds in the order `ps3_ladder_seeds' hands them back, which is also
+ * the order lv1ldr carries them: encdec data, SB indiv data, encdec tweak, SB
+ * indiv tweak.  This is the model's copy, used when no loader image is given.
  */
-static const uint8_t ps3_ata_seed_data[32] = {
+static const uint8_t ps3_ladder_default[128] = {
+    /* encdec data (ks_1) */
+    0xE2, 0xD0, 0x5D, 0x40, 0x71, 0x94, 0x5B, 0x01,
+    0xC3, 0x6D, 0x51, 0x51, 0xE8, 0x8C, 0xB8, 0x33,
+    0x4A, 0xAA, 0x29, 0x80, 0x81, 0xD8, 0xC4, 0x4F,
+    0x18, 0x5D, 0xC6, 0x60, 0xED, 0x57, 0x56, 0x86,
+    /* SB indiv data (ATA data) */
     0xD9, 0x2D, 0x65, 0xDB, 0x05, 0x7D, 0x49, 0xE1,
     0xA6, 0x6F, 0x22, 0x74, 0xB8, 0xBA, 0xC5, 0x08,
     0x83, 0x84, 0x4E, 0xD7, 0x56, 0xCA, 0x79, 0x51,
     0x63, 0x62, 0xEA, 0x8A, 0xDA, 0xC6, 0x03, 0x26,
-};
-
-static const uint8_t ps3_ata_seed_tweak[32] = {
+    /* encdec tweak (ks_3) */
+    0x02, 0x08, 0x32, 0x92, 0xC3, 0x05, 0xD5, 0x38,
+    0xBC, 0x50, 0xE6, 0x99, 0x71, 0x0C, 0x0A, 0x3E,
+    0x55, 0xF5, 0x1C, 0xBA, 0xA5, 0x35, 0xA3, 0x80,
+    0x30, 0xB6, 0x7F, 0x79, 0xC9, 0x05, 0xBD, 0xA3,
+    /* SB indiv tweak (ATA tweak) */
     0xC3, 0xB3, 0xB5, 0xAA, 0xCC, 0x74, 0xCD, 0x6A,
     0x48, 0xEF, 0xAB, 0xF4, 0x4D, 0xCD, 0xF1, 0x6E,
     0x37, 0x9F, 0x55, 0xF5, 0x77, 0x7D, 0x09, 0xFB,
     0xEE, 0xDE, 0x07, 0x05, 0x8E, 0x94, 0xBE, 0x08,
 };
 
+/*
+ * The two layouts the loaders are seen to carry: the four blocks back to back,
+ * the ATA pair and the encdec pair in one order or the other.  A block is
+ * recognised by its *content*, so no offset is assumed anywhere.
+ */
+static void ps3_ladder_views(const uint8_t *seeds[2][4])
+{
+    seeds[0][0] = ps3_ladder_default + 0x00;      /* encdec data  */
+    seeds[0][1] = ps3_ladder_default + 0x20;      /* sb indiv data*/
+    seeds[0][2] = ps3_ladder_default + 0x40;      /* encdec tweak */
+    seeds[0][3] = ps3_ladder_default + 0x60;      /* sb indiv tweak*/
+    seeds[1][0] = ps3_ladder_default + 0x20;      /* the other interleave */
+    seeds[1][1] = ps3_ladder_default + 0x00;
+    seeds[1][2] = ps3_ladder_default + 0x60;
+    seeds[1][3] = ps3_ladder_default + 0x40;
+}
+
+bool ps3_ladder_seeds(const uint8_t *img, size_t len, uint8_t seeds[128],
+                      size_t *off, char *why, size_t why_len)
+{
+    const uint8_t *views[2][4];
+    size_t i;
+
+    ps3_ladder_views(views);
+
+    if (len < 128) {
+        snprintf(why, why_len, "the image is shorter than one seed block");
+        return false;
+    }
+
+    for (i = 0; i + 128 <= len; i += 4) {
+        unsigned l;
+
+        for (l = 0; l < 2; l++) {
+            if (!memcmp(img + i, views[l][0], 32) &&
+                !memcmp(img + i + 0x20, views[l][1], 32) &&
+                !memcmp(img + i + 0x40, views[l][2], 32) &&
+                !memcmp(img + i + 0x60, views[l][3], 32)) {
+                memcpy(seeds + 0x00, views[l][0], 32);
+                memcpy(seeds + 0x20, views[l][1], 32);
+                memcpy(seeds + 0x40, views[l][2], 32);
+                memcpy(seeds + 0x60, views[l][3], 32);
+                if (off) {
+                    *off = i;
+                }
+                return true;
+            }
+        }
+    }
+
+    snprintf(why, why_len, "no ladder seed block (the four published encdec / "
+             "SB-indiv seeds) anywhere in the image");
+    return false;
+}
+
+void ps3_ata_keys_seeds(const uint8_t erk[48], const uint8_t seeds[128],
+                        uint8_t data_key[32], uint8_t tweak_key[32])
+{
+    ps3_aes_cbc256_encrypt(erk, erk + 32, seeds + 0x20, data_key, 32);
+    ps3_aes_cbc256_encrypt(erk, erk + 32, seeds + 0x60, tweak_key, 32);
+}
+
+void ps3_encdec_keys_seeds(const uint8_t erk[48], const uint8_t seeds[128],
+                           uint8_t data_key[32], uint8_t tweak_key[32])
+{
+    ps3_aes_cbc256_encrypt(erk, erk + 32, seeds + 0x00, data_key, 32);
+    ps3_aes_cbc256_encrypt(erk, erk + 32, seeds + 0x40, tweak_key, 32);
+}
+
 void ps3_ata_keys(const uint8_t erk[48], uint8_t data_key[32],
                   uint8_t tweak_key[32])
 {
-    ps3_aes_cbc256_encrypt(erk, erk + 32, ps3_ata_seed_data, data_key, 32);
-    ps3_aes_cbc256_encrypt(erk, erk + 32, ps3_ata_seed_tweak, tweak_key, 32);
+    ps3_ata_keys_seeds(erk, ps3_ladder_default, data_key, tweak_key);
 }
-
-/*
- * The flash side of the same ladder: ps3_decrypt_tools' "encdec" seeds
- * (kgen.c, 0x00 and 0x20).  A superslim's firmware lives on eMMC, and the
- * console encrypts those sectors with these keys rather than the ATA ones, so
- * PCK1 alone can read the flash as well as the disk.
- */
-static const uint8_t ps3_encdec_seed_data[32] = {
-    0xE2, 0xD0, 0x5D, 0x40, 0x71, 0x94, 0x5B, 0x01,
-    0xC3, 0x6D, 0x51, 0x51, 0xE8, 0x8C, 0xB8, 0x33,
-    0x4A, 0xAA, 0x29, 0x80, 0x81, 0xD8, 0xC4, 0x4F,
-    0x18, 0x5D, 0xC6, 0x60, 0xED, 0x57, 0x56, 0x86,
-};
-
-static const uint8_t ps3_encdec_seed_tweak[32] = {
-    0x02, 0x08, 0x32, 0x92, 0xC3, 0x05, 0xD5, 0x38,
-    0xBC, 0x50, 0xE6, 0x99, 0x71, 0x0C, 0x0A, 0x3E,
-    0x55, 0xF5, 0x1C, 0xBA, 0xA5, 0x35, 0xA3, 0x80,
-    0x30, 0xB6, 0x7F, 0x79, 0xC9, 0x05, 0xBD, 0xA3,
-};
 
 void ps3_encdec_keys(const uint8_t erk[48], uint8_t data_key[32],
                      uint8_t tweak_key[32])
 {
-    ps3_aes_cbc256_encrypt(erk, erk + 32, ps3_encdec_seed_data, data_key, 32);
-    ps3_aes_cbc256_encrypt(erk, erk + 32, ps3_encdec_seed_tweak, tweak_key,
-                           32);
+    ps3_encdec_keys_seeds(erk, ps3_ladder_default, data_key, tweak_key);
 }
 
 /*
@@ -361,6 +416,40 @@ bool ps3_aes_selftest(char *why, size_t why_len)
     if (memcmp(got, plain, sizeof(got))) {
         snprintf(why, why_len, "XTS decrypt does not return the plaintext");
         return false;
+    }
+
+    /*
+     * The loader-driven ladder: a block found in an image must derive exactly
+     * the keys the model's own copy of the seeds derives, and an image without
+     * the published seeds must not produce a block at all.  This is what keeps
+     * `lv1ldr' honest - it can only ever supply the console's own seeds.
+     */
+    {
+        uint8_t image[512], seeds[128], got_data[32], got_tweak[32];
+        size_t off = 0;
+        char sub[160];
+
+        memset(image, 0x11, sizeof(image));
+        memcpy(image + 200, ps3_ladder_default, sizeof(seeds));
+        if (!ps3_ladder_seeds(image, sizeof(image), seeds, &off, sub,
+                              sizeof(sub)) || off != 200 ||
+            memcmp(seeds, ps3_ladder_default, sizeof(seeds))) {
+            snprintf(why, why_len, "the seed block was not found where it was "
+                     "planted (%s)", sub);
+            return false;
+        }
+        ps3_ata_keys_seeds(erk, seeds, got_data, got_tweak);
+        if (memcmp(got_data, data_key, 32) || memcmp(got_tweak, tweak_key, 32)) {
+            snprintf(why, why_len, "the block's ATA keys differ from the "
+                     "published seeds'");
+            return false;
+        }
+        image[200 + 0x20] ^= 0x01;      /* one seed byte off: not a block */
+        if (ps3_ladder_seeds(image, sizeof(image), seeds, &off, sub,
+                             sizeof(sub))) {
+            snprintf(why, why_len, "a corrupted seed block was accepted");
+            return false;
+        }
     }
 
     /* The eMMC path: the encdec ladder, then one whole sector each way. */
