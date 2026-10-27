@@ -71,6 +71,15 @@ bool ps3_self_decrypt_erk(uint8_t *img, size_t len, const char *erk_hex,
                           bool *from_table, char *why, size_t why_len);
 
 /*
+ * The .2 route to the same key: unwrap the wrapped ERK the loader carries with
+ * the console's PCK2, confirmed by opening the loader with it.  Hands back the
+ * unwrapped 48 bytes and, when `off_out` is given, where the wrapped value was.
+ */
+bool ps3_self_unwrap_erk_in_image(uint8_t *img, size_t len, const uint8_t pck2[48],
+                                  uint8_t erk_out[48], size_t *off_out,
+                                  char *why, size_t why_len);
+
+/*
  * Decrypt `img`, then place its segments into `ls` at their link addresses and
  * return the entry point.  Segments with no file data are zero-filled, which is
  * what the loader does for .bss.  Returns 0 on success, 1 when no keyset opened

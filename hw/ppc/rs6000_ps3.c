@@ -1375,6 +1375,7 @@ struct PS3BootROMState {
     uint8_t erk[48];                /* 32 bytes of key, 16 of IV */
     bool has_erk;
     const char *erk_from;           /* where the ladder's ERK came from */
+    uint32_t erk_wrap_off;          /* a .2 loader: where the wrapped ERK sat */
     /*
      * The ladder seeds, read out of the console's own loader rather than the
      * model's table: lv1ldr carries the four static seeds (encdec and SB-indiv,
@@ -19059,7 +19060,7 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
         if (!memcmp(buf, "SCE\0", 4)) {
             uint8_t *img = (uint8_t *)buf;
             uint8_t erk48[48];
-            bool from_table = false;
+            bool from_table = false, adopted = false;
 
             /*
              * The key the console's own copy carries first (PCK1), because that
@@ -19077,12 +19078,40 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
                                       s->has_erk ? key_hex : NULL,
                                       s->has_erk ? iv_hex : NULL,
                                       erk48, &from_table, why, sizeof(why))) {
-                error_setg(errp, "ps3-boot-rom: %s: no keyset opened it (%s)",
-                           images[i].path, why);
-                return false;
+                /*
+                 * A .2 loader has no keyset that opens it directly: its ERK is
+                 * wrapped under the console's PCK2, so that is the only way in
+                 * - and the key it yields is the real per-console ERK, which is
+                 * exactly what the ladders want.
+                 */
+                uint8_t pck2[48];
+                size_t wrap_off = 0;
+
+                if (!s->has_pck2) {
+                    error_setg(errp, "ps3-boot-rom: %s: no keyset opened it "
+                               "(%s); a .2 loader needs the console's PCK2 "
+                               "(pck2/pck2-file)", images[i].path, why);
+                    return false;
+                }
+
+                memcpy(pck2, s->pck2, sizeof(pck2));
+                if (!ps3_self_unwrap_erk_in_image(img, len, pck2, erk48,
+                                                  &wrap_off, why, sizeof(why))) {
+                    error_setg(errp, "ps3-boot-rom: %s: %s", images[i].path,
+                               why);
+                    return false;
+                }
+
+                memcpy(s->erk, erk48, sizeof(s->erk));
+                s->has_erk = true;
+                s->erk_from = "the ERK the loader carries, unwrapped under PCK2";
+                s->erk_wrap_off = (uint32_t)wrap_off;
+                opened_by = "PCK2";
+                adopted = true;
+                info_report("ps3-boot-rom: %s: %s", images[i].path, why);
             }
 
-            if (!s->has_erk || !from_table) {
+            if (!adopted && (!s->has_erk || !from_table)) {
                 /* The loader's own ERK becomes the ladder's key. */
                 memcpy(s->erk, erk48, sizeof(s->erk));
                 s->has_erk = true;
@@ -19091,7 +19120,7 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
                 opened_by = from_table
                     ? "the loader keyset (a retail image, not PCK1)"
                     : "PCK1";
-            } else {
+            } else if (!adopted) {
                 /*
                  * A key was given and a retail image cannot carry it, so the
                  * image proves nothing about it: keep the caller's key and say
@@ -19135,6 +19164,51 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
         info_report("ps3-boot-rom: the NOR and NAND loaders carry the same "
                     "four seeds (0x%X and 0x%X); the model's own table agrees",
                     s->ladder_off[0], s->ladder_off[1]);
+    }
+
+    return true;
+}
+
+/*
+ * The console's per-console root key 2, as hex or as a 48-byte file.  Nothing
+ * needs it unless a .2 loader is opened, so it is optional; when it is given the
+ * .2 loader's wrapped ERK is what the ladders then run on.
+ */
+static bool ps3_pck2_setup(PS3BootROMState *s, Error **errp)
+{
+    if (s->pck2_prop) {
+        size_t plen = 0;
+
+        if (!ps3_stage_parse_hex(s->pck2_prop, s->pck2, sizeof(s->pck2),
+                                 &plen) || plen != sizeof(s->pck2)) {
+            error_setg(errp, "ps3-boot-rom: pck2 must be 96 hex digits (48 "
+                       "bytes: the per-console root key 2)");
+            return false;
+        }
+        s->has_pck2 = true;
+    } else if (s->pck2_file) {
+        g_autofree gchar *kbuf = NULL;
+        GError *gerr = NULL;
+        gsize klen = 0;
+
+        if (!g_file_get_contents(s->pck2_file, &kbuf, &klen, &gerr)) {
+            error_setg(errp, "ps3-boot-rom: cannot read %s: %s",
+                       s->pck2_file, gerr->message);
+            g_error_free(gerr);
+            return false;
+        }
+        if (klen != sizeof(s->pck2)) {
+            error_setg(errp, "ps3-boot-rom: %s is %u byte(s), PCK2 is 48",
+                       s->pck2_file, (unsigned)klen);
+            return false;
+        }
+        memcpy(s->pck2, kbuf, sizeof(s->pck2));
+        s->has_pck2 = true;
+    }
+
+    if (s->has_pck2) {
+        info_report("ps3-boot-rom: per-console root key 2 (PCK2) read; the "
+                    ".2 loaders' ERK can be unwrapped");
     }
 
     return true;
@@ -19863,6 +19937,17 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
             return;
         }
     }
+    /*
+     * PCK2 is the console's per-console root key 2: it unwraps the ERK the .2
+     * loaders carry, which is what the following SELF stages then use.  It is
+     * read before the storage ladder because a .2 loader image is opened with
+     * it - the loader's own ERK is the ladder's key, and PCK2 is the only way to
+     * get at that without the console handing it over.  Like every other key
+     * here it comes from the caller's dump, never the model.
+     */
+    if (!ps3_pck2_setup(s, errp)) {
+        return;
+    }
     if (!ps3_hdd_setup(s, errp)) {
         return;
     }
@@ -19876,45 +19961,6 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    /*
-     * PCK2 is the console's per-console root key 2: it unwraps the ERK the .2
-     * loaders carry, which is what the following SELF stages then use.  Like
-     * every other key here it comes from the caller's dump, never the model.
-     */
-    if (s->pck2_prop) {
-        size_t plen = 0;
-
-        if (!ps3_stage_parse_hex(s->pck2_prop, s->pck2, sizeof(s->pck2),
-                                 &plen) || plen != sizeof(s->pck2)) {
-            error_setg(errp, "ps3-boot-rom: pck2 must be 96 hex digits (48 "
-                       "bytes: the per-console root key 2)");
-            return;
-        }
-        s->has_pck2 = true;
-    } else if (s->pck2_file) {
-        g_autofree gchar *kbuf = NULL;
-        GError *gerr = NULL;
-        gsize klen = 0;
-
-        if (!g_file_get_contents(s->pck2_file, &kbuf, &klen, &gerr)) {
-            error_setg(errp, "ps3-boot-rom: cannot read %s: %s",
-                       s->pck2_file, gerr->message);
-            g_error_free(gerr);
-            return;
-        }
-        if (klen != sizeof(s->pck2)) {
-            error_setg(errp, "ps3-boot-rom: %s is %u byte(s), PCK2 is 48",
-                       s->pck2_file, (unsigned)klen);
-            return;
-        }
-        memcpy(s->pck2, kbuf, sizeof(s->pck2));
-        s->has_pck2 = true;
-    }
-
-    if (s->has_pck2) {
-        info_report("ps3-boot-rom: per-console root key 2 (PCK2) read; the "
-                    ".2 loaders' ERK can be unwrapped");
-    }
     snprintf(s->led_text, sizeof(s->led_text), "green on");
     qemu_console_set_status_led(s->led_text);
     info_report("ps3-boot-rom: front LED: %s (pretend; the display puts it in "

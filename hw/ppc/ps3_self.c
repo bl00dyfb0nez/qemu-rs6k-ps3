@@ -604,6 +604,135 @@ void ps3_self_unwrap_erk(const uint8_t wrapped[32], const uint8_t pck2[48],
 }
 
 /*
+ * The first step self_decrypt_tables() takes - decrypt the root header at the
+ * metadata offset and require its two padding runs to be zero - but without
+ * opening the metadata or the sections.  A search over thousands of candidate
+ * keys has to be this cheap; whatever wins is then confirmed by the full open.
+ */
+static bool self_root_opens(const uint8_t *img, size_t len, const uint8_t key[32],
+                            const uint8_t iv[16])
+{
+    uint8_t root[0x40];
+    uint32_t meta_offset;
+    uint64_t header_len;
+
+    if (len < 0x200 || memcmp(img, "SCE\0", 4)) {
+        return false;
+    }
+
+    meta_offset = self_be32(img + 0x0C);
+    header_len  = self_be64(img + 0x10);
+
+    if (meta_offset < 0x20 || header_len <= meta_offset ||
+        header_len > len || meta_offset + 0xA0 > header_len) {
+        return false;
+    }
+
+    aes256_cbc_decrypt(key, iv, img + meta_offset + 0x20, root, sizeof(root));
+
+    return !memcmp(root + 0x10, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) &&
+           !memcmp(root + 0x30, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16);
+}
+
+/*
+ * How far into a loader a wrapped ERK is looked for.  A .2 loader keeps its key
+ * material in the header area and the tables that follow it, so the search does
+ * not have to walk a 20 MB payload - and saying the bound is part of saying what
+ * was searched when nothing turns up.
+ */
+#define PS3_ERK_WRAP_SCAN  0x10000
+
+/*
+ * A .2 loader does not carry its ERK in the clear: the value it was sealed with
+ * is stored wrapped under the console's per-console root key 2, the same
+ * AES-256-CBC shape the HDD key sector uses.  Unwrap every 16-byte aligned
+ * window with PCK2 and let the image itself say which one is the ERK - only the
+ * right 48 bytes pass the root header's padding check, and that is checked
+ * again by opening it for real before anything is handed back.
+ *
+ * The RIV that goes with the unwrapped key is not stored separately on every
+ * console, so three candidates are tried: the 16 bytes that follow the wrapped
+ * value (a 48-byte blob), the wrapper's own IV, and the .2 keysets' RIVs.
+ */
+bool ps3_self_unwrap_erk_in_image(uint8_t *img, size_t len, const uint8_t pck2[48],
+                                  uint8_t erk_out[48], size_t *off_out,
+                                  char *why, size_t why_len)
+{
+    size_t limit = MIN(len, (size_t)PS3_ERK_WRAP_SCAN);
+    uint8_t rivs[4][16];
+    unsigned count = ps3_self_key_count();
+    unsigned nr = 0;
+
+    if (len < 0x200 || memcmp(img, "SCE\0", 4)) {
+        snprintf(why, why_len, "not a SCE container");
+        return false;
+    }
+
+    memcpy(rivs[nr++], pck2 + 32, sizeof(rivs[0]));
+    for (unsigned k = count; k > 2 && nr < ARRAY_SIZE(rivs); ) {
+        k--;
+        if (hex_to_bytes(self_keys[k].riv, rivs[nr], sizeof(rivs[0]))) {
+            nr++;
+        }
+    }
+
+    for (size_t off = 0x40; off + 32 <= limit; off += 16) {
+        uint8_t key[32], iv[16], saved[0x40];
+        uint32_t meta_offset;
+        char sub[160];
+
+        ps3_self_unwrap_erk(img + off, pck2, key);
+
+        for (unsigned r = 0; r <= nr; r++) {
+            char erk_hex[65], riv_hex[33];
+            struct SelfKey probe;
+
+            if (r == 0) {                       /* a 48-byte wrapped blob */
+                if (off + 48 > len) {
+                    continue;
+                }
+                memcpy(iv, img + off + 32, sizeof(iv));
+            } else {
+                memcpy(iv, rivs[r - 1], sizeof(iv));
+            }
+
+            if (!self_root_opens(img, len, key, iv)) {
+                continue;
+            }
+
+            /* Confirm on the whole container, and undo the open's writes if it
+             * turns out to be more than a root-header match. */
+            meta_offset = self_be32(img + 0x0C);
+            memcpy(saved, img + meta_offset + 0x20, sizeof(saved));
+            bytes_to_hex(key, sizeof(key), erk_hex);
+            bytes_to_hex(iv, sizeof(iv), riv_hex);
+            probe.erk = erk_hex;
+            probe.riv = riv_hex;
+
+            if (!self_decrypt_tables(img, len, &probe, 1, sub, sizeof(sub))) {
+                memcpy(img + meta_offset + 0x20, saved, sizeof(saved));
+                continue;
+            }
+
+            memcpy(erk_out, key, sizeof(key));
+            memcpy(erk_out + 32, iv, sizeof(iv));
+            if (off_out) {
+                *off_out = off;
+            }
+            snprintf(why, why_len, "the value at 0x%X unwraps under PCK2 into "
+                     "the key this loader was sealed with (%s)",
+                     (unsigned)off, sub);
+            return true;
+        }
+    }
+
+    snprintf(why, why_len, "no 16-byte aligned window in the loader's first "
+             "0x%X bytes unwraps under PCK2 into the key it was sealed with",
+             (unsigned)PS3_ERK_WRAP_SCAN);
+    return false;
+}
+
+/*
  * Open `img` and hand back the ERK it was opened with - the 48 bytes (32 of key,
  * 16 of RIV) the SELF format calls erk and riv.  The caller's pair is tried
  * first, because that is the console's own; the loader table follows, which is
