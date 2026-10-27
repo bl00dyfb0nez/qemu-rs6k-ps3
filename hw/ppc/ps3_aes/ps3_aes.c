@@ -8,7 +8,7 @@
  * AES-128 is here because the SPU mask ROM's container opener is built around
  * it: the ROM expands the channel-66 half into a key, encrypts one block to
  * unwrap the container key, then runs CBC-MAC and CTR over the header.  The
- * AES-256 CBC and XTS below are the HDD side: metldr turns the console's EID
+ * AES-256 CBC and XTS below are the HDD side: lv1ldr turns the console's EID
  * root key into ATA data and tweak keys, and those encrypt every sector.
  */
 
@@ -152,7 +152,7 @@ void ps3_aes_ctr_block(const uint8_t rk[176], uint32_t counter,
 }
 
 /* ---------------------------------------------------------------------- */
-/* AES-256 CBC: the key ladder, and the ATA keys metldr derives from PCK1. */
+/* AES-256 CBC: the key ladder, and the ATA keys lv1ldr derives from PCK1. */
 
 void ps3_aes_cbc256_encrypt(const uint8_t key[32], const uint8_t iv[16],
                             const uint8_t *in, uint8_t *out, size_t len)

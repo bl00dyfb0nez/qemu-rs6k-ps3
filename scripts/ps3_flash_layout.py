@@ -4,10 +4,11 @@ PS3 flash image helper for the rs6000-ps3 model.
 
 A console's NOR/NAND is described in two independent ways, and the model needs
 both: the flash's own table of contents (which is what a dump carries and what
-the flash writer patches), and the fixed offsets the mask ROM uses before it
-has parsed anything (metldr at 0x840, bootldr at 0xFC0000).  This script owns
-those layouts in one place so an image can be inspected, carved and rebuilt
-without hand-copying offsets:
+the flash writer patches), and the fixed offsets the mask boot ROM uses before
+it has parsed anything (metldr at 0x840, and the container the ROM opens at
+0xFC0000, whose own name string is `lv0ldr.2`).  This script owns those layouts
+in one place so an image can be inspected, carved and rebuilt without
+hand-copying offsets:
 
     ps3_flash_layout.py list nor
     ps3_flash_layout.py dump  .tmp/bootchain_flash.bin
@@ -36,7 +37,7 @@ Layouts (all big-endian, from the flash section of the ps3tools notes):
   0x20-byte entries of u64 offset (relative to the header), u64 length, name.
   The first entry is `metldr`, whose own container follows at header+0x40.
 
-  a container (metldr, bootldr): u32 encrypted blocks at 0x00, 12-byte
+  a container (metldr.2, lv0ldr.2): u32 encrypted blocks at 0x00, 12-byte
   counter suffix at 0x04, u32 total blocks at 0x10, 12-byte nonce at 0x14,
   16-byte key-derivation input at 0x20, 16-byte masked tag at 0x30, body at
   0x40; the container's span is total * 16 + 0x40.
@@ -44,6 +45,23 @@ Layouts (all big-endian, from the flash section of the ps3tools notes):
 Nothing here carries a key or decrypts anything: sealing a stage back into its
 container is the loader's (or spu_rom/norbuild.py's) job, because the key is
 the console's, not this tree's.  Everything below is offsets and bounds checks.
+
+The channel-66 key is not part of any of this.  It belongs to the *mask boot
+ROM* (the 0x400 bytes the SPUs execute first): the ROM reads those 32 bytes on
+its own channel 66, expands them into the key ladder and opens the flash
+container with them.  It is not stored in metldr, not in bootldr, and not
+anywhere in the flash regions this script maps - a dump carries no copy of it,
+which is why the model takes it as `readout`/`readout-file`.  The name this
+script (and the older flash-writer patches) use for the 0xFC0000 slot is kept
+only so existing commands keep working: what sits there is the container the
+ROM opens, and its own name string says `lv0ldr.2`.
+
+ch66 is public (it is the container key), but the per-console key is one level
+in: decrypt that container with the channel-66 ladder and **PCK1** (the EID
+root key) is inside lv0ldr.2.  PCK1 is what the loaders run the ATA and flash
+ladders on, and what `ps3_hdd_create.py` wraps the key sector under.  So this
+script maps the container's slots; `ps3_emmc_create.py --identify` reads PCK1's
+carrier (`ros`, `lv0`, `lv0.2`) out of the flash it maps.
 """
 import argparse
 import hashlib
@@ -79,14 +97,20 @@ REGIONS = [
     ("crl2",           0xF80000, None,     0x40),
     ("drl2",           0xFA0000, None,     0x40),
     ("ocrl",           0xF69400, None,     0x130),
+    /*
+     * The container the mask boot ROM opens (0xFC0000 on NOR).  The model's
+     * chain check finds it by its own name string, `lv0ldr.2`; the key that
+     * opens it is the ROM's channel-66 readout, not anything in this slot.
+     */
     ("bootldr",        0xFC0000, 0x000000, 0x40000),
 ]
 
 # The entries a NOR table of contents lists, in the order a dump lists them,
 # with the slot size each entry carries.  A slot is not the region's data
 # length: trvk_prg0 holds a 0x2C0 revocation record in a 0x20000 slot, and the
-# flash writer patches these slots in place.  bootldr is deliberately absent:
-# the ROM finds it by fixed offset and the table never mentions it.  `ros` is
+# flash writer patches these slots in place.  The container slot at 0xFC0000
+# is deliberately absent: the ROM finds it by fixed offset and the table never
+# mentions it.  `ros` is
 # one 0xE00000 NAND entry instead of the two NOR banks, which is why NAND
 # tables are copied from a dump rather than built.
 TOC_LAYOUT = [
@@ -106,7 +130,8 @@ TOC_LAYOUT = [
 MAPS = {
     "nor": {"size": 16 * MiB,
             "toc": 0x400,
-            "note": "16 MiB NOR dump; bootldr sits at the top"},
+            "note": "16 MiB NOR dump; the container the ROM opens "
+                    "(lv0ldr.2) sits at the top"},
     "nand": {"size": 0x10000000,
              "toc": 0x200,
              "note": "256 MiB NAND image or a GameOS dump that starts at "
@@ -114,7 +139,9 @@ MAPS = {
 }
 
 ALIASES = {"OCRL0200": "ocrl", "extnor_area": "extnor",
-           "CELL_EXTNOR_AREA": "extnor", "trvk_prg": "trvk_prg_hdr"}
+           "CELL_EXTNOR_AREA": "extnor", "trvk_prg": "trvk_prg_hdr",
+           # A dump that names the slot by its container says lv0ldr.2.
+           "lv0ldr.2": "bootldr", "lv0ldr": "bootldr"}
 
 
 def read_blob(path):

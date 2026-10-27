@@ -72,6 +72,38 @@ offsets those bits address.  The ROM image is the user's to supply; no Sony
 code is carried in this tree, and no per-console key is written to a log (only
 fingerprints).
 
+### ch66 is the boot ROM's public key; PCK1 comes out of lv0ldr.2
+
+The 32 bytes the boot path calls channel 66 live in the *mask boot ROM* - the
+0x400 bytes the SPUs execute first.  The ROM reads them on its own channel 66,
+expands the key ladder from them and opens the flash container with it
+(lv0ldr.2 on NOR, metldr.2 on NAND/eMMC).  ch66 is **public**, which is why a
+container in a dump can be opened at all: it is the container key, not a
+per-console secret, and it never encrypts disk data.
+
+The per-console keys are one and two levels in, and they are read out in that
+order:
+
+1. **ch66 opens `lv0ldr.2`** - decrypt the container with the channel-66 ladder
+   and **PCK1 is inside it**.  PCK1 is the per-console root: it is what the ATA
+   and flash ladders are run on, and what the HDD image's key sector is wrapped
+   under.
+2. **PCK1 opens `lv1ldr.self`**, and **the EID root key (with its RIV) is inside
+   it**.  That pair is what opens the application SELFs (`vsh.self` and the
+   rest), so it is the key the SELF opener works from, not the container key.
+
+So a NOR/NAND/eMMC dump carries the container and, inside it, that console's
+PCK1, and the next stage's SELF carries the EID root key - but never ch66
+itself, which belongs to the ROM.
+
+The model follows the same order: `readout` / `readout-file` supplies the 32
+channel-66 bytes exactly as the ROM reads them (K_lo, then K_hi) and is what
+opens and verifies the container; `erk` / `erk-file` supplies the EID root key
+and RIV read out of `lv1ldr.self` (that is what `ps3_self.c` opens SELFs with,
+and it is the same value the ATA/flash ladders and an HDD image's key sector
+are built from).  No per-console key is ever written to a log, only
+fingerprints.
+
 ## Files
 
 | Path | Contents |
@@ -302,7 +334,7 @@ audiodev feed `sys_mic`'s rings.
 | Property | Default | Meaning |
 | --- | --- | --- |
 | `rom-file` / `drive` | - | set by `-bios` and `-drive if=pflash,...` |
-| `erk-file`, `readout-file` | - | console root key / channel-66 readout (raw 32 bytes) |
+| `erk-file`, `readout-file` | - | the EID root key + RIV read out of `lv1ldr.self`, 48 raw bytes / the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi |
 | `container` | `lv0ldr.2` | container to look for in the flash image |
 | `dev-flash`, `dev-flash2`, `dev-flash3` | - | firmware trees unpacked from the flash's ROS, as an alternative to an image |
 | `hdd-file`, `hdd-size` | - / 20G | raw disk image, and the size the model gives a fresh one (1 TB max) |

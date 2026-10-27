@@ -13,9 +13,11 @@
  * The PS3 is a Cell BE: a 64-bit PowerPC PPU derived from the RS/6000 line,
  * eight SPUs, and a memory interface controller (MIC) that has to be
  * programmed before DRAM can be used.  Its first code is not a PC BIOS: the
- * mask ROM on each SPU opens the boot loader container (lv0ldr/bootldr) with a
- * per-console root key that only the ROM can read, verifies its CCM tag, wipes
- * local storage and falls through to the payload it just decrypted.
+ * mask boot ROM on each SPU reads the per-console key on its own channel 66
+ * (the key lives in that ROM, not in the flash), opens the boot loader
+ * container with it - lv0ldr.2 on a NOR console, metldr.2 on a NAND/eMMC one -
+ * verifies its CCM tag, wipes local storage and falls through to the payload
+ * it just decrypted.
  *
  * This board gives that path somewhere to run:
  *
@@ -40,11 +42,13 @@
  *
  * The ROM's own key is the 32-byte channel-66 readout.  It can be given as
  * `readout' (64 hex digits) or `readout-file' (32 raw bytes, in the order the
- * ROM reads them: K_lo first, then K_hi).  Without it the device feeds the ROM
- * 32 zero bytes, which is what the channel returns once metldr is loaded on
- * real hardware, and the tag check fails exactly as the ROM's "stop 2" path
- * does.  The container name defaults to lv0ldr.2 and falls back to the NOR
- * slots at 0xFC0000 and 0x840 when a dump carries no name.
+ * ROM reads them: K_lo first, then K_hi).  No flash image carries it - it
+ * belongs to the mask boot ROM - so the caller supplies it.  Without it the
+ * device feeds the ROM 32 zero bytes, which is what the ROM's own channel
+ * reads once the key ladder has been used and the ROM has wiped itself, and
+ * the tag check then fails exactly as the ROM's "stop 2" path does.  The
+ * container name defaults to lv0ldr.2 and falls back to the NOR slots at
+ * 0xFC0000 and 0x840 when a dump carries no name.
  *
  * Once the container opens, its plaintext is placed at LS 0x400 - where the
  * mask ROM falls through to it - and executed by the SPU interpreter
@@ -77,6 +81,23 @@ typedef struct PS3Call {
     uint64_t sp;
     uint64_t srr0;
 } PS3Call;
+
+/*
+ * The last few file reads, with the path the descriptor was opened by.
+ *
+ * A guest that reports a failed inflate has the bytes it was handed in RAM,
+ * and what it was handed is the question: the resource it read, where from
+ * and how many bytes came back.  Keeping that here means the report can name
+ * the file instead of only the call that read it.
+ */
+#define PS3_READ_RING 8
+typedef struct PS3ReadCall {
+    char *path;                 /* owned; the guest path of the descriptor */
+    uint64_t off, len;
+    int64_t got;
+    uint32_t buf;               /* where it landed in guest RAM */
+    int tid;
+} PS3ReadCall;
 
 #include "qemu/units.h"
 #include "qemu/cutils.h"
@@ -1080,6 +1101,8 @@ struct PS3BootROMState {
     /* The last lv2 calls, for the report a vector makes. */
     PS3Call call_ring[PS3_CALL_RING];
     unsigned call_ring_pos;
+    PS3ReadCall read_ring[PS3_READ_RING];
+    unsigned read_ring_pos;
     unsigned ppu_fault_reports;
     char ppu_why[160];
 
@@ -1246,6 +1269,8 @@ struct PS3BootROMState {
     uint8_t lv2_fan_policy;         /* 0 auto, 1 manual, 2 full */
     uint8_t lv2_fan_duty;
     bool lv2_usleep_reported;       /* the idle loop's sleep was reported */
+    /* The guest's first failed inflate, named with the calls that led to it. */
+    bool lv2_inflate_reported;
     bool lv2_storage_reported;      /* the BD drive's enumeration was reported */
     bool lv2_btsetting_reported;    /* sys_btsetting_if's first call */
     bool lv2_av_reported;           /* the guest read the sink's EDID */
@@ -1322,6 +1347,8 @@ struct PS3BootROMState {
     bool idle_off_reported;
     int lv2_fd[PS3_LV2_FD_MAX];     /* guest handle -> host descriptor */
     bool lv2_fd_open[PS3_LV2_FD_MAX];
+    /* The guest path each open descriptor came from, for the read report. */
+    char *lv2_fd_path[PS3_LV2_FD_MAX];
     /*
      * A directory handle is a GDir of the host tree, opened on the guest's
      * behalf.  The console's lv2 hands out the same fd numbering to files and
@@ -1334,7 +1361,7 @@ struct PS3BootROMState {
 
     /*
      * The HDD: one raw image, the size a superslim ships with.  Its sectors
-     * are XTS-AES with keys metldr derives from the console's EID root key
+     * are XTS-AES with keys lv1ldr derives from the console's EID root key
      * (PCK1), so the image is the same disk whatever the host filesystem is.
      */
     char *hdd_file;
@@ -14809,6 +14836,22 @@ static void ps3_av_parse(PS3BootROMState *s)
     }
 }
 
+/* Whether a guest buffer carries a byte string, for one-shot diagnostics. */
+static bool ps3_mem_has(const uint8_t *p, size_t len, const char *needle)
+{
+    size_t n = strlen(needle), i;
+
+    if (n > len) {
+        return false;
+    }
+    for (i = 0; i + n <= len; i++) {
+        if (!memcmp(p + i, needle, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ps3_lv2_service(PS3BootROMState *s)
 {
     CPUState *cs = qemu_get_cpu(0);
@@ -16875,6 +16918,64 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EFAULT;
             break;
         }
+        /*
+         * One-shot: the VSH's resource layer tells the console about every
+         * failed inflate, and the caller is what says whose data was bad.
+         * The call ring already holds the calls that led here, so name them
+         * the first time the message appears - after that the console repeats
+         * it for as long as the loader retries, and only the first one has the
+         * thread's stack still where it was.
+         */
+        if (!s->lv2_inflate_reported &&
+            ps3_mem_has(ram + a1, a2, "inflate")) {
+            unsigned k;
+            unsigned n = s->call_ring_pos < PS3_CALL_RING ?
+                         s->call_ring_pos : PS3_CALL_RING;
+
+            s->lv2_inflate_reported = true;
+            info_report("ps3-ppu: the guest reports a failed inflate "
+                        "(thread 0x%X, pc=0x%" PRIX64 ", lr=0x%" PRIX64
+                        "); the calls that led there:",
+                        s->thr_cur >= 0 && s->thr[s->thr_cur].used ?
+                        s->thr[s->thr_cur].id : 0,
+                        (uint64_t)cpu->env.nip, (uint64_t)cpu->env.lr);
+            for (k = 0; k < n; k++) {
+                PS3Call *c = &s->call_ring[(s->call_ring_pos - n + k) %
+                                           PS3_CALL_RING];
+
+                info_report("ps3-ppu:   call 0x%X from lr=0x%" PRIX64
+                            " sp=0x%" PRIX64 " srr0=0x%" PRIX64 " tid=%d",
+                            c->nr, c->lr, c->sp, c->srr0, c->tid);
+            }
+            n = s->read_ring_pos < PS3_READ_RING ?
+                s->read_ring_pos : PS3_READ_RING;
+            /* The whole ring, oldest first, so the sequence reads as it ran. */
+            for (k = 0; k < n; k++) {
+                PS3ReadCall *r = &s->read_ring[(s->read_ring_pos - n + k) %
+                                               PS3_READ_RING];
+
+                info_report("ps3-ppu:   read %" PRId64 " of 0x%" PRIX64
+                            " at file 0x%" PRIX64 " into 0x%" PRIX64
+                            "..0x%" PRIX64 " from %s (tid=%d)",
+                            r->got, r->len, r->off, (uint64_t)r->buf,
+                            (uint64_t)r->buf + r->len, r->path ?: "?",
+                            r->tid);
+                /*
+                 * What the guest was handed, so it can be held against the
+                 * file: equal bytes mean the read path is not the fault.
+                 */
+                if (r->buf && (uint64_t)r->buf + 16 <= ram_size) {
+                    const uint8_t *b = ram + r->buf;
+
+                    info_report("ps3-ppu:   that buffer starts %02X %02X %02X "
+                                "%02X %02X %02X %02X %02X %02X %02X %02X "
+                                "%02X %02X %02X %02X %02X %02X",
+                                b[0], b[1], b[2], b[3], b[4], b[5], b[6],
+                                b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+                                b[14], b[15]);
+                }
+            }
+        }
         for (n = 0; n < a2; n++) {
             ps3_uart_putc(s, ram[a1 + n]);
         }
@@ -17643,6 +17744,17 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
 
+        {
+            char guest_path[160];
+
+            if (ps3_lv2_guest_string(ram, ram_size, a0, guest_path,
+                                     sizeof(guest_path)) &&
+                gfd - 3 >= 0 && gfd - 3 < PS3_LV2_FD_MAX) {
+                g_free(s->lv2_fd_path[gfd - 3]);
+                s->lv2_fd_path[gfd - 3] = g_strdup(guest_path);
+            }
+        }
+
         ps3_put_be32(ram + a2, gfd);
         ret = 0;
         break;
@@ -17667,6 +17779,19 @@ static void ps3_lv2_service(PS3BootROMState *s)
         if (got < 0) {
             ret = ps3_lv2_fs_error(errno);
             break;
+        }
+        {
+            PS3ReadCall *r = &s->read_ring[s->read_ring_pos % PS3_READ_RING];
+
+            g_free(r->path);
+            r->path = (a0 - 3 < PS3_LV2_FD_MAX && s->lv2_fd_path[a0 - 3]) ?
+                      g_strdup(s->lv2_fd_path[a0 - 3]) : NULL;
+            r->off = (uint64_t)before;
+            r->len = n;
+            r->got = got;
+            r->buf = a1;
+            r->tid = s->thr_cur;
+            s->read_ring_pos++;
         }
         if (s->ppu_trace) {
             struct stat st;
@@ -17726,6 +17851,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
         s->lv2_fd_open[a0 - 3] = false;
+        g_clear_pointer(&s->lv2_fd_path[a0 - 3], g_free);
         close(hfd);
         ret = 0;
         break;
@@ -18756,7 +18882,7 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
          * An eMMC console's logical flash region starts 256 KiB into the
          * device: the first 0x40000 bytes are the CFI header and the flash
          * metadata block, and the Flash Region Table sits at 0x40200.  The
-         * mask ROM's view - bootldr at offset 0, the container search over the
+         * mask ROM's view - the container it opens at offset 0, the search over
          * first 16 MiB - begins at that 0x40000, so that is what the model
          * copies.
          */
