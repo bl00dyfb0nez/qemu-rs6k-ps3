@@ -1374,6 +1374,7 @@ struct PS3BootROMState {
     char *pck1_file;
     uint8_t erk[48];                /* 32 bytes of key, 16 of IV */
     bool has_erk;
+    const char *erk_from;           /* where the ladder's ERK came from */
     /*
      * The ladder seeds, read out of the console's own loader rather than the
      * model's table: lv1ldr carries the four static seeds (encdec and SB-indiv,
@@ -19010,7 +19011,10 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
  * or eMMC console keeps the same ladder in the loader its ros bank carries, and
  * the two media put the block at different offsets - which is why the block is
  * looked for by its content and the offset is reported rather than assumed.  A
- * SELF is opened with PCK1 first (the loader's own root-header check); anything
+ * SELF is opened with the key it carries: PCK1 when the console's own copy was
+ * given, the loader keyset when the image is one out of a update package.  The
+ * ERK that opened it is what the ladders then run on - it is the loader's own
+ * key, read out of the loader rather than supplied separately - and anything
  * that is not a SELF (a carve, a bank, a whole dump) is scanned as it stands.
  * When both media's images are given they must carry the same block, which is a
  * cross-check on the reading rather than a requirement of the format.
@@ -19027,20 +19031,13 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
         return true;
     }
 
-    if (!s->has_erk) {
-        error_setg(errp, "ps3-boot-rom: %s is the loader the ladder seeds are "
-                   "read from and PCK1 is what keys it; give pck1/pck1-file "
-                   "(or erk/erk-file)", s->lv1ldr_file ? "lv1ldr" : "nand-loader");
-        return false;
-    }
-
     for (unsigned i = 0; i < ARRAY_SIZE(images); i++) {
         g_autofree gchar *buf = NULL;
         GError *gerr = NULL;
         gsize len = 0;
         uint8_t seeds[128];
         size_t off = 0;
-        char key_hex[97], iv_hex[33], why[160], why2[160];
+        char key_hex[97], iv_hex[33], why[160];
         const char *opened_by = NULL;
 
         if (!images[i].path) {
@@ -19061,26 +19058,47 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
 
         if (!memcmp(buf, "SCE\0", 4)) {
             uint8_t *img = (uint8_t *)buf;
+            uint8_t erk48[48];
+            bool from_table = false;
 
-            /* PCK1 first: that is the console's own copy of the loader. */
-            ps3_hex(s->erk, 32, key_hex);
-            ps3_hex(s->erk + 32, 16, iv_hex);
-            if (ps3_self_decrypt_key(img, len, key_hex, iv_hex, why,
-                                     sizeof(why))) {
-                opened_by = "PCK1";
-            } else if (ps3_self_decrypt(img, len, why2, sizeof(why2))) {
-                /*
-                 * A retail image out of a update package is sealed with the
-                 * loader's published keyset instead, and its own seed block is
-                 * the same four constants.  Say which key opened it rather
-                 * than calling a package copy the console's.
-                 */
-                opened_by = "the loader keyset (a retail image, not PCK1)";
-            } else {
-                error_setg(errp, "ps3-boot-rom: %s: neither PCK1 nor the "
-                           "loader keysets opened it (%s / %s)",
-                           images[i].path, why, why2);
+            /*
+             * The key the console's own copy carries first (PCK1), because that
+             * is the ERK the ladders want; the loader keyset after it covers a
+             * image out of a update package, which is the same four seeds but
+             * not this console's key - and that is said rather than hidden.
+             */
+            key_hex[0] = 0;
+            iv_hex[0] = 0;
+            if (s->has_erk) {
+                ps3_hex(s->erk, 32, key_hex);
+                ps3_hex(s->erk + 32, 16, iv_hex);
+            }
+            if (!ps3_self_decrypt_erk(img, len,
+                                      s->has_erk ? key_hex : NULL,
+                                      s->has_erk ? iv_hex : NULL,
+                                      erk48, &from_table, why, sizeof(why))) {
+                error_setg(errp, "ps3-boot-rom: %s: no keyset opened it (%s)",
+                           images[i].path, why);
                 return false;
+            }
+
+            if (!s->has_erk || !from_table) {
+                /* The loader's own ERK becomes the ladder's key. */
+                memcpy(s->erk, erk48, sizeof(s->erk));
+                s->has_erk = true;
+                s->erk_from = from_table ? "the loader's published keyset"
+                                         : "the key given for it (PCK1)";
+                opened_by = from_table
+                    ? "the loader keyset (a retail image, not PCK1)"
+                    : "PCK1";
+            } else {
+                /*
+                 * A key was given and a retail image cannot carry it, so the
+                 * image proves nothing about it: keep the caller's key and say
+                 * so instead of quietly swapping in a published one.
+                 */
+                opened_by = "the loader keyset - the image is a retail copy, "
+                            "the given ERK is kept";
             }
         } else {
             opened_by = "nothing - the image is not a SELF";
@@ -19108,8 +19126,9 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
         given++;
 
         info_report("ps3-boot-rom: %s: %s: ladder seed block at 0x%X - the "
-                    "ATA and flash ladders run on the console's own seeds",
-                    images[i].medium, opened_by, (unsigned)off);
+                    "ATA and flash ladders run on the console's own seeds; the "
+                    "ladder's ERK is %s",
+                    images[i].medium, opened_by, (unsigned)off, s->erk_from);
     }
 
     if (given > 1) {
@@ -19146,6 +19165,7 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
             return false;
         }
         s->has_erk = true;
+        s->erk_from = "the command line (erk/pck1)";
     } else if (erk_path) {
         g_autofree gchar *buf = NULL;
         GError *gerr = NULL;
@@ -19164,6 +19184,7 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
         }
         memcpy(s->erk, buf, sizeof(s->erk));
         s->has_erk = true;
+        s->erk_from = "the file given for it (erk-file/pck1-file)";
     }
 
     if (!ps3_ladder_seeds_setup(s, errp)) {
@@ -19177,8 +19198,9 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
 
     if (!s->hdd_file) {
         if (s->has_erk) {
-            info_report("ps3-boot-rom: EID root key 1 (PCK1) read; ATA data "
+            info_report("ps3-boot-rom: the ladder's ERK read from %s; ATA data "
                         "and tweak keys derived %s, no HDD image to key",
+                        s->erk_from ?: "the command line",
                         s->has_ladder_seeds ? "from the loader's own seeds"
                                             : "from the published seeds");
         }

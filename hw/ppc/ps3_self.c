@@ -603,6 +603,55 @@ void ps3_self_unwrap_erk(const uint8_t wrapped[32], const uint8_t pck2[48],
     aes256_cbc_decrypt(pck2, pck2 + 32, wrapped, erk, 32);
 }
 
+/*
+ * Open `img` and hand back the ERK it was opened with - the 48 bytes (32 of key,
+ * 16 of RIV) the SELF format calls erk and riv.  The caller's pair is tried
+ * first, because that is the console's own; the loader table follows, which is
+ * what a retail image out of a update package carries.  `from_table` says which
+ * of the two won, so a caller that wants a per-console key is not handed a
+ * published one without being told.
+ */
+bool ps3_self_decrypt_erk(uint8_t *img, size_t len, const char *erk_hex,
+                          const char *riv_hex, uint8_t erk_out[48],
+                          bool *from_table, char *why, size_t why_len)
+{
+    uint8_t probe[32];
+
+    if (erk_hex && riv_hex) {
+        struct SelfKey key = { erk_hex, riv_hex };
+        char sub[160];
+
+        if (self_decrypt_tables(img, len, &key, 1, sub, sizeof(sub))) {
+            if (!hex_to_bytes(erk_hex, probe, 32) ||
+                !hex_to_bytes(riv_hex, erk_out + 32, 16)) {
+                snprintf(why, why_len, "the key that opened it is not hex");
+                return false;
+            }
+            memcpy(erk_out, probe, 32);
+            *from_table = false;
+            return true;
+        }
+    }
+
+    for (unsigned k = 0; k < ARRAY_SIZE(self_keys); k++) {
+        struct SelfKey key = self_keys[k];
+        char sub[160];
+
+        if (self_decrypt_tables(img, len, &key, 1, sub, sizeof(sub))) {
+            if (!hex_to_bytes(self_keys[k].erk, erk_out, 32) ||
+                !hex_to_bytes(self_keys[k].riv, erk_out + 32, 16)) {
+                snprintf(why, why_len, "loader keyset %u is not hex", k);
+                return false;
+            }
+            *from_table = true;
+            return true;
+        }
+    }
+
+    snprintf(why, why_len, "no keyset opened the root header");
+    return false;
+}
+
 bool ps3_self_decrypt_pck2(uint8_t *img, size_t len, const uint8_t pck2[48],
                            char *why, size_t why_len)
 {
