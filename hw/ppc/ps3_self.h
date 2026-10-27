@@ -61,6 +61,16 @@ bool ps3_self_decrypt_pck2(uint8_t *img, size_t len, const uint8_t pck2[48],
                            char *why, size_t why_len);
 
 /*
+ * Open `img` and hand back the ERK it was opened with (32 bytes of key, 16 of
+ * RIV).  `erk_hex`/`riv_hex` are tried first and may be NULL; the loader table
+ * follows.  `from_table` reports which won, so a caller that wants a per-console
+ * key is never handed a published one without being told.
+ */
+bool ps3_self_decrypt_erk(uint8_t *img, size_t len, const char *erk_hex,
+                          const char *riv_hex, uint8_t erk_out[48],
+                          bool *from_table, char *why, size_t why_len);
+
+/*
  * Decrypt `img`, then place its segments into `ls` at their link addresses and
  * return the entry point.  Segments with no file data are zero-filled, which is
  * what the loader does for .bss.  Returns 0 on success, 1 when no keyset opened
