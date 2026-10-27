@@ -2190,7 +2190,23 @@ static bool ps3_chain_container(PS3BootROMState *s, const char **name_out,
 {
     static const char nand_first[] = "metldr.2";
     const char *name = s->container ?: "lv0ldr.2";
-    bool nand_medium;
+    bool nand_medium = s->boot_medium && !strcmp(s->boot_medium, "emmc");
+
+    /*
+     * A NAND/eMMC medium is asked for its own first container: the mask ROM
+     * is pointed at the asecure_loader region, and metldr.2 is what it opens
+     * there.  The lv0ldr.2 the NOR chain opens is metldr's next stage, and a
+     * flash without it is not a broken console - it is the other boot path.
+     */
+    if (nand_medium && strcmp(name, nand_first) &&
+        ps3_container_find(s->flash, s->flash_len, nand_first, offset, why,
+                           why_len)) {
+        info_report("ps3-boot-rom: NAND/eMMC medium: the ROM opens %s (the "
+                    "asecure_loader); %s is metldr's own next stage",
+                    nand_first, name);
+        *name_out = nand_first;
+        return true;
+    }
 
     *name_out = name;
     if (ps3_container_find(s->flash, s->flash_len, name, offset, why,
@@ -2198,7 +2214,6 @@ static bool ps3_chain_container(PS3BootROMState *s, const char **name_out,
         return true;
     }
 
-    nand_medium = s->boot_medium && !strcmp(s->boot_medium, "emmc");
     if (nand_medium && strcmp(name, nand_first)) {
         char why2[160];
 
