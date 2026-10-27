@@ -20315,7 +20315,7 @@ static bool ps3_lv2_warm_reset(PS3BootROMState *s)
     /* And so is every socket the process had: the link comes up again. */
     for (i = 0; i < PS3_NET_MAX; i++) {
         if (s->net_used[i]) {
-            closesocket(s->net_fd[i]);
+            ps3_net_close_fd(s->net_fd[i]);
         }
         s->net_used[i] = false;
         s->net_fd[i] = -1;

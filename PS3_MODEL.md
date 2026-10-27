@@ -230,6 +230,27 @@ All three media stay supported, and each one is a boot target of its own:
 | HDD (raw) | `boot-medium=hdd` + `hdd-file` | the first 16 MiB of the disk | the disk's own `dev_flash*`/`dev_hdd0` |
 | NAND/eMMC | `boot-medium=emmc` + `emmc-file` | the eMMC's flash region | the eMMC's storage area |
 
+Each medium is asked for the container its own boot ROM opens.  On NOR (and on
+a chain staged on a disk) that is `lv0ldr.2`.  On NAND/eMMC it is `metldr.2` in
+the asecure_loader region - the region the mask ROM is pointed at - and
+`lv0ldr.2` is what metldr opens once it runs, so a NAND flash that carries
+`metldr.2` and no `lv0ldr.2` is the other boot path, not a damaged console:
+
+```
+ps3-boot-rom: NAND/eMMC medium: the ROM opens metldr.2 (the asecure_loader);
+              lv0ldr.2 is metldr's own next stage
+```
+
+The container is verified against the console's own channel-66 readout, so an
+eMMC image needs the readout of the console the dump came from.  With another
+console's readout the check says exactly that and the recover process comes up
+instead:
+
+```
+ps3-boot-rom: stop 2, MAC mismatch (metldr.2 at flash 0x840)
+ps3-boot-rom: ### Vflash recovery mode
+```
+
 ### The recovery application, when the checks fail
 
 lv2 picks the application, not the command line: the chain must verify and
