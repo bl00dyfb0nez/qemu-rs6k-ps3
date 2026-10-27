@@ -232,6 +232,32 @@ keeps the CPU compose path, and omitting `gl=` lets the backend decide.  `-vga
 rsx` is optional: the machine creates the RSX display either way, and `-vga help`
 lists `rsx  PS3 RSX display`.
 
+### The ERK, read out of the loader
+
+The console's own `lv1ldr` is sealed with the EID root key, so the key that
+opens it is the ERK the ATA and encdec ladders run on - the loader image is where
+that key comes from, and nothing has to be handed over separately:
+
+```sh
+$Q -M rs6000-ps3 -display sdl \
+   -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
+   -global ps3-boot-rom.lv1ldr=C:/Users/Thewoodsman/Documents/ps3tools-main/lv1ldr_493.self \
+   -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img \
+   -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
+```
+
+```
+ps3-boot-rom: NOR lv1ldr: PCK1: ladder seed block at 0x1BB20 - the ATA and flash
+              ladders run on the console's own seeds; the ladder's ERK is the
+              key given for it (PCK1)
+```
+
+A retail loader out of an update package carries the published keyset instead
+of a per-console key, and the line says so (`the ladder's ERK is the loader's
+published keyset`) rather than calling a package copy the console's.  When a key
+is given as well (`pck1=`, `erk-file=`), it is tried first and, if the image is a
+retail one that cannot carry it, the given ERK is kept for the ladder.
+
 The window carries the chain's own lines (`SPU PAYLOAD: 67108864 INSTRUCTIONS`,
 `LV0LDR.2 CONTAINER VERIFIED: 191152 BYTES`), then the VSH's stdout, then the
 boot wordmark.  The XMB is not drawn by the model: it is `vsh.self`'s own frame
@@ -353,9 +379,9 @@ audiodev feed `sys_mic`'s rings.
 | Property | Default | Meaning |
 | --- | --- | --- |
 | `rom-file` / `drive` | - | set by `-bios` and `-drive if=pflash,...` |
-| `erk-file`, `pck1-file`, `readout-file` | - | the EID root key + RIV read out of the loader (PCK1), 48 raw bytes / the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi |
+| `erk-file`, `pck1-file`, `readout-file` | - | the console's 48-byte ERK + RIV (the name `pck1` gives the same value), or the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi.  Optional: without it the ERK is the one the loader in `lv1ldr`/`nand-loader` carries |
 | `pck1`, `erk` | - | the same 48 bytes as hex (96 digits); `pck1` is the console's name for it |
-| `lv1ldr`, `nand-loader` | - | the console's loader image the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  A SELF is opened with PCK1 (the published loader keyset is accepted for a retail image, and says so); both are read and must agree |
+| `lv1ldr`, `nand-loader` | - | the console's loader image the ERK and the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  The key that opens it *is* the ladder's ERK, so a loader alone keys the storage ladder; the published loader keyset is accepted for a retail image and says so, and both images are read and must agree |
 | `container` | `lv0ldr.2` | container to look for in the flash image |
 | `dev-flash`, `dev-flash2`, `dev-flash3` | - | firmware trees unpacked from the flash's ROS, as an alternative to an image |
 | `hdd-file`, `hdd-size` | - / 20G | raw disk image, and the size the model gives a fresh one (1 TB max) |
@@ -378,7 +404,7 @@ window's pixels can be inspected without a display.
 | --- | --- | --- |
 | device selftest + mask ROM replay | any run with `-bios` | `selftest passed (AES-128 KAT, sealed container round trip, mask ROM replayed by the SPU interpreter)` |
 | container opener | `-drive if=pflash,...` with the readout | `container verified, 191152 bytes of payload` |
-| ladder seeds from the console's own loader | `-global ps3-boot-rom.pck1=... -global ps3-boot-rom.lv1ldr=lv1ldr.self` (optionally `-global ps3-boot-rom.nand-loader=...` too) | `NOR lv1ldr: ...: ladder seed block at 0x1BB20 - the ATA and flash ladders run on the console's own seeds`, and `the NOR and NAND loaders carry the same four seeds` when both are given.  A loader with no block (or a mismatched pair) stops the run with the reason |
+| ladder seeds and ERK from the console's own loader | `-global ps3-boot-rom.lv1ldr=lv1ldr.self` - no key on the command line | `NOR lv1ldr: ...: ladder seed block at 0x1BB20 - the ATA and flash ladders run on the console's own seeds; the ladder's ERK is <where it came from>`, and `the NOR and NAND loaders carry the same four seeds` when both are given.  A loader with no block (or a mismatched pair) stops the run with the reason.  `pck1=`/`erk-file=` still override the ERK, and a retail image cannot carry a per-console key, so a given ERK is kept and that is reported |
 | a loader stage | `-global ps3-boot-rom.stage-elf=lv2ldr.self` | exit 0, `stop 48 at ...` (the loaders' signal) |
 | lv0 and above | `-global ps3-boot-rom.ppu-elf=lv0.self` | exit 0 at the next hand-off |
 | vsh.self | `-global ps3-boot-rom.vsh-run=on` | `ps3-vsh: ... entry=0x6D5AC8 ... PPU entering it`, then `sys_prx_load_module` and the module set |
@@ -415,6 +441,7 @@ The key chain itself has a tool on the ps3tools side, `chain_keys.py`, next to
 | Invocation | What it does |
 | --- | --- |
 | `chain_keys.py --flash dump.bin --readout ch66.bin --scan-lv0 --eid0 eEID.bin` | open the container, read PCK1 out of it (accepted only when it authenticates the EID0's CMAC) |
+| `chain_keys.py --lv1ldr lv1ldr.self` | no key on the command line: the ERK is read out of the loader (the key that opened it) and the ladder runs on that |
 | `chain_keys.py --pck1 <96 hex> --lv1ldr lv1ldr.self --nand-loader nand.bin --qemu` | open both loaders, report the seed block's offset against the NOR and NAND reference offsets, derive the ATA and encdec keys, and print the `-global` lines this model takes |
 | `chain_keys.py --selftest` | seal a container and a loader, then prove each rung on them: tag, root-header check, seed discovery at both media's offsets, the ladder against a second implementation, and the EID0 check |
 
