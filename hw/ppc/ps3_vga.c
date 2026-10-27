@@ -1002,6 +1002,19 @@ void ps3_vga_set_mode(uint32_t w, uint32_t h)
     }
 }
 
+/* What the display is showing, so the AV service can report a native mode. */
+void ps3_vga_mode(uint32_t *w, uint32_t *h)
+{
+    PS3VGAState *s = ps3_vga_current;
+
+    if (w) {
+        *w = s ? s->width : 0;
+    }
+    if (h) {
+        *h = s ? s->height : 0;
+    }
+}
+
 unsigned ps3_vga_hdmi_edid(uint8_t *out, unsigned cap)
 {
     unsigned n = MIN(cap, (unsigned)sizeof(ps3_vga_edid));

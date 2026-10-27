@@ -397,6 +397,15 @@ enum {
 /* The gamepad ports libpad numbers; sys_io describes all of them. */
 #define PS3_PAD_PORT_MAX    7
 
+/*
+ * The AV channel's buffers: the VSH's AV library keeps 0x800 bytes of replies
+ * and hands the device 0x800 bytes of commands at a time.
+ */
+#define PS3_AV_RX_SIZE      0x800
+#define PS3_AV_TX_SIZE      0x1000
+#define PS3_AV_VERSION      0x205
+#define PS3_AV_REPLY_BIT    0x80000000u
+
 /* lv2's sockets: a small table, guest handles are indices above 0x2FF. */
 #define PS3_NET_MAX         32
 #define PS3_NET_FD_BASE     0x300
@@ -859,6 +868,12 @@ typedef struct PS3Thread {
     /* When it last had the CPU, and whether its current stall was reported. */
     uint64_t last_run;
     bool stall_reported;
+    /* The code page it kept returning to, and whether that was reported. */
+    uint64_t spin_page;
+    unsigned spin_ticks;
+    bool spin_reported;
+    /* A sys_uart_receive that had to wait: where its bytes go, and how many. */
+    uint32_t uart_buf, uart_size;
     uint64_t gpr[32];
     uint64_t lr, ctr, xer, msr, nip;
     /*
@@ -1279,6 +1294,20 @@ struct PS3BootROMState {
     /* The process image, scanned for the import table appldr would supply. */
     uint32_t vsh_lo, vsh_hi;
 
+    /*
+     * The AV device behind sys_uart: libavst opens the port and speaks the
+     * console's AV protocol over it (see ps3_av_*).
+     */
+    bool av_up;
+    uint8_t av_rx[PS3_AV_RX_SIZE];  /* replies and events the guest reads */
+    unsigned av_rx_len;
+    uint8_t av_tx[PS3_AV_TX_SIZE];  /* what the guest has sent */
+    unsigned av_tx_len;
+    uint16_t av_version;            /* the protocol version AV_INIT named */
+    uint32_t av_event_bits;         /* the events it asked to be told about */
+    uint8_t av_hdmi_mode;           /* PS3AV_HDMI_BEHAVIOR_* it set */
+    bool av_hdcp_done;              /* the link authenticated once */
+
     uint8_t rom[PS3_ROM_SIZE];
     size_t rom_len;
     uint8_t *flash;
@@ -1345,6 +1374,12 @@ static const uint32_t ps3_lv2_shim[] = {
     0x4082001C, 0x81810010, 0x8001000C, 0x7C0FF120, 0x80010008,
     0x38210020, 0x4C000024, 0x48000000,
 };
+
+static void ps3_put_be16(uint8_t *p, uint16_t v)
+{
+    p[0] = v >> 8;
+    p[1] = v & 0xFF;
+}
 
 static void ps3_put_be32(uint8_t *p, uint32_t v)
 {
@@ -5309,6 +5344,38 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
     }
 }
 
+/*
+ * A thread that keeps coming back to the same page is not making progress, and
+ * the page alone does not say why: its caller is what says which wait it is in.
+ * Walk the ABI backchain out of its stack so the report names the call chain
+ * rather than one address inside it.
+ */
+static void ps3_sched_spin_report(PS3BootROMState *s, PS3Thread *t,
+                                  CPUPPCState *env)
+{
+    uint64_t ram_size = memory_region_size(s->ram);
+    uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+    uint64_t r1 = env->gpr[1];
+    unsigned i;
+
+    info_report("ps3-ppu: sched: thread 0x%X spinning in the 0x%" PRIX64
+                " page at 0x%" PRIX64 " (lr=0x%" PRIX64 ", sp=0x%" PRIX64
+                ")", t->id, t->spin_page, (uint64_t)env->nip,
+                (uint64_t)env->lr, r1);
+
+    for (i = 0; i < 12 && r1 && r1 + 0x18 <= ram_size; i++) {
+        uint64_t next = ps3_be64(ram + r1);
+        uint64_t ret = ps3_be64(ram + r1 + 0x10);
+
+        info_report("ps3-ppu: sched:   frame %u: sp 0x%" PRIX64
+                    " return 0x%" PRIX64, i, r1, ret);
+        if (next <= r1) {
+            break;
+        }
+        r1 = next;
+    }
+}
+
 static void ps3_sched_tick(void *opaque)
 {
     PS3BootROMState *s = opaque;
@@ -5317,6 +5384,29 @@ static void ps3_sched_tick(void *opaque)
     s->sched_ticks++;
     if (!(s->sched_ticks & 0x3F)) {
         ps3_sched_stall_report(s);
+    }
+
+    /*
+     * Sample the running thread's code page on every tick.  A thread that
+     * stays on one page for hundreds of slices is looping there, and the
+     * stack says what it is looping over.
+     */
+    if (cs && s->thr_cur >= 0 && s->thr[s->thr_cur].used &&
+        !s->thr[s->thr_cur].parked) {
+        PS3Thread *t = &s->thr[s->thr_cur];
+        CPUPPCState *env = cpu_env(cs);
+        uint64_t page = env->nip & ~0xFFFULL;
+
+        if (page == t->spin_page) {
+            if (++t->spin_ticks == 512 && !t->spin_reported) {
+                t->spin_reported = true;
+                ps3_sched_spin_report(s, t, env);
+            }
+        } else {
+            t->spin_page = page;
+            t->spin_ticks = 1;
+            t->spin_reported = false;
+        }
     }
 
     /*
@@ -5539,8 +5629,9 @@ static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 
     info_report("ps3-ppu: lv2: thread \"%s\" created (id 0x%X), entry "
-                "0x%X, toc 0x%X, stack 0x%X-0x%X", text, t->id, code, toc,
-                base, top);
+                "0x%X, toc 0x%X, arg 0x%X, stack 0x%X-0x%X (from lr "
+                "0x%" PRIX64 ")", text, t->id, code, toc, arg, base, top,
+                (uint64_t)env->lr);
     return t->id;
 }
 
@@ -12087,6 +12178,559 @@ static void ps3_spu_lv2_pump(PS3BootROMState *s, uint64_t budget)
     }
 }
 
+/*
+ * The AV channel: sys_uart is the VSH's link to the console's AV device.
+ *
+ * libavst owns the port.  Its receiver thread blocks in sys_uart_receive and
+ * hands every packet it reads to the AV service thread, which talks to the
+ * device: it sends AV_INIT, asks for the monitor information (the EDID-derived
+ * mode table), sets the HDMI behaviour, sends the video and audio set-up as
+ * one AVB_PARAM packet, and waits for the plugged and HDCP events.  A port
+ * with nothing on the other end never completes any of that: the receiver
+ * stays blocked, the service thread never gets its event, and vsh.self's main
+ * thread - which joins the service - never reaches cellGcmInit.
+ *
+ * The device below is the one RPCS3 presents: the same packet layout, a reply
+ * for each command (version, length, cid|reply bit, status), the same monitor
+ * information, and the plug and HDCP events.  The modes it reports are the
+ * ones the machine's display offers (ps3-vga, an HDMI sink with 720p/1080p).
+ */
+#define PS3_AV_WAIT              (-4)   /* wait_eq: a receive on the port */
+#define PS3_AV_STATUS_SUCCESS    0x00
+#define PS3_AV_STATUS_FAILURE    0x0B
+#define PS3_AV_STATUS_INVALID_CMD 0x03
+#define PS3_AV_STATUS_BAD_PORT   0x04
+#define PS3_AV_STATUS_BAD_VIDEO  0x0E
+#define PS3_AV_STATUS_NO_SEL     0x0F
+#define PS3_AV_STATUS_BAD_AUDIO  0x11
+
+static void ps3_av_reply(PS3BootROMState *s, uint32_t cid, uint32_t status,
+                         const void *data, unsigned size)
+{
+    unsigned at = s->av_rx_len;
+    unsigned total = 12 + size;
+
+    if (at + total > PS3_AV_RX_SIZE) {
+        return;                 /* the device's reply buffer is full */
+    }
+
+    ps3_put_be16(s->av_rx + at, PS3_AV_VERSION);
+    ps3_put_be16(s->av_rx + at + 2, (uint16_t)(size + 8));
+    ps3_put_be32(s->av_rx + at + 4, cid | PS3_AV_REPLY_BIT);
+    ps3_put_be32(s->av_rx + at + 8, status);
+    if (size) {
+        memcpy(s->av_rx + at + 12, data, size);
+    }
+    s->av_rx_len += total;
+
+    if (s->ppu_trace) {
+        info_report("ps3-av: reply cid 0x%08X status 0x%02X (%u byte(s))",
+                    cid, status, size);
+    }
+}
+
+/* An event the device raises on its own: the reply bit stays clear. */
+static void ps3_av_event(PS3BootROMState *s, uint32_t cid, const void *data,
+                         unsigned size)
+{
+    unsigned at = s->av_rx_len;
+    unsigned total = 8 + size;
+
+    if (at + total > PS3_AV_RX_SIZE) {
+        return;
+    }
+
+    ps3_put_be16(s->av_rx + at, s->av_version ? s->av_version
+                                              : PS3_AV_VERSION);
+    ps3_put_be16(s->av_rx + at + 2, (uint16_t)(size + 4));
+    ps3_put_be32(s->av_rx + at + 4, cid);
+    if (size) {
+        memcpy(s->av_rx + at + 8, data, size);
+    }
+    s->av_rx_len += total;
+
+    if (s->ppu_trace) {
+        info_report("ps3-av: event 0x%08X (%u byte(s))", cid, size);
+    }
+}
+
+/*
+ * The monitor information: the modes and the audio formats the sink supports.
+ * The native mode is the one the display is showing, so the VSH picks the
+ * resolution the window is already in instead of asking for another one.
+ */
+static unsigned ps3_av_monitor_info(uint8_t *out, uint16_t avport)
+{
+    static const uint8_t mon_id[10] = {
+        0x4A, 0x13, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15,
+    };
+    static const uint8_t audio[7][4] = {
+        { 1, 8, 0x7F, 0x07 },   /* LPCM */
+        { 2, 8, 0x7F, 0xFF },   /* AC-3 */
+        { 6, 8, 0x7F, 0xFF },   /* AAC */
+        { 7, 8, 0x7F, 0xFF },   /* DTS */
+        { 10, 8, 0x7F, 0xFF },  /* Dolby Digital Plus */
+        { 11, 8, 0x7F, 0xFF },  /* DTS-HD */
+        { 12, 8, 0x7F, 0xFF },  /* Dolby TrueHD */
+    };
+    uint32_t w = 0, h = 0, native;
+    unsigned i;
+
+    memset(out, 0, 208);
+    out[0] = avport;
+
+    ps3_vga_mode(&w, &h);
+    if (h >= 1080) {
+        native = 0x4000;                /* 1920x1080p */
+    } else if (h >= 720) {
+        native = 0x0004;                /* 1280x720p */
+    } else {
+        native = 0x0003;                /* 720x480p / 720x576p */
+    }
+
+    if (avport == 0x10) {               /* AVMULTI_0, the analogue head */
+        out[0x0B] = 3;                  /* PS3AV_MONITOR_TYPE_AVMULTI */
+        for (i = 0; i < 3; i++) {
+            ps3_put_be32(out + 0x1C + 8 * i, 0xFFFFFFFFu);
+        }
+        out[0x3C] = 1;
+        out[0x3D] = 1;
+        out[0x3E] = 1;
+        out[0x55] = 1;                  /* one speaker */
+        ps3_put_be16(out + 0x56, 1);
+        out[0x58] = 1;                  /* LPCM */
+        out[0x59] = 2;                  /* two channels */
+        out[0x5A] = 127;                /* every sample rate */
+        out[0x5B] = 7;                  /* up to 24-bit */
+        return 208;
+    }
+
+    memcpy(out + 0x01, mon_id, sizeof(mon_id));
+    out[0x0B] = 1;                      /* PS3AV_MONITOR_TYPE_HDMI */
+    memcpy(out + 0x0C, "PlayStation 3", 13);
+
+    ps3_put_be32(out + 0x1C, 0xFFFFFFFFu);  /* every 60 Hz mode */
+    ps3_put_be32(out + 0x20, native);
+    ps3_put_be32(out + 0x24, 0xFFFFFFFFu);  /* every 50 Hz mode */
+    ps3_put_be32(out + 0x28, native);
+    ps3_put_be32(out + 0x2C, 0xFFFFFFFFu);  /* other modes */
+    ps3_put_be32(out + 0x30, native);
+    ps3_put_be32(out + 0x34, 1);           /* VESA: one mode at a time */
+
+    out[0x3C] = 0x19;   /* RGB, selectable range, 12-bit */
+    out[0x3D] = 0x11;   /* YCbCr 4:4:4, 12-bit */
+    out[0x3E] = 0x01;   /* YCbCr 4:2:2 */
+    out[0x3F] = 0x73;   /* xvYCC 601/709, MD0..MD2 */
+
+    ps3_put_be16(out + 0x40, 1023);     /* red */
+    ps3_put_be16(out + 0x42, 0);
+    ps3_put_be16(out + 0x44, 0);        /* green */
+    ps3_put_be16(out + 0x46, 1023);
+    ps3_put_be16(out + 0x4C, 341);      /* white, D65 */
+    ps3_put_be16(out + 0x4E, 341);
+    ps3_put_be32(out + 0x50, 100);      /* gamma */
+
+    out[0x54] = 1;                      /* supported AI */
+    out[0x55] = 0x4F;                   /* speaker mask */
+    ps3_put_be16(out + 0x56, 7);
+    memcpy(out + 0x58, audio, sizeof(audio));
+
+    ps3_put_be16(out + 0x98, 60);       /* a 27-inch 16:9 panel */
+    ps3_put_be16(out + 0x9A, 34);
+    out[0x9C] = 0x0F;                   /* graphics, cinema, photo, game */
+
+    for (i = 0; i < 5; i++) {
+        ps3_put_be32(out + 0xA0 + 8 * i, 0xFFFFFFFFu);  /* the 3D modes */
+    }
+
+    return 208;
+}
+
+/* The sink came up: say so, if the guest asked to be told. */
+static void ps3_av_hdmi_events(PS3BootROMState *s)
+{
+    uint8_t info[208];
+
+    if (s->av_event_bits & 0x01) {          /* UNPLUGGED */
+        ps3_av_event(s, 0x10000001, NULL, 0);
+    }
+    if (s->av_event_bits & 0x02) {          /* PLUGGED, with its modes */
+        ps3_av_monitor_info(info, 0);
+        ps3_av_event(s, 0x10000002, info, 204);
+    }
+}
+
+static void ps3_av_hdcp_event(PS3BootROMState *s)
+{
+    uint8_t pkt[8];
+
+    if (!(s->av_event_bits & 0x04) || s->av_hdcp_done) {
+        return;
+    }
+    s->av_hdcp_done = true;
+    ps3_put_be32(pkt, 1);                   /* one key */
+    pkt[4] = 0xFF;                          /* the sink's BKSV */
+    pkt[5] = 0xFF;
+    pkt[6] = 0xF0;
+    pkt[7] = 0x00;
+    ps3_av_event(s, 0x10000003, pkt, sizeof(pkt));
+}
+
+/*
+ * AVB_PARAM: the video and audio set-up in one packet.  Its sub-packets are
+ * the ones the standalone commands carry; the video mode is where the console
+ * hands the display its resolution, and an AV video packet is where a real
+ * link finishes authenticating.
+ */
+static void ps3_av_avb_param(PS3BootROMState *s, const uint8_t *pkt,
+                             unsigned size)
+{
+    unsigned video = ps3_be16(pkt + 8);
+    unsigned audio = ps3_be16(pkt + 10);
+    unsigned av_video = ps3_be16(pkt + 12);
+    unsigned av_audio = ps3_be16(pkt + 14);
+    const uint8_t *at = pkt + 16;
+    const uint8_t *end = pkt + size;
+    uint32_t status = PS3_AV_STATUS_SUCCESS;
+    bool hdcp = false;
+    unsigned i;
+
+    if (video > 2 || av_video > 4 || av_audio > 4) {
+        ps3_av_reply(s, 0x04000001, PS3_AV_STATUS_INVALID_CMD, NULL, 0);
+        return;
+    }
+
+    for (i = 0; i < video + audio + av_video + av_audio; i++) {
+        unsigned sub;
+
+        if (at + 8 > end) {
+            status = PS3_AV_STATUS_INVALID_CMD;
+            break;
+        }
+        sub = ps3_be16(at + 2) + 4;
+        if (sub < 8 || at + sub > end) {
+            status = PS3_AV_STATUS_INVALID_CMD;
+            break;
+        }
+
+        if (i < video) {                    /* a video mode packet */
+            if (ps3_be32(at + 4) == 0x01000002 && sub >= 48) {
+                uint32_t head = ps3_be32(at + 8);
+                uint32_t w = ps3_be32(at + 20);
+                uint32_t h = ps3_be32(at + 24);
+
+                if (head == 0 && w && h) {
+                    ps3_vga_set_mode(w, h);
+                }
+            }
+        } else if (i >= video + audio) {    /* an AV video (HDMI setup) */
+            if (at[8] == 0 && at[9] <= 1) {
+                hdcp = true;
+            }
+        }
+
+        at += sub;
+    }
+
+    ps3_av_reply(s, 0x04000001, status, NULL, 0);
+    if (status == PS3_AV_STATUS_SUCCESS && hdcp) {
+        ps3_av_hdcp_event(s);
+    }
+}
+
+/* One command packet.  Unknown ones are answered with nothing, as the device. */
+static void ps3_av_command(PS3BootROMState *s, const uint8_t *pkt)
+{
+    uint32_t cid = ps3_be32(pkt + 4);
+    uint8_t body[208];
+    uint16_t port;
+    unsigned i;
+
+    memset(body, 0, sizeof(body));
+
+    switch (cid) {
+    case 0x00000001:                    /* AV_INIT */
+        s->av_version = ps3_be16(pkt);
+        s->av_event_bits |= ps3_be32(pkt + 8);
+        if (s->av_event_bits & 0x80000000u) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 4);
+        } else {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        }
+        break;
+    case 0x00000002:                    /* AV_FIN */
+        s->av_event_bits = 0;
+        s->av_hdcp_done = false;
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x00000003:                    /* AV_GET_HW_CONF */
+        ps3_put_be16(body + 0, 1);      /* one HDMI head */
+        ps3_put_be16(body + 2, 1);      /* one analogue head */
+        ps3_put_be16(body + 4, 1);      /* one S/PDIF */
+        ps3_put_be16(body + 6, 1);      /* bitstream audio */
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 8);
+        break;
+    case 0x00000004:                    /* AV_GET_MONITOR_INFO */
+        port = ps3_be16(pkt + 8);
+        if (port == 0x10) {
+            ps3_av_monitor_info(body, port);
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 208);
+        } else if (port <= 1) {
+            /* The HDMI reply is four bytes short of the structure. */
+            ps3_av_monitor_info(body, port);
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 204);
+        } else {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_PORT, NULL, 0);
+        }
+        break;
+    case 0x00000005: {                  /* AV_GET_BKSV_LIST */
+        port = ps3_be16(pkt + 8);
+        if (port > 1) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_PORT, NULL, 0);
+            break;
+        }
+        ps3_put_be16(body + 0, port);
+        ps3_put_be32(body + 4, 1);
+        body[8] = 0xFF;
+        body[9] = 0xFF;
+        body[10] = 0xF0;
+        body[11] = 0x00;
+        body[12] = 0x00;
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 16);
+        break;
+    }
+    case 0x00000006:                    /* AV_ENABLE_EVENT */
+        s->av_event_bits |= ps3_be32(pkt + 8);
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x00000007:                    /* AV_DISABLE_EVENT */
+        s->av_event_bits &= ~ps3_be32(pkt + 8);
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x0000000A:                    /* AV_TV_MUTE */
+    case 0x0000000B:                    /* AV_NULL_CMD */
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x0000000C:                    /* AV_GET_AKSV */
+        ps3_put_be32(body + 0, 5);
+        body[4] = 0x00;
+        body[5] = 0x00;
+        body[6] = 0x0F;
+        body[7] = 0xFF;
+        body[8] = 0xFF;
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 16);
+        break;
+    case 0x00010003:                    /* VIDEO_DISABLE_SIG */
+    case 0x00010004:                    /* VIDEO_YTRAPCONTROL */
+    case 0x00030001:                    /* ADD_SIGNAL_CTL */
+    case 0x00030003:                    /* SET_CGMS_WSS */
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x00020002:                    /* AUDIO_MUTE */
+        port = pkt[8];
+        if (!(port == 0 || port == 1 || port == 0x10 || port == 0x11 ||
+              port == 0x20 || port == 0x21)) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_PORT, NULL, 0);
+        } else {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        }
+        break;
+    case 0x00020003:                    /* ACP_CTRL */
+    case 0x00020004:                    /* SET_ACP_PACKET */
+        if (pkt[8] > 1) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_PORT, NULL, 0);
+        } else {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        }
+        break;
+    case 0x00040001:                    /* HDMI mode */
+        s->av_hdmi_mode = pkt[8];
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        ps3_av_hdmi_events(s);
+        break;
+    case 0x000A0002:                    /* GET_CEC_CONFIG */
+        ps3_put_be32(body, 1);
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 4);
+        break;
+    case 0x000A0001:                    /* CEC message and the unknowns */
+    case 0x000A0003:
+    case 0x000A0004:
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x01000001:                    /* VIDEO_INIT */
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x01000002: {                  /* VIDEO_MODE */
+        uint32_t head = ps3_be32(pkt + 8);
+        uint32_t w = ps3_be32(pkt + 20);
+        uint32_t h = ps3_be32(pkt + 24);
+
+        if (head > 1 || !w || !h) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_VIDEO, NULL, 0);
+        } else {
+            if (head == 0) {
+                ps3_vga_set_mode(w, h);
+            }
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        }
+        break;
+    }
+    case 0x01000003:                    /* VIDEO_ROUTE: only PS2 has a GX */
+        ps3_av_reply(s, cid, PS3_AV_STATUS_NO_SEL, NULL, 0);
+        break;
+    case 0x01000004:                    /* VIDEO_FORMAT */
+        if (ps3_be32(pkt + 8) > 1 || ps3_be16(pkt + 18) > 1 ||
+            ps3_be32(pkt + 12) > 16) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_VIDEO, NULL, 0);
+        } else {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        }
+        break;
+    case 0x01000005:                    /* VIDEO_PITCH */
+        if (ps3_be32(pkt + 8) > 1 || (ps3_be32(pkt + 12) & 7)) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_VIDEO, NULL, 0);
+        } else {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        }
+        break;
+    case 0x01000006:                    /* VIDEO_GET_HW_CONF */
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, body, 4);
+        break;
+    case 0x02000001:                    /* AUDIO_INIT */
+    case 0x02000003:                    /* AUDIO_MUTE */
+    case 0x02000004:                    /* AUDIO_ACTIVE */
+    case 0x02000005:                    /* AUDIO_INACTIVE */
+    case 0x02000006:                    /* AUDIO_SPDIF_BIT */
+    case 0x02000007:                    /* AUDIO_CTRL */
+        ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        break;
+    case 0x02000002:                    /* AUDIO_MODE */
+        port = pkt[8];
+        if (!(port == 0 || port == 1 || port == 0x10 || port == 0x11 ||
+              port == 0x20 || port == 0x21) || ps3_be32(pkt + 20) > 7) {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_BAD_AUDIO, NULL, 0);
+        } else {
+            ps3_av_reply(s, cid, PS3_AV_STATUS_SUCCESS, NULL, 0);
+        }
+        break;
+    case 0x04000001:                    /* AVB_PARAM */
+        ps3_av_avb_param(s, pkt, ps3_be16(pkt + 2) + 4);
+        break;
+    default:
+        if (s->ppu_trace) {
+            info_report("ps3-av: command 0x%08X has no handler; the device "
+                        "stays silent", cid);
+        }
+        break;
+    }
+
+    (void)i;
+}
+
+/* Take queued bytes out of the device and into the guest. */
+static unsigned ps3_av_take(PS3BootROMState *s, uint8_t *ram,
+                            uint64_t ram_size, uint32_t buf, uint32_t size)
+{
+    unsigned n = MIN(s->av_rx_len, size);
+
+    if (!n) {
+        return 0;
+    }
+    if (!buf || (uint64_t)buf + n > ram_size) {
+        return 0;
+    }
+    memcpy(ram + buf, s->av_rx, n);
+    memmove(s->av_rx, s->av_rx + n, s->av_rx_len - n);
+    s->av_rx_len -= n;
+    return n;
+}
+
+/* A receive with nothing to read waits on the port, not on a queue. */
+static void ps3_av_park(PS3BootROMState *s, uint32_t buf, uint32_t size)
+{
+    PS3Thread *t;
+
+    if (s->thr_cur < 0 || !s->thr[s->thr_cur].used) {
+        return;
+    }
+    t = &s->thr[s->thr_cur];
+    t->parked = true;
+    t->blocked = true;
+    t->wait_eq = PS3_AV_WAIT;
+    t->wait_ea = 0;
+    t->wait_ticks = -1;
+    t->uart_buf = buf;
+    t->uart_size = size;
+    s->lv2_park = true;
+    s->sched_pending = true;
+}
+
+/* Hand what the device just queued to the receiver waiting for it. */
+static bool ps3_av_wake(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size)
+{
+    unsigned i;
+
+    for (i = 0; i < PS3_THREAD_MAX; i++) {
+        PS3Thread *t = &s->thr[i];
+        unsigned n;
+
+        if (!t->used || !t->parked || t->wait_eq != PS3_AV_WAIT) {
+            continue;
+        }
+        n = ps3_av_take(s, ram, ram_size, t->uart_buf, t->uart_size);
+        if (!n) {
+            return false;
+        }
+        if (s->ppu_trace) {
+            info_report("ps3-av: %u byte(s) wake thread 0x%X", n, t->id);
+        }
+        ps3_thread_finish_call(s, t, ram, ram_size, n);
+        return true;
+    }
+    return false;
+}
+
+/* Walk the packets the guest has sent, answering the ones it can. */
+static void ps3_av_parse(PS3BootROMState *s)
+{
+    unsigned at = 0;
+
+    while (s->av_tx_len - at >= 8) {
+        const uint8_t *pkt = s->av_tx + at;
+        unsigned size = ps3_be16(pkt + 2) + 4;
+
+        if (ps3_be16(pkt + 2) == 0xFFFC) {
+            ps3_av_reply(s, 0xDEAD, PS3_AV_STATUS_FAILURE, NULL, 0);
+            at = s->av_tx_len;
+            break;
+        }
+        if (size < 8 || size > PS3_AV_TX_SIZE) {
+            at = s->av_tx_len;
+            break;
+        }
+        if (s->av_tx_len - at < size) {
+            break;              /* the rest of the packet is still coming */
+        }
+        if (ps3_be16(pkt) != PS3_AV_VERSION) {
+            ps3_av_reply(s, ps3_be32(pkt + 4), PS3_AV_STATUS_INVALID_CMD,
+                         NULL, 0);
+            at = s->av_tx_len;
+            break;
+        }
+        if (s->ppu_trace) {
+            info_report("ps3-av: command 0x%08X, %u byte(s)",
+                        ps3_be32(pkt + 4), size);
+        }
+        ps3_av_command(s, pkt);
+        at += size;
+    }
+
+    if (at) {
+        memmove(s->av_tx, s->av_tx + at, s->av_tx_len - at);
+        s->av_tx_len -= at;
+    }
+}
+
 static void ps3_lv2_service(PS3BootROMState *s)
 {
     CPUState *cs = qemu_get_cpu(0);
@@ -12271,6 +12915,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = 0;
             break;
         }
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: event_queue_receive 0x%X: nothing "
+                        "queued, parking thread 0x%X on index %d", a0,
+                        s->thr[s->thr_cur].id, q);
+        }
         ps3_eq_park(s, q, a1, a2);
         ret = 0;
         break;
@@ -12332,6 +12981,10 @@ static void ps3_lv2_service(PS3BootROMState *s)
         s->ep[idx].eq = -1;
         s->ep[idx].name = a2;
         ps3_put_be32(ram + a0, s->ep[idx].id);
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: event port 0x%X created (type %u, "
+                        "name 0x%X)", s->ep[idx].id, a1, a2);
+        }
         ret = 0;
         break;
     }
@@ -12365,6 +13018,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
         s->ep[p].eq = q;
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: event_port_connect_local: port 0x%X "
+                        "-> queue 0x%X (index %d)", s->ep[p].id,
+                        s->eq[q].id, q);
+        }
         ret = 0;
         break;
     }
@@ -12490,8 +13148,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ev.data3 = a3;
         ps3_eq_push(&s->eq[q], &ev);
         if (!ps3_eq_wake(s, ram, ram_size, q) && s->ppu_trace) {
-            info_report("ps3-ppu: lv2: event queued on 0x%X (no taker yet)",
-                        s->eq[q].id);
+            /*
+             * The event stays queued for whoever waits next.  Name the queue
+             * and the port, because a send that never finds a taker is how a
+             * missing peer shows up in this model.
+             */
+            info_report("ps3-ppu: lv2: event queued on 0x%X (index %d, "
+                        "port 0x%X, no taker yet)", s->eq[q].id, q,
+                        s->ep[p].id);
         }
         ret = 0;
         break;
@@ -13068,6 +13732,12 @@ static void ps3_lv2_service(PS3BootROMState *s)
     case 0x058:                 /* sys_interrupt_thread_eoi */
     case 0x059:                 /* _sys_interrupt_thread_disestablish */
     case 0x16F:                 /* sys_uart_initialize */
+        /*
+         * libavst opens the AV device here.  It is part of the console, so it
+         * answers whatever the VSH sends it; a second open is the same device
+         * and succeeds too.
+         */
+        s->av_up = true;
         ret = 0;
         break;
     case 0x052:                 /* sys_event_flag_create(id*, attr*, init) */
@@ -13098,16 +13768,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     case 0x170: {               /* sys_uart_receive(buf, size, mode) */
-        /*
-         * This is the console's AV receiver channel: the bytes come from
-         * outside, and this model has no AV source, so there is never one to
-         * return.  Answering success with nothing written turned the AV
-         * streaming thread into a poll loop - 7800 calls in a single run, and
-         * it eventually fell off its stack.  lv2 blocks here, so the caller is
-         * parked: it waits for input that never comes, which is what a
-         * console with nothing on the AV connector does.
-         */
-        if (!a1) {          /* size == 0 is an immediate success */
+        unsigned got;
+
+        if (!a1) {              /* size == 0 is an immediate success */
             ret = 0;
             break;
         }
@@ -13115,26 +13778,47 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EFAULT;
             break;
         }
-        ps3_sync_park(s, 0);
+        got = ps3_av_take(s, ram, ram_size, a0, a1);
+        if (got) {
+            ret = got;
+            break;
+        }
+        if (a2 & 1) {           /* the caller waits for the device to speak */
+            ps3_av_park(s, a0, a1);
+        }
         ret = 0;
         break;
     }
     case 0x171: {               /* sys_uart_send(buf, size) */
-        uint32_t n;
-
         if ((uint64_t)a0 + a1 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
         }
-        for (n = 0; n < a1; n++) {
-            ps3_uart_putc(s, ram[a0 + n]);
+        if (!a1) {
+            ret = 0;
+            break;
         }
-        ret = 0;
+        if (s->av_tx_len + a1 > PS3_AV_TX_SIZE) {
+            ret = PS3_LV2_EAGAIN;   /* the device's own buffer is full */
+            break;
+        }
+        memcpy(s->av_tx + s->av_tx_len, ram + a0, a1);
+        s->av_tx_len += a1;
+        ps3_av_parse(s);
+        ps3_av_wake(s, ram, ram_size);
+        /*
+         * lv2 answers a write with the byte count it took, not with 0: the
+         * VSH's libavst wrapper compares the answer with the length it asked
+         * to send and treats anything else as a short write.  A zero here
+         * made avst_init tear its own channels down right after the flush.
+         */
+        ret = a1;
         break;
     }
     case 0x172:                 /* sys_uart_get_params(out) */
-        if (a0 && (uint64_t)a0 + 64 <= ram_size) {
-            memset(ram + a0, 0, 64);
+        if (a0 && (uint64_t)a0 + 16 <= ram_size) {
+            ps3_put_be64(ram + a0, PS3_AV_RX_SIZE);
+            ps3_put_be64(ram + a0 + 8, PS3_AV_RX_SIZE);
         }
         ret = 0;
         break;
@@ -13638,8 +14322,10 @@ static void ps3_lv2_service(PS3BootROMState *s)
          * froze the VSH's main thread at its first join of a worker.
          */
         if (s->ppu_trace) {
-            info_report("ps3-ppu: lv2: join 0x%X from thread 0x%X", a0,
-                        s->thr_cur >= 0 ? s->thr[s->thr_cur].id : 0);
+            info_report("ps3-ppu: lv2: join 0x%X from thread 0x%X (lr "
+                        "0x%" PRIX64 ")", a0,
+                        s->thr_cur >= 0 ? s->thr[s->thr_cur].id : 0,
+                        (uint64_t)cpu->env.lr);
         }
         if (s->thr_cur >= 0 && s->thr[s->thr_cur].used) {
             PS3Thread *j = &s->thr[s->thr_cur];

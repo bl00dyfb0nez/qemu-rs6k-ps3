@@ -42,4 +42,7 @@ unsigned ps3_vga_hdmi_edid(uint8_t *out, unsigned cap);
 /* The mode the guest selected through cellVideoOutConfigure. */
 void ps3_vga_set_mode(uint32_t w, uint32_t h);
 
+/* The mode the display currently offers, for the AV service to report. */
+void ps3_vga_mode(uint32_t *w, uint32_t *h);
+
 #endif /* PS3_VGA_H */

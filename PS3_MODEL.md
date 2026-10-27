@@ -456,10 +456,11 @@ ps3-rsx: draw done: 6 primitive(s), 19200 pixel(s), 19200 shaded by the fp40
 
 Status: the pipeline is in the model and the draw test below still passes
 through it (with no program loaded it takes the attribute path, and reports
-`0 shaded by the fp40`).  The real VSH run has not drawn through it yet: its
-main thread still parks joining the `_libavst_receiver_thread_entry` worker
-before `cellGcmInit`, so the window keeps the boot screen rather than an XMB
-frame.  That park is the next thing to solve, and the shaders are ready for it.
+`0 shaded by the fp40`).  The real VSH run has not drawn through it yet.  It
+gets past the `libavst` exchange now (see "The libavst handshake" below), and
+the main thread's next stop is inside `sys_audio.sprx`, waiting on that module's
+event queue before `cellGcmInit` - so the window still keeps the boot screen
+rather than an XMB frame, and the shaders stay ready for the first draw.
 
 #### The draw test
 
@@ -1727,6 +1728,60 @@ that a console which has never been updated does not have, and handling both:
 ps3-ppu: lv2: open(/dev_flash2/turn_hdd) -> ...: No such file or directory (lr=0x62A664)
 ps3-ppu: lv2: open(/dev_flash2/post_update) -> ...: No such file or directory (lr=0x62A664)
 ```
+
+### The libavst handshake: what `sys_uart_send` must return
+
+The VSH's `avst` library talks to the console's AV controller over lv2's uart
+calls, and its bring-up is a request/reply exchange with that controller.  On
+the model's side the exchange looked complete - the device answered every
+command - but the guest tore its own channels down right after sending them:
+
+```
+ps3-av: command 0x01000001, 8 byte(s)      (the flush avst_init makes)
+ps3-av: reply cid 0x01000001 status 0x00
+...
+lv2: event queued on 0x147 (index 11, port 0x146, no taker yet)
+lv2: join 0x14E from thread 0x0 (lr 0x5D9F64)
+```
+
+The join is inside `avst`'s teardown, and the caller of that teardown is
+`avst`'s module-start error path - so `avst_init` had returned a failure even
+though the device answered.  The VSH's own disassembly names the test:
+
+```
+5DED54: sys_uart_send(buf, size)           ; wrapper the C code calls
+5DED70: sc
+5DED74: xor  r29, r29, r3                  ; r29 was the size argument
+5DED78: ... 0x80210403 on a mismatch       ; "short write"
+```
+
+`avst` compares the call's answer with the length it asked to write, so lv2
+must answer a write with the **number of bytes it took**, not with 0.  The
+model returned 0 for a successful send, so every flush looked like a short
+write (`0 ^ 40`), `avst_init` failed, and the module destroyed the channels it
+had just built - including the receiver thread the main thread then joined.
+`sys_uart_send` (`0x171`) now returns the byte count, like `sys_uart_receive`
+already did.
+
+The rest of the exchange was already right once the send reported success.  The
+main thread's pump (`0x5DC194`) waits on the channel's reply queue with a 3 s
+timeout, the receiver thread (`_libavst_receiver_thread_entry`, entry
+`0x5DBF54`) delivers each reply into the channel's ring and signals its port,
+and the pump walks the replies.  The negotiation then runs to the end a real
+console sees:
+
+```
+ps3-av: command 0x00000004, 12 byte(s)     GET_MONITOR_INFO
+ps3-av: reply cid 0x00000004 status 0x00 (208 byte(s))
+ps3-av: command 0x01000003, 24 byte(s)     SET_AV_SETTING (retried 3x, 0x0F)
+ps3-av: command 0x00000005, 12 byte(s)     GET_AV_SETTING
+ps3-av: command 0x01000004, 20 byte(s)     SET_AV_SETTING (video)
+```
+
+and the VSH goes on to start `cec_module_thread` and `x3::hidportassign`,
+which the previous build never reached.  The main thread now leaves `avst` and
+parks inside `sys_audio.sprx` on its own event queue (`0x15A`) - the next stop,
+and not the AV one.
 
 ### What the VSH is still waiting for
 
