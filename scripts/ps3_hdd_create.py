@@ -35,6 +35,9 @@ import sys
 SECTOR = 512
 MAGIC = b"PS3ATA01"
 DEFAULT_SIZE = 20 * 1024 ** 3
+# The console's own drive went up to 1 TB; the model keeps the same ceiling so
+# an image stays a console's disk and not a container for the host's files.
+MAX_SIZE = 1024 ** 4
 
 # The two static "SB indiv" seeds from ps3_decrypt_tools' kgen.c, the same
 # constants the model's ps3_ata_keys() runs through AES-256-CBC.
@@ -183,11 +186,12 @@ def key_sector(erk, data_key, tweak_key):
 
 
 def parse_size(text):
-    text = text.strip().upper()
+    text = text.strip().upper().replace(" ", "")
     mult = 1
     for suffix, m in (("KIB", 1024), ("MIB", 1024 ** 2), ("GIB", 1024 ** 3),
+                      ("TIB", 1024 ** 4), ("TB", 1000 ** 4),
                       ("K", 1000), ("M", 1000 ** 2), ("G", 1000 ** 3),
-                      ("B", 1)):
+                      ("T", 1000 ** 4), ("B", 1)):
         if text.endswith(suffix):
             mult = m
             text = text[:-len(suffix)]
@@ -196,6 +200,8 @@ def parse_size(text):
         value = int(text, 0)
     except ValueError:
         raise SystemExit("bad size: %s" % text)
+    if value <= 0:
+        raise SystemExit("size must be positive")
     return value * mult
 
 
@@ -205,7 +211,8 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("--size", default=str(DEFAULT_SIZE),
-                    help="image size (default 20G)")
+                    help="image size, up to 1 TB: 20G, 250G, 1T "
+                         "(default 20G)")
     ap.add_argument("--erk-file")
     ap.add_argument("--erk", help="48-byte EID root key as hex")
     ap.add_argument("--data-key", help="32-byte ATA data key as hex")
@@ -220,13 +227,33 @@ def main(argv=None):
     size = parse_size(args.size)
     if size < SECTOR or size % SECTOR:
         raise SystemExit("size must be a multiple of 512 bytes")
+    if size > MAX_SIZE:
+        raise SystemExit("size is capped at 1 TB (%d bytes); %d asked for "
+                         "(%s)" % (MAX_SIZE, size, args.size))
 
     if os.path.exists(args.output):
         raise SystemExit("%s exists; remove it first" % args.output)
 
+    def make_sparse(f):
+        """Grow the image to `size' without writing it out.
+
+        The data area is an unformatted disk, so every block past sector 0 is
+        zeros; on a filesystem that supports sparse files this costs nothing
+        but the directories.  Where it does not (Windows on NTFS through some
+        filesystems, or a full host disk) the OS says ENOSPC, and that is a
+        host limit worth naming rather than a traceback.
+        """
+        try:
+            f.truncate(size)
+        except OSError as e:
+            raise SystemExit("%s: cannot size the image to %d bytes (%s); the "
+                             "data area is sparse, so this is the host "
+                             "filesystem or its free space, not the console"
+                             % (args.output, size, e.strerror or e))
+
     if args.no_key:
         with open(args.output, "wb") as f:
-            f.truncate(size)
+            make_sparse(f)
         print("%s: %d bytes, no key sector (the model runs it unkeyed)" %
               (args.output, size))
         return 0
@@ -264,7 +291,8 @@ def main(argv=None):
 
     with open(args.output, "wb") as f:
         f.write(sector0)
-        f.truncate(size)
+        f.flush()
+        make_sparse(f)
 
     print("%s: %d bytes, key sector written (ATA data key sha256 %s, "
           "tweak key sha256 %s)" %

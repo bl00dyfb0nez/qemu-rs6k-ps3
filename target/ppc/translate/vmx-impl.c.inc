@@ -105,6 +105,23 @@ TRANS(STVEBX, do_ldst_ve_X, 1, gen_helper_STVEBX);
 TRANS(STVEHX, do_ldst_ve_X, 2, gen_helper_STVEHX);
 TRANS(STVEWX, do_ldst_ve_X, 4, gen_helper_STVEWX);
 
+/*
+ * The left/right indexed forms take an EA that is deliberately unaligned -
+ * the low four bits say which half of the block the vector carries - so the
+ * helper is handed the address as it stands (size 1 leaves it alone) and does
+ * the byte placement itself.  There is no cache to touch, so lvlxl/stvlxl and
+ * lvrxl/stvrxl are the same instructions as their unlocked forms.
+ */
+TRANS(LVLX, do_ldst_ve_X, 1, gen_helper_LVLX);
+TRANS(LVLXL, do_ldst_ve_X, 1, gen_helper_LVLXL);
+TRANS(LVRX, do_ldst_ve_X, 1, gen_helper_LVRX);
+TRANS(LVRXL, do_ldst_ve_X, 1, gen_helper_LVRXL);
+
+TRANS(STVLX, do_ldst_ve_X, 1, gen_helper_STVLX);
+TRANS(STVLXL, do_ldst_ve_X, 1, gen_helper_STVLXL);
+TRANS(STVRX, do_ldst_ve_X, 1, gen_helper_STVRX);
+TRANS(STVRXL, do_ldst_ve_X, 1, gen_helper_STVRXL);
+
 static void gen_mfvscr(DisasContext *ctx)
 {
     TCGv_i32 t;

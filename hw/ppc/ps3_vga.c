@@ -450,6 +450,33 @@ void ps3_vga_puts(const char *line)
     ps3_vga_present(s);
 }
 
+/*
+ * A warm reset takes the scanout back from the process that had it: the next
+ * frame is the console's own boot screen again, so the window shows the
+ * restart rather than the last frame the old process drew.
+ */
+void ps3_vga_reset_screen(void)
+{
+    PS3VGAState *s = ps3_vga_current;
+
+    if (!s || !s->boot_fb) {
+        return;
+    }
+
+    s->guest_mode = false;
+    s->guest_base = 0;
+    s->guest_w = 0;
+    s->guest_h = 0;
+    s->guest_stride = 0;
+
+    s->lines = 0;
+    memset(s->text, 0, sizeof(s->text));
+    memset(s->boot_fb, PS3_VGA_BG,
+           PS3_VGA_BOOT_W * PS3_VGA_BOOT_H * sizeof(s->boot_fb[0]));
+
+    ps3_vga_present(s);
+}
+
 void ps3_vga_printf(const char *fmt, ...)
 {
     char line[PS3_VGA_TEXT_COLS + 1];

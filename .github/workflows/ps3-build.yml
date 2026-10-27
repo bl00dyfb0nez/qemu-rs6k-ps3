@@ -5,7 +5,19 @@
 # the guest window - builds it with ninja, and then proves the binary it produced
 # actually carries the machine and the display backend: `-M help` must list
 # rs6000-ps3 and `-display help` must list sdl.  A build that links but registers
-# nothing would pass a bare compile, so the smoke test is the last step.
+# nothing would pass a bare compile, so the smoke test runs before the binary is
+# uploaded, and the artifact is the same file that passed it.
+#
+# The action versions are the Node 24 runtime releases: GitHub removed the
+# Node 20 action runtime on 23 September 2026, so checkout is v5 (the first
+# Node 24 release) and upload-artifact is v6 (the first whose default runtime is
+# Node 24).  setup-msys2's v2 line moved to Node 24 in 2.31.0, which is what the
+# `v2` tag resolves to.
+#
+# Artifacts cannot be kept forever - GitHub expires them, and deleting a run
+# deletes its artifacts.  `retention-days: 400` asks for the longest retention a
+# repository can have; a public repository's cap is 90 days, and the uploader
+# clamps the request to the cap with a warning rather than failing.
 
 name: PS3 model build
 
@@ -30,7 +42,7 @@ jobs:
           - arch: arm64
             runs-on: ubuntu-26.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the build dependencies
         run: |
@@ -56,6 +68,14 @@ jobs:
           ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
           ./build/qemu-system-ppc64 -display help | grep -qw sdl
           ./build/qemu-system-ppc64 --version
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: qemu-system-ppc64-linux-${{ matrix.arch }}
+          path: build/qemu-system-ppc64
+          if-no-files-found: error
+          retention-days: 400
 
   windows:
     name: Windows ${{ matrix.arch }}
@@ -89,7 +109,7 @@ jobs:
               mingw-w64-clang-aarch64-SDL2
               mingw-w64-clang-aarch64-git
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: msys2/setup-msys2@v2
         with:
@@ -117,6 +137,14 @@ jobs:
           ./build/qemu-system-ppc64.exe -M help | grep -qw rs6000-ps3
           ./build/qemu-system-ppc64.exe -display help | grep -qw sdl
 
+      - name: Upload the binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: qemu-system-ppc64-windows-${{ matrix.arch }}
+          path: build/qemu-system-ppc64.exe
+          if-no-files-found: error
+          retention-days: 400
+
   macos:
     name: macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
@@ -129,7 +157,7 @@ jobs:
           - arch: arm64
             runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the build dependencies
         run: |
@@ -155,3 +183,11 @@ jobs:
           test -x build/qemu-system-ppc64
           ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
           ./build/qemu-system-ppc64 -display help | grep -qw sdl
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: qemu-system-ppc64-macos-${{ matrix.arch }}
+          path: build/qemu-system-ppc64
+          if-no-files-found: error
+          retention-days: 400

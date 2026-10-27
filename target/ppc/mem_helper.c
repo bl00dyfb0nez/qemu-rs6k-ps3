@@ -378,6 +378,112 @@ void HELPER(ICBIEP)(CPUPPCState *env, target_ulong addr)
 #endif
 
 /*
+ * A vector register's architectural byte, whichever way round the host
+ * keeps the sixteen bytes of the union.  The element helpers below reach the
+ * same place through HI_IDX; the left/right indexed accesses are byte-wide
+ * and index the register directly.
+ */
+static inline uint8_t vec_byte_get(const ppc_avr_t *r, int i)
+{
+    return r->u8[HI_IDX ? 15 - i : i];
+}
+
+static inline void vec_byte_set(ppc_avr_t *r, int i, uint8_t v)
+{
+    r->u8[HI_IDX ? 15 - i : i] = v;
+}
+
+/*
+ * lvlx/lvrx and their locked forms: the sixteen bytes at EA, a window whose low
+ * four bits say where it starts inside its aligned block.  The pair is the Cell
+ * compiler's unaligned 16-byte load - lvlx carries the window's leading 16 - b
+ * bytes at the front of the vector, lvrx its trailing b at the end, and
+ * `lvlx/lvrx/vor' is the window in element order.  An element's byte is the
+ * aligned block's byte (b + the element's offset in the window) mod 16: the
+ * access wraps at the block, so lvrx's elements land in the block's own leading
+ * bytes instead of reading past it.
+ */
+static void vec_lvlx_rx(CPUPPCState *env, ppc_avr_t *r, target_ulong ea,
+                        bool right)
+{
+    uint32_t base = (uint32_t)ea & ~0xf;
+    int b = (uint32_t)ea & 0xf;
+    bool le = ppc_env_is_little_endian(env);
+    /* The window offsets this access carries: lvlx's are the front 16 - b,
+     * lvrx's the b at the back. */
+    int lo = right ? 16 - b : 0;
+    int hi = right ? 16 : 16 - b;
+    int j;
+
+    for (j = 0; j < 16; j++) {
+        /*
+         * A little-endian guest keeps the window's first byte in the vector's
+         * last one, exactly as an element load's index does.
+         */
+        int at = le ? 15 - j : j;
+
+        if (at < lo || at >= hi) {
+            vec_byte_set(r, j, 0);
+            continue;
+        }
+        vec_byte_set(r, j,
+                     cpu_ldub_data_ra(env, base + ((b + at) & 15), GETPC()));
+    }
+}
+
+/*
+ * The stores are the loads the other way round: stvlx writes the vector's
+ * leading 16 - b elements over the window's front, stvrx its trailing b over
+ * its back, at the same block bytes the loads read, so a vector the pair loaded
+ * comes back to the bytes it came from and it writes nothing outside the
+ * sixteen bytes of the window's block.
+ */
+static void vec_stvlx_rx(CPUPPCState *env, ppc_avr_t *r, target_ulong ea,
+                         bool right)
+{
+    uint32_t base = (uint32_t)ea & ~0xf;
+    int b = (int)((uint32_t)ea & 0xf);
+    bool le = ppc_env_is_little_endian(env);
+    int lo = right ? 16 - b : 0;
+    int hi = right ? 16 : 16 - b;
+    int j;
+
+    for (j = 0; j < 16; j++) {
+        int at = le ? 15 - j : j;
+
+        if (at < lo || at >= hi) {
+            continue;               /* each writes only what it carries */
+        }
+        cpu_stb_data_ra(env, base + ((b + at) & 15),
+                        vec_byte_get(r, j), GETPC());
+    }
+}
+
+#define LVLX_RX(name, right)                                        \
+    void HELPER(name)(CPUPPCState *env, ppc_avr_t *r,               \
+                       target_ulong ea)                             \
+    {                                                               \
+        vec_lvlx_rx(env, r, ea, right);                             \
+    }
+LVLX_RX(LVLX, false)
+LVLX_RX(LVLXL, false)
+LVLX_RX(LVRX, true)
+LVLX_RX(LVRXL, true)
+#undef LVLX_RX
+
+#define STVLX_RX(name, right)                                       \
+    void HELPER(name)(CPUPPCState *env, ppc_avr_t *r,               \
+                       target_ulong ea)                             \
+    {                                                               \
+        vec_stvlx_rx(env, r, ea, right);                            \
+    }
+STVLX_RX(STVLX, false)
+STVLX_RX(STVLXL, false)
+STVLX_RX(STVRX, true)
+STVLX_RX(STVRXL, true)
+#undef STVLX_RX
+
+/*
  * We use MSR_LE to determine index ordering in a vector.  However,
  * byteswapping is not simply controlled by MSR_LE.  We also need to
  * take into account endianness of the target.  This is done for the

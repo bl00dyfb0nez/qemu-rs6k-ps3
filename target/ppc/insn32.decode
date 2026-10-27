@@ -849,6 +849,19 @@ STVEWX          011111 ..... ..... ..... 0011000111 -   @X
 STVX            011111 ..... ..... ..... 0011100111 -   @X
 STVXL           011111 ..... ..... ..... 0111100111 -   @X
 
+# The left/right indexed forms carry the two halves of an unaligned access:
+# the Cell PPU's compiler emits them for a 16-byte copy, and without them the
+# instruction is undecodable and takes the program-interrupt vector.
+LVLX            011111 ..... ..... ..... 1000000111 -   @X
+LVLXL           011111 ..... ..... ..... 1100000111 -   @X
+LVRX            011111 ..... ..... ..... 1000100111 -   @X
+LVRXL           011111 ..... ..... ..... 1100100111 -   @X
+
+STVLX           011111 ..... ..... ..... 1010000111 -   @X
+STVLXL          011111 ..... ..... ..... 1110000111 -   @X
+STVRX           011111 ..... ..... ..... 1010100111 -   @X
+STVRXL          011111 ..... ..... ..... 1110100111 -   @X
+
 LVSL            011111 ..... ..... ..... 0000000110 -   @X
 LVSR            011111 ..... ..... ..... 0000100110 -   @X
 

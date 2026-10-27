@@ -17,6 +17,13 @@ void ps3_vga_puts(const char *line);
 void ps3_vga_printf(const char *fmt, ...);
 
 /*
+ * A restart: the guest's scanout is released and the boot screen starts
+ * empty, so the window shows the new boot rather than the frame the old
+ * process left behind.
+ */
+void ps3_vga_reset_screen(void);
+
+/*
  * The console's boot screen once the chain is done: `title' as the wordmark,
  * `caption' under it.  The glyphs are the console font scaled up, so this is
  * the model's rendition of the splash, not Sony's artwork.
