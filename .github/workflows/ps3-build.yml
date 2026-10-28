@@ -75,7 +75,7 @@ jobs:
           name: qemu-system-ppc64-linux-${{ matrix.arch }}
           path: build/qemu-system-ppc64
           if-no-files-found: error
-          retention-days: 400
+          retention-days: 90
 
   windows:
     name: Windows ${{ matrix.arch }}
@@ -143,7 +143,7 @@ jobs:
           name: qemu-system-ppc64-windows-${{ matrix.arch }}
           path: build/qemu-system-ppc64.exe
           if-no-files-found: error
-          retention-days: 400
+          retention-days: 90
 
   macos:
     name: macOS ${{ matrix.arch }}
@@ -190,4 +190,4 @@ jobs:
           name: qemu-system-ppc64-macos-${{ matrix.arch }}
           path: build/qemu-system-ppc64
           if-no-files-found: error
-          retention-days: 400
+          retention-days: 90

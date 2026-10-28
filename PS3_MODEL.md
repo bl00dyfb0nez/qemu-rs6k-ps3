@@ -276,8 +276,8 @@ retail one that cannot carry it, the given ERK is kept for the ladder.
 ### A `.2` loader: the ERK it carries is wrapped
 
 The loaders on a Metldr.2 console hold their ERK wrapped under the console's
-per-console root key 2, so no keyset opens them directly.  Give PCK2 and the
-model unwraps every 16-byte aligned window of the image's first 0x10000 bytes,
+eid_root_key, so no keyset opens them directly.  Give it (the `pck2` property)
+and the model unwraps every 16-byte aligned window of the image's first 0x10000 bytes,
 letting the loader's own root-header check say which one is the ERK; the winner
 is then opened for real before it becomes the ladder's key:
 
@@ -285,21 +285,21 @@ is then opened for real before it becomes the ladder's key:
 $Q -M rs6000-ps3 -display sdl \
    -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
    -global ps3-boot-rom.lv1ldr=lv1ldr.2.self \
-   -global ps3-boot-rom.pck2=$PCK2 \
+   -global ps3-boot-rom.pck2=$EID_ROOT_KEY \
    -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img \
    -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
 ```
 
 ```
-ps3-boot-rom: per-console root key 2 (PCK2) read; the .2 loaders' ERK can be unwrapped
-ps3-boot-rom: lv1ldr.2.self: the value at 0xAC0 unwraps under PCK2 into the key
+ps3-boot-rom: the console's eid_root_key read; the .2 loaders' ERK can be unwrapped
+ps3-boot-rom: lv1ldr.2.self: the value at 0xAC0 unwraps under eid_root_key into the key
               this loader was sealed with
-ps3-boot-rom: NOR lv1ldr: PCK2: ladder seed block at 0xA40 - ... the ladder's ERK
-              is the ERK the loader carries, unwrapped under PCK2
+ps3-boot-rom: NOR lv1ldr: eid_root_key: ladder seed block at 0xA40 - ... the ladder's ERK
+              is the ERK the loader carries, unwrapped under eid_root_key
 ```
 
-A wrong PCK2 unwraps nothing, and a `.2` loader given without one stops with
-`a .2 loader needs the console's PCK2 (pck2/pck2-file)` rather than guessing.
+A wrong eid_root_key unwraps nothing, and a `.2` loader given without one stops with
+`a .2 loader needs the console's eid_root_key (pck2/pck2-file)` rather than guessing.
 
 The window carries the chain's own lines (`SPU PAYLOAD: 67108864 INSTRUCTIONS`,
 `LV0LDR.2 CONTAINER VERIFIED: 191152 BYTES`), then the VSH's stdout, then the
@@ -349,6 +349,29 @@ All three media stay supported, and each one is a boot target of its own:
 | NOR flash | `-drive if=pflash,format=raw,file=...` | the NOR image | an HDD or eMMC image, else the ROS banks |
 | HDD (raw) | `boot-medium=hdd` + `hdd-file` | the first 16 MiB of the disk | the disk's own `dev_flash*`/`dev_hdd0` |
 | NAND/eMMC | `boot-medium=emmc` + `emmc-file` | the eMMC's flash region | the eMMC's storage area |
+
+A NAND/eMMC chip keeps the same containers its NOR sibling does, at the front of
+its flash region, and the 12 GB SuperSlim is the eMMC console while the 250 GB and
+500 GB 40xx are NOR: both put the asecure_loader region at 0x800 and metldr's
+container at 0x840, the region running to 0x2F000 with a ~0xF920-byte payload and
+the rest zero-filled.  `CECH4201A.NAND.BIN` carries the name `metldr.2` at flash
+0x820 and the header at 0x840, and that is the only copy anywhere in its 256 MiB.  The model resolves it by name there - it is not a fallback - and
+the eMMC's own tree at 0x10040000 carries `dev_flash*`, `dev_hdd0` and the empty
+`dev_hdd1` cache partition.
+
+That container is sealed for the chip's own channel-66 root key.  Given a readout
+that opens a NOR image, the eMMC's metldr still reports a MAC mismatch (the
+ROM's `stop 2`), and the console falls through to the vflash recovery program,
+which is the correct behaviour for a chip whose first container this ROM cannot
+open.  Give the medium its own key when it differs:
+
+```sh
+   -global ps3-boot-rom.nand-readout-file=.tmp/dlt/4201A-readout.bin \
+```
+
+`nand-readout` takes the same 32 bytes as 64 hex digits, and either one is used
+by both the chain check and the ROM whenever `boot-medium=emmc`; a failure then
+names the container and the address it was found at.
 
 Each medium is asked for the container its own boot ROM opens.  On NOR (and on
 a chain staged on a disk) that is `lv0ldr.2`.  On NAND/eMMC it is `metldr.2` in
@@ -425,7 +448,7 @@ audiodev feed `sys_mic`'s rings.
 | `erk-file`, `pck1-file`, `readout-file` | - | the console's 48-byte ERK + RIV (the name `pck1` gives the same value), or the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi.  Optional: without it the ERK is the one the loader in `lv1ldr`/`nand-loader` carries |
 | `pck1`, `erk` | - | the same 48 bytes as hex (96 digits); `pck1` is the console's name for it |
 | `lv1ldr`, `nand-loader` | - | the console's loader image the ERK and the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  The key that opens it *is* the ladder's ERK, so a loader alone keys the storage ladder; the published loader keyset is accepted for a retail image and says so, and both images are read and must agree |
-| `pck2`, `pck2-file` | - | the console's per-console root key 2, 48 bytes.  Only a `.2` loader needs it: that image carries its ERK wrapped, and PCK2 is what unwraps it - the ERK the unwrap yields is then the ladder's key |
+| `pck2`, `pck2-file` | - | the console's eid_root_key (the ERK+RIV, 48 bytes; the property names are the old ones and are kept for scripts).  Only a `.2` loader needs it: that image carries its ERK wrapped, and eid_root_key is what unwraps it - the ERK the unwrap yields is then the ladder's key |
 | `container` | `lv0ldr.2` | container to look for in the flash image |
 | `hdd-file`, `emmc-file` | - | the drive, or the eMMC, the firmware trees and the application are mounted from |
 | `hdd-file`, `hdd-size` | - / 20G | raw disk image, and the size the model gives a fresh one (1 TB max) |
@@ -448,7 +471,7 @@ window's pixels can be inspected without a display.
 | --- | --- | --- |
 | device selftest + mask ROM replay | any run with `-bios` | `selftest passed (AES-128 KAT, sealed container round trip, mask ROM replayed by the SPU interpreter)` |
 | container opener | `-drive if=pflash,...` with the readout | `container verified, 191152 bytes of payload` |
-| a `.2` loader, whose ERK is wrapped | `-global ps3-boot-rom.lv1ldr=lv1ldr.2.self -global ps3-boot-rom.pck2=<96 hex>` | `the value at 0x... unwraps under PCK2 into the key this loader was sealed with`, then `NOR lv1ldr: PCK2: ladder seed block at 0x...` with `the ladder's ERK is the ERK the loader carries, unwrapped under PCK2`.  A wrong PCK2 finds no window, and a `.2` loader with no PCK2 given stops and says so |
+| a `.2` loader, whose ERK is wrapped | `-global ps3-boot-rom.lv1ldr=lv1ldr.2.self -global ps3-boot-rom.pck2=<96 hex>` | `the value at 0x... unwraps under eid_root_key into the key this loader was sealed with`, then `NOR lv1ldr: eid_root_key: ladder seed block at 0x...` with `the ladder's ERK is the ERK the loader carries, unwrapped under eid_root_key`.  A wrong eid_root_key finds no window, and a `.2` loader with no eid_root_key given stops and says so |
 | ladder seeds and ERK from the console's own loader | `-global ps3-boot-rom.lv1ldr=lv1ldr.self` - no key on the command line | `NOR lv1ldr: ...: ladder seed block at 0x1BB20 - the ATA and flash ladders run on the console's own seeds; the ladder's ERK is <where it came from>`, and `the NOR and NAND loaders carry the same four seeds` when both are given.  A loader with no block (or a mismatched pair) stops the run with the reason.  `pck1=`/`erk-file=` still override the ERK, and a retail image cannot carry a per-console key, so a given ERK is kept and that is reported |
 | a loader stage | `-global ps3-boot-rom.stage-elf=lv2ldr.self` | exit 0, `stop 48 at ...` (the loaders' signal) |
 | lv0 and above | `-global ps3-boot-rom.ppu-elf=lv0.self` | exit 0 at the next hand-off |
@@ -474,7 +497,7 @@ $LD -Ttext=0x02000000 -e _start -o .tmp/sys_audio_test.elf .tmp/sys_audio_test.o
 | `ps3_hdd_create.py --erk-file ... --size 20G -o disk.raw --verify` | raw disk: sector 0 is the ATA key block under PCK1, the rest XTS; `--size` takes `20G`/`512M`/`1MiB` or bytes, up to 1 TB |
 | `ps3_hdd_tree.py` | put `dev_flash`, `dev_flash2`, `dev_flash3`, `dev_hdd0` trees into such an image (and take them out again) |
 | `ps3_ram_dump.py --launch` / `--read ... --disasm` | dump guest RAM from a running machine over QMP, then read or disassemble it in place |
-| `ps3_emmc_create.py [dump] --identify` / `-o emmc_12g.img --tree-root ...` | identify a NAND/eMMC dump (model, firmware, ldr revision, region table), then build the 12 GB image: flash region at 0x40000 and the `dev_flash*`/`dev_hdd0` tree past 256 MiB |
+| `ps3_emmc_create.py [dump] --identify` / `-o emmc_12g.img --tree-root ...` | identify a NAND/eMMC dump (model, firmware, ldr revision, region table), then build the 12 GB image: flash region at 0x40000 and the `dev_flash*`/`dev_hdd0`/`dev_hdd1` tree past 256 MiB |
 
 `scripts/PS3_TOOLS.md` is the index for those four: inputs, outputs, workflows
 and what each one refuses to do.  No key is ever printed, and nothing derived
@@ -511,6 +534,44 @@ its resource loader inflates is not coming out of a plain read of
 The XMB frame therefore has not been drawn yet; `emer_init` is the application
 that comes up when the checks do not pass, and it draws its own screen through
 the same cellGcm path.
+
+The XMB's resource file can be had back out of a run: with `PS3_DUMP_RCO=<dir>`
+in the environment, the model assembles every `.rco` the loader reads from the
+8 KiB chunks it asks for (`read` always lands in one scratch buffer, so the file
+never exists whole in RAM) and writes the copy there.
+`/dev_flash/vsh/resource/system_plugin.rco` came back as 296,356 bytes, magic
+`FRP\0`, version 0x130.  Its TOC is a zlib stream at 0xB0 - 61,856 bytes that
+unpack to 190 entries: MainTree over an ImageTree (81), a SoundTree (9), a
+TextTree (20), an ObjectTree (9) and an AnimTree (8) - and the file carries
+three more streams (UTF-16 text tables at 0x61B4, 0x6B7C, 0x7544) and the 17
+VAG payloads of its sound tree in the tail.  The copy holds what the reads
+delivered, not the whole file: the loader reads the head and the sound section
+in its first pass (0x0..0x81A4, then 0x2FEE4..0x485A4) and leaves the image
+table unread until it has a screen to draw it on, so the gap in the copy is the
+loader's own read pattern - the file on the extracted dev_flash tree is
+byte-identical to the source, 0 differences over all 296,356 bytes.  The
+inflate-range probe scans the reading thread at every lv2 call and the other
+threads every 32nd, over a 2,000-call window, and reports when no stream is
+left on any thread's stack to read.  Reading the wrapper's frame is not enough
+for the VSH's own zlib: by the time lv2 is entered the wrapper has ended its
+stream and nothing on the stack still names the ranges, so the probe records
+r3..r6 at the wrapper's entry instead.  The entry is 0x40BE7C in this image:
+it saves r5/r6/r3/r4 as `next_in`/`avail_in`/`next_out`/`avail_out` of a
+0x38-byte stream, calls inflateInit_, inflate(..., Z_FINISH) and inflateEnd,
+and formats `inflate failed - %s` from 0x690318 - found by dumping RAM and
+scanning for the `lis`/`addi` pair that materialises that string's address (the
+first reference is at 0x40BF70).  The hook itself is a function pointer the
+machine installs (`ps3_pc_hook_fn`), so it costs one predictable branch per
+translation block and nothing at all unless a dump was asked for.
+
+`sys_config` is a real interface now, not an acknowledgement: `sys_config_open`
+remembers the queue, `sys_config_add_service_listener` announces the two
+implicit padmanager services (0x11/0x12) to it the way lv2 does - one queue
+event carrying the event id in `data2` and the buffer size in `data3` - and
+`sys_config_get_service_event` writes the `sys_config_service_event_t` back,
+HID descriptor included.  The VSH's `_cfg_ev_hndlr` parks on its config queue
+until a listener asks for those services, and the announcement is what wakes
+it.
 
 A worker that loops on a low-page exception vector is reported with the vector,
 `SRR0`/`SRR1` and the word it faulted on, then retired (an unresolved-import

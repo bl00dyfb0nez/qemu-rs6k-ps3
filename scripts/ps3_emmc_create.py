@@ -11,7 +11,7 @@ the ps3tools notes describes it and as this tool writes it:
                       0x40200, i.e. 0x200 into this region, and the region is
                       256 MiB (0x10000000) long
     0x10000000..      the storage area, which is where the console keeps its
-                      dev_flash / dev_flash2 / dev_flash3 / dev_hdd0 files
+                      dev_flash / dev_flash2 / dev_flash3 / dev_hdd0 / dev_hdd1 files
 
 A dump taken from the console (GameOS or a chip reader that skips the preamble)
 starts at 0x40000, so this tool detects that base on its own: such a dump begins
@@ -398,7 +398,7 @@ def main(argv=None):
     ap.add_argument("--model", help="the SKU, when the dump does not say")
     ap.add_argument("--tree-root",
                     help="a directory holding dev_flash, dev_flash2, "
-                         "dev_flash3 and dev_hdd0 to store in the image")
+                         "dev_flash3, dev_hdd0 and dev_hdd1 to store in the image")
     ap.add_argument("--identify", action="store_true",
                     help="only say what the dump is")
     args = ap.parse_args(argv)

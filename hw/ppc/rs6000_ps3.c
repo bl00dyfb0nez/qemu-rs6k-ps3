@@ -123,6 +123,7 @@ typedef struct PS3ReadCall {
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
 #include "hw/ppc/ppc.h"
+#include "hw/ppc/ps3_pc_hook.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qom/object.h"
@@ -1067,6 +1068,12 @@ struct PS3BootROMState {
     char *readout;
     char *readout_file;
     uint8_t readout_bytes[32];
+    /* The same, for a NAND/eMMC medium whose first container is sealed
+       differently from the NOR one. */
+    char *nand_readout;
+    char *nand_readout_file;
+    uint8_t nand_readout_bytes[32];
+    bool has_nand_readout;
     bool has_readout;
     bool selftest;
     bool mic_selftest;              /* drive the cellMic path once at start */
@@ -1126,6 +1133,33 @@ struct PS3BootROMState {
     unsigned rco_watch_calls;
     uint32_t rco_stream_in;
     unsigned rco_stream_reports;
+    /*
+     * sys_config: the event queue the guest opened it on, the handle it was
+     * given, and the service events that are waiting for
+     * sys_config_get_service_event.  lv2 has two implicit services, the two
+     * padmanager IDs, and their announcement is what the VSH's config event
+     * handler parks for before the rest of its services come up.
+     */
+    uint32_t lv2_cfg_queue;
+    uint32_t lv2_cfg_handle;
+    struct {
+        bool used;
+        uint32_t id;            /* the id the queue event carries */
+        uint32_t listener;      /* the listener handle that got it */
+        uint32_t service;       /* 0x11 or 0x12 */
+        uint32_t size;          /* bytes of data behind the fixed part */
+        uint8_t data[0x1a];
+    } lv2_cfg_ev[8];
+    /*
+     * The .rco as the loader reads it.  Its reads all land in one scratch
+     * buffer, so the file never exists whole in RAM: it is assembled here as
+     * the reads go by, which is what the dumped copy is made from.
+     */
+    char *rco_path;
+    uint8_t *rco_bytes;
+    size_t rco_len;             /* highest offset written, so far */
+    size_t rco_read;            /* bytes actually delivered by reads */
+    size_t rco_cap;
     unsigned ppu_fault_reports;
     char ppu_why[160];
 
@@ -1412,7 +1446,7 @@ struct PS3BootROMState {
     bool has_ladder_seeds;
     uint32_t ladder_off[2];         /* where each image carried the block */
     const char *ladder_medium[2];
-    char *pck2_prop;                /* per-console root key 2, hex */
+    char *pck2_prop;                /* the console's eid_root_key, hex */
     char *pck2_file;                /* or a 48-byte file */
     uint8_t pck2[48];
     bool has_pck2;
@@ -1644,6 +1678,37 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
  */
 #define PS3_LV2_SCRATCH 0x880
 #define PS3_LV2_HEAP    0x808
+
+/*
+ * The model's RAM map, low to high.  Three allocators hand out memory on this
+ * machine and each has to stay in its own band: when two share one, a block
+ * one of them hands out lands on bytes the other is still using.  That is what
+ * the display's resource loader kept running into - it built its buffer on the
+ * container's break, and the next sys_memory_allocate gave the same bytes to
+ * another caller.
+ *
+ *   guest heap   the VSH's own allocator, growing up from the bottom of user
+ *                memory; its ceiling is the size sys_memory_get_user_memory_size
+ *                reports, so it never asks for more than its band
+ *   mmapper      the mapper's reservations for RSX surfaces
+ *   container    lv2's own blocks: PRX modules, sys_memory_allocate, loaded
+ *                modules, the import stubs
+ *
+ * The container used to start at the same 0x01000000 the guest's heap does, so
+ * by the time the VSH loaded system_plugin.rco the two breaks had crossed.
+ *
+ * The 1 MiB at 0x0D400000 is the window the guest maps its RSX IO io at, so a
+ * module or a thread stack placed there is not RAM to the guest any more: it
+ * reads I/O instead of its own code.  Nothing the container hands out may land
+ * in it, which is why the container starts above it.
+ */
+#define PS3_LV2_GUEST_HEAP_BASE 0x01000000u
+#define PS3_LV2_GUEST_HEAP_END  0x07000000u
+#define PS3_LV2_MMAP_BASE       0x07000000u
+#define PS3_LV2_MMAP_END        0x0D400000u
+#define PS3_LV2_RSX_IO_BASE     0x0D400000u
+#define PS3_LV2_RSX_IO_END      0x0D500000u
+#define PS3_LV2_CONTAINER_BASE  0x0D500000u
 
 /* lv2 reports its errors as negative Cell error codes. */
 #define PS3_LV2_EINVAL  ((int32_t)0x80010002)
@@ -2316,6 +2381,8 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
     uint64_t offset = 0;
     uint32_t blocks, result;
     uint8_t *plain, key[16];
+    const bool nand_medium = s->boot_medium &&
+                             !strcmp(s->boot_medium, "emmc");
 
     if (!s->flash) {
         snprintf(why, why_len, "no flash image");
@@ -2326,7 +2393,11 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
         return false;
     }
 
-    if (!s->has_readout) {
+    /*
+     * A NAND/eMMC medium may be sealed for its own channel-66 key, so that is
+     * the one its first container is checked with when the caller gave both.
+     */
+    if (!s->has_readout && !(nand_medium && s->has_nand_readout)) {
         snprintf(why, why_len, "no channel-66 readout");
         return false;
     }
@@ -2334,12 +2405,15 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
     blocks = ps3_be32(s->flash + offset + 0x10);
     plain = g_malloc0((size_t)blocks * 16);
     result = ps3_rom_open(s->flash + offset, s->flash + offset + PS3_CONTAINER_HDR,
-                          (size_t)blocks * 16, s->readout_bytes, plain, key);
+                          (size_t)blocks * 16,
+                          (nand_medium && s->has_nand_readout) ?
+                          s->nand_readout_bytes : s->readout_bytes,
+                          plain, key);
     g_free(plain);
 
     if (result != PS3_BOOT_OK) {
-        snprintf(why, why_len, "the %s container does not verify (stop 0x%X)",
-                 name, result);
+        snprintf(why, why_len, "the %s container at flash 0x%" PRIX64
+                 " does not verify (stop 0x%X)", name, offset, result);
         return false;
     }
 
@@ -2367,6 +2441,8 @@ static void ps3_rom_home_tick(void *opaque)
 static void ps3_rom_boot(PS3BootROMState *s)
 {
     const char *name = s->container ?: "lv0ldr.2";
+    const bool nand_medium = s->boot_medium &&
+                             !strcmp(s->boot_medium, "emmc");
     uint8_t ch66[32];
     uint8_t *plain;
     char why[160];
@@ -2405,7 +2481,12 @@ static void ps3_rom_boot(PS3BootROMState *s)
      * K_lo, second 16 in K_hi.  With no readout the channel returns zeros,
      * which is what it does once metldr is loaded, and the MAC fails.
      */
-    if (s->has_readout) {
+    if (nand_medium && s->has_nand_readout) {
+        memcpy(ch66, s->nand_readout_bytes, sizeof(ch66));
+        info_report("ps3-boot-rom: the NAND/eMMC medium's own channel-66 "
+                    "readout is used for %s at flash 0x%" PRIX64, name,
+                    s->container_offset);
+    } else if (s->has_readout) {
         memcpy(ch66, s->readout_bytes, sizeof(ch66));
     } else {
         memset(ch66, 0, sizeof(ch66));
@@ -3038,14 +3119,17 @@ static const MemoryRegionOps ps3_ppe_uart_ops = {
 };
 
 /*
- * The memory container: a bump heap above the loaded image.  Both allocate
- * calls hand out 256-byte aligned blocks from it, and free is a no-op, which
- * is all the guest's allocator needs from a container this simple.
+ * The memory container: a bump heap in the top band of RAM, clear of the
+ * region the guest's own allocator grows through.  Both allocate calls hand
+ * out 256-byte aligned blocks from it, and free is a no-op, which is all the
+ * guest's allocator needs from a container this simple.
  */
 static int32_t ps3_lv2_alloc(PS3BootROMState *s, uint8_t *ram,
                              uint64_t ram_size, uint32_t size, uint32_t out)
 {
-    uint32_t heap = s->lv2_heap;
+    uint32_t heap;
+
+    heap = s->lv2_heap;
     uint32_t end = (heap + size + 0xFF) & ~0xFFu;
 
     if (!size) {
@@ -3061,6 +3145,23 @@ static int32_t ps3_lv2_alloc(PS3BootROMState *s, uint8_t *ram,
     ps3_put_be32(ram + out, heap);
     s->lv2_heap = end;
     ps3_put_be32(ram + PS3_LV2_HEAP, end);
+    /*
+     * With the private RCO dump on, every container block is on record: the
+     * resource loader hands its inflate ranges out of these, so which call
+     * claimed 0x1FF bytes at 0x2400300 is part of the evidence.
+     */
+    if (g_getenv("PS3_DUMP_RCO")) {
+        static unsigned n;
+
+        if (n < 200) {
+            CPUState *cs = qemu_get_cpu(0);
+
+            n++;
+            info_report("ps3-ppu: lv2: alloc %u -> 0x%X..0x%X (thread %d, "
+                        "lr 0x%" PRIX64 ")", size, heap, end, s->thr_cur,
+                        cs ? POWERPC_CPU(cs)->env.lr : 0);
+        }
+    }
     return 0;
 }
 
@@ -4662,7 +4763,11 @@ static int32_t ps3_lv2_prx_load_path(PS3BootROMState *s, uint8_t *ram,
         return PS3_LV2_EINVAL;
     }
 
-    /* The module gets its own 64 KiB-aligned block above the heap. */
+    /*
+     * The module gets its own 64 KiB-aligned block from the container's band,
+     * never from the region the guest's own heap grows through: a module and
+     * the guest's resources must not be able to land on each other.
+     */
     mod_size = (span + 0xFFFF) & ~(uint64_t)0xFFFF;
     heap = s->lv2_heap;
     base = (heap + 0xFFFF) & ~(uint64_t)0xFFFF;
@@ -15224,7 +15329,11 @@ static bool ps3_lv2_zstream_at(const uint8_t *ram, uint64_t ram_size,
         zfree >= ram_size || zalloc < 0x10000 || zfree < 0x10000) {
         return false;
     }
-    /* inflateEnd() leaves Z_NULL here; the wrapper always calls it. */
+    /*
+     * inflateEnd() leaves Z_NULL here and the wrapper always calls it, so a
+     * frame that still holds a state is another call's (or a failed one's):
+     * reading it would name a buffer the wrapper was not handed this time.
+     */
     if (state) {
         return false;
     }
@@ -15259,35 +15368,511 @@ static bool ps3_lv2_zstream_at(const uint8_t *ram, uint64_t ram_size,
 }
 
 /*
- * Read the ranges back out of the frame the VSH's inflate wrapper left on the
- * stack of the thread that just read an .rco.  Only that thread runs the
- * loader, and it reaches lv2 again within a few calls of the inflate, with the
- * wrapper's frame still above its own.
+ * Write one guest range out for offline inspection.  PS3_DUMP_RCO names the
+ * directory; each range lands in it named for its address and length, so two
+ * runs can be compared byte for byte.  Capped at 256 KiB: a range that names
+ * more than that is a caller pointing at an arena, and the head of it is all
+ * the evidence an inspection needs.
  */
-static void ps3_lv2_inflate_stream_probe(PS3BootROMState *s, uint8_t *ram,
-                                         uint64_t ram_size)
+static void ps3_lv2_dump_range(uint8_t *ram, uint64_t ram_size,
+                               uint32_t start, uint32_t len, const char *tag)
+{
+    const char *dir = g_getenv("PS3_DUMP_RCO");
+    g_autofree gchar *name = NULL;
+    g_autofree gchar *path = NULL;
+    uint64_t n = len;
+    FILE *f;
+
+    if (!dir || start >= ram_size || !len) {
+        return;
+    }
+    n = MIN(n, ram_size - start);
+    n = MIN(n, 256 * 1024);
+    name = g_strdup_printf("%s_%08X_%06X.bin", tag, start, (unsigned)n);
+    path = g_build_filename(dir, name, NULL);
+    f = fopen(path, "wb");
+    if (!f) {
+        return;
+    }
+    fwrite(ram + start, 1, n, f);
+    fclose(f);
+    info_report("ps3-ppu:   wrote the %u byte(s) at 0x%X to %s",
+                (unsigned)n, start, path);
+}
+
+/*
+ * Assemble the .rco the resource loader is reading.  It reads the file in 8 KiB
+ * chunks into one scratch buffer and the file is dropped from RAM when the next
+ * chunk lands, so a dump has to be built from the reads themselves.  When the
+ * last chunk arrives the copy goes to PS3_DUMP_RCO, named for the file.
+ */
+static void ps3_lv2_rco_collect(PS3BootROMState *s, uint8_t *p, uint32_t got,
+                                uint64_t off, uint64_t size, const char *path)
+{
+    const char *dir = g_getenv("PS3_DUMP_RCO");
+    g_autofree gchar *base = NULL;
+    g_autofree gchar *out = NULL;
+    FILE *f;
+
+    if (!dir || !got || !path) {
+        return;
+    }
+    if (!s->rco_path || strcmp(s->rco_path, path) != 0) {
+        g_free(s->rco_path);
+        g_free(s->rco_bytes);
+        s->rco_path = g_strdup(path);
+        s->rco_cap = 1 << 20;              /* every .rco in dev_flash fits */
+        s->rco_bytes = g_malloc0(s->rco_cap);
+        s->rco_len = 0;
+        s->rco_read = 0;
+    }
+    if (off + got > s->rco_cap) {
+        return;                            /* not a resource file */
+    }
+    memcpy(s->rco_bytes + off, p, got);
+    s->rco_read += got;
+    s->rco_len = MAX(s->rco_len, (size_t)(off + got));
+    /*
+     * Written on every chunk, not only at the end: a loader that reads the
+     * head and comes back for the rest much later would otherwise leave no
+     * copy at all when the run is cut short.
+     */
+    base = g_path_get_basename(path);
+    out = g_build_filename(dir, base, NULL);
+    f = fopen(out, "wb");
+    if (!f) {
+        return;
+    }
+    fwrite(s->rco_bytes, 1, s->rco_len, f);
+    fclose(f);
+    /*
+     * The copy holds what the reads delivered.  A loader skips the tables it
+     * does not need yet (the image table, until it draws one), so the gaps are
+     * zero here and `rco_read' is the count that is the loader's, not the
+     * file's.
+     */
+    if ((size && s->rco_len >= size) || s->rco_read == (size_t)got) {
+        info_report("ps3-ppu:   the loader read %zu of the %zu byte(s) of "
+                    "%s; wrote what it read to %s", s->rco_read,
+                    s->rco_len, path, out);
+    }
+}
+
+/*
+ * The resource loader's inflate wrapper, as this image has it.  It takes
+ * out/out_len/in/in_len in r3..r6 and is guest code, so its entry is the one
+ * point where the ranges exist: it ends its z_stream before it returns, and
+ * by the next lv2 call nothing on any stack still names them.
+ *
+ * Where the range comes from, for the record.  The entry loader resolves a
+ * resource through 0x36A550(ctx, slot, handle, &type, &in, &in_len):
+ *
+ *     in     = *(u32 *)slot + u32(entry + 4)     (the packed stream)
+ *     in_len = u32(entry + 8)
+ *
+ * (0x36A62C is the same accessor for the mapped-file variant; it takes its
+ * base through 0x36A12C, the 0xF004 field getter.)  For the first GIM of
+ * system_plugin.rco, in = 0x2400300 with 511 packed bytes and 3152 unpacked.
+ * That address was the container's own bump break at the time (0x2400000,
+ * 0x2400100 and 0x2400200 had just been handed out for 198-byte blocks), so
+ * the range was never file data: the resource table was right, and the buffer
+ * under it was memory another allocator still owned.  The container now lives
+ * in its own band at 0x0C000000, so no block it hands out can land on a
+ * resource the guest's heap holds.
+ */
+#define PS3_RCO_INFLATE_PC  0x40BE7C
+/*
+ * The 0xF004 field getter behind the texture accessor's base.  It returns
+ * object + u32(object+0x88); that base plus the TOC entry's data offset is
+ * what the wrapper is handed as `packed'.
+ */
+#define PS3_RCO_GETTER_PC   0x36A12C
+/* The accessor that turns an entry into a packed range: r4 holds the base. */
+#define PS3_RCO_ACCESSOR_PC 0x36A550
+#define PS3_RCO_ENTRY_MAX   512
+#define PS3_RCO_SEEN_MAX    64
+#define PS3_RCO_DESC_LEN    0x40
+
+static PS3BootROMState *ps3_pc_hook_state;
+static unsigned ps3_rco_entry_reports;
+
+/*
+ * Two calls with the same four ranges and the same first bytes are the loader
+ * retrying one entry, not two entries: the pack is mapped into the same scratch
+ * block each time.  A different image reusing the block has different bytes.
+ */
+static struct {
+    uint32_t out, out_len, in, in_len;
+    uint8_t first[8];
+} ps3_rco_seen[PS3_RCO_SEEN_MAX];
+static unsigned ps3_rco_seen_pos;
+static unsigned ps3_rco_accessor_reports;
+
+/* RFC 1950: CM = 8, CINFO <= 7, and FCHECK makes the two bytes a multiple of 31. */
+static bool ps3_rco_zlib_header(const uint8_t *p)
+{
+    unsigned hdr = ((unsigned)p[0] << 8) | p[1];
+
+    return (p[0] & 0x0F) == 8 && (p[0] >> 4) <= 7 && (hdr % 31) == 0;
+}
+
+/*
+ * The file's first image stream, as the loader's own reads assembled it.  A
+ * copy of it in RAM names the base the resource table's offsets are relative
+ * to: `hit - 0x12050` has to be the FRP header.  When no copy is found, the
+ * table points at a base that never held the file, which is what the failing
+ * inflate then inflates.
+ */
+static void ps3_rco_find_packed_copy(PS3BootROMState *s, uint8_t *ram,
+                                     uint64_t ram_size)
+{
+    const uint32_t off = 0x12050;
+    uint64_t at = 0;
+    unsigned hits = 0;
+
+    if (!s->rco_bytes || s->rco_len < (size_t)off + 16) {
+        return;
+    }
+    while (at + 16 <= ram_size && hits < 4) {
+        uint8_t *hit = memchr(ram + at, s->rco_bytes[off], ram_size - at);
+
+        if (!hit) {
+            break;
+        }
+        at = hit - ram;
+        if (!memcmp(ram + at, s->rco_bytes + off, 16)) {
+            g_autofree gchar *tag = g_strdup_printf("packedcopy_%u", hits);
+            uint32_t base = at > off ? (uint32_t)(at - off) : 0;
+
+            hits++;
+            info_report("ps3-ppu:   the file's first packed stream is in RAM "
+                        "at 0x%" PRIX64 ": that makes its base 0x%X, whose "
+                        "head is %02X %02X %02X %02X", at, base, ram[base],
+                        ram[base + 1], ram[base + 2], ram[base + 3]);
+            ps3_lv2_dump_range(ram, ram_size, base, 0x400, tag);
+        }
+        at++;
+    }
+    if (!hits) {
+        info_report("ps3-ppu:   no copy of the file's first packed stream is "
+                    "in RAM: the base the table points at never held it");
+    }
+}
+
+/*
+ * Does the guest still hold the whole .rco?  Its image and sound tables live
+ * far past the TOC, so a loader that inflates one of those needs the file in
+ * RAM (or a copy of the table).  One FRP-signature scan answers that: a hit
+ * names the base a file offset is relative to.
+ */
+static void ps3_rco_scan_file_copy(PS3BootROMState *s, uint8_t *ram,
+                                   uint64_t ram_size, uint32_t in)
+{
+    /* The system_plugin.rco this run is loading: file base, image table, TOC. */
+    static const uint8_t toc_head[16] = {
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28,
+    };
+    static bool done;
+    uint64_t at = 0;
+    unsigned n = 0, t = 0;
+
+    if (done) {
+        return;
+    }
+    done = true;
+    while (at + 4 <= ram_size && n < 8) {
+        uint8_t *hit = memchr(ram + at, 'F', ram_size - at);
+
+        if (!hit) {
+            break;
+        }
+        at = hit - ram;
+        if (at + 4 <= ram_size && !memcmp(hit, "FRP\0", 4)) {
+            info_report("ps3-ppu:   an FRP header is in RAM at 0x%" PRIX64
+                        ": %02X %02X %02X %02X %02X %02X %02X %02X "
+                        "(input - FRP = 0x%X)",
+                        at, ram[at], ram[at + 1], ram[at + 2], ram[at + 3],
+                        ram[at + 4], ram[at + 5], ram[at + 6], ram[at + 7],
+                        (unsigned)(in - at));
+            if (!n) {
+                /* What the hit actually holds, for comparison with the file. */
+                ps3_lv2_dump_range(ram, ram_size, at, 0x30000, "frp");
+            }
+            if (at + 0x12058 <= ram_size) {
+                const uint8_t *img = ram + at + 0x12050;
+                info_report("ps3-ppu:   its image table at 0x%" PRIX64
+                            " starts %02X %02X %02X %02X (%s)",
+                            at + 0x12050, img[0], img[1], img[2], img[3],
+                            ps3_rco_zlib_header(img) ? "a zlib stream" :
+                            "not a zlib stream");
+            }
+            n++;
+        }
+        at++;
+    }
+    if (!n) {
+        info_report("ps3-ppu:   no FRP header in RAM: the .rco is not kept "
+                    "whole");
+    }
+    for (at = 0; at + sizeof(toc_head) <= ram_size && t < 4; at += 4) {
+        if (!memcmp(ram + at, toc_head, sizeof(toc_head))) {
+            info_report("ps3-ppu:   the decompressed TOC is in RAM at "
+                        "0x%" PRIX64 " (input - TOC = 0x%X)", at,
+                        (unsigned)(in - at));
+            t++;
+        }
+    }
+    if (!t) {
+        info_report("ps3-ppu:   the decompressed TOC is not in RAM");
+    }
+    ps3_rco_find_packed_copy(s, ram, ram_size);
+}
+
+static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
+{
+    PS3BootROMState *s = ps3_pc_hook_state;
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    uint32_t out, out_len, in, in_len, desc;
+    uint8_t *ram;
+    uint64_t ram_size;
+    unsigned i, k;
+    bool zlib_hdr, seen = false;
+    g_autofree gchar *tag = NULL;
+    PS3ReadCall *from = NULL;
+
+    if (!s) {
+        return;
+    }
+    if (pc == PS3_RCO_GETTER_PC) {
+        uint32_t ctx = cpu->env.gpr[3];
+        uint32_t field = cpu->env.gpr[4];
+
+        if (g_getenv("PS3_DUMP_RCO") && field == 0xF004 &&
+            ps3_rco_accessor_reports < 64) {
+            uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+            uint64_t ram_size = memory_region_size(s->ram);
+            uint32_t obj, ten, val, base;
+
+            ps3_rco_accessor_reports++;
+            if ((uint64_t)ctx + 0x10 > ram_size ||
+                (obj = ps3_be32(ram + ctx + 0xC)) == 0 ||
+                (uint64_t)obj + 0x8C > ram_size) {
+                info_report("ps3-ppu: rco-getter: ctx 0x%X, bad object", ctx);
+                return;
+            }
+            ten = obj + 0x10;
+            val = ps3_be32(ram + ten + 0x78);
+            base = val ? obj + val : 0;
+            info_report("ps3-ppu: rco-getter: ctx 0x%X -> object 0x%X, "
+                        "field +0x78 = 0x%X, base 0x%X (thread %d)",
+                        ctx, obj, val, base, s->thr_cur);
+        }
+        return;
+    }
+    if (pc == PS3_RCO_ACCESSOR_PC) {
+        static unsigned n;
+        uint32_t ctx = cpu->env.gpr[3];
+        uint32_t slot = cpu->env.gpr[4];
+        uint32_t handle = cpu->env.gpr[5];
+        uint32_t base = 0;
+
+        if (n >= 8 || !g_getenv("PS3_DUMP_RCO")) {
+            return;
+        }
+        n++;
+        ram = memory_region_get_ram_ptr(s->ram);
+        ram_size = memory_region_size(s->ram);
+        if (slot && (uint64_t)slot + 4 <= ram_size) {
+            base = ps3_be32(ram + slot);
+        }
+        info_report("ps3-ppu: rco-accessor: ctx 0x%X slot 0x%X holds base 0x%X, "
+                    "handle 0x%X (thread %d)", ctx, slot, base, handle,
+                    s->thr_cur);
+        if (n == 1) {
+            ps3_lv2_dump_range(ram, ram_size, ctx & ~0xFFu, 0x200, "ctx");
+            ps3_lv2_dump_range(ram, ram_size, slot & ~0x3Fu, 0x80, "slot");
+            if (base > 0x40) {
+                ps3_lv2_dump_range(ram, ram_size, base - 0x40, 0x100, "base");
+            }
+        }
+        return;
+    }
+    if (pc != PS3_RCO_INFLATE_PC) {
+        return;
+    }
+    if (ps3_rco_entry_reports >= PS3_RCO_ENTRY_MAX) {
+        return;
+    }
+    out = cpu->env.gpr[3];
+    out_len = cpu->env.gpr[4];
+    in = cpu->env.gpr[5];
+    in_len = cpu->env.gpr[6];
+    desc = cpu->env.gpr[31];          /* the loader's resource entry */
+    ram = memory_region_get_ram_ptr(s->ram);
+    ram_size = memory_region_size(s->ram);
+    if (!in || !in_len || (uint64_t)in + in_len > ram_size) {
+        return;
+    }
+    for (i = 0; i < PS3_RCO_SEEN_MAX; i++) {
+        if (ps3_rco_seen[i].in == in && ps3_rco_seen[i].in_len == in_len &&
+            ps3_rco_seen[i].out == out &&
+            ps3_rco_seen[i].out_len == out_len &&
+            !memcmp(ps3_rco_seen[i].first, ram + in, 8)) {
+            seen = true;
+            break;
+        }
+    }
+    if (seen) {
+        return;
+    }
+    i = ps3_rco_seen_pos++ % PS3_RCO_SEEN_MAX;
+    ps3_rco_seen[i].out = out;
+    ps3_rco_seen[i].out_len = out_len;
+    ps3_rco_seen[i].in = in;
+    ps3_rco_seen[i].in_len = in_len;
+    memcpy(ps3_rco_seen[i].first, ram + in, 8);
+    ps3_rco_entry_reports++;
+
+    /*
+     * The caller and the wrapper, once: the argument order and where the
+     * two ranges come from are only readable in the code.
+     */
+    {
+        static bool code_dumped;
+
+        if (!code_dumped) {
+            code_dumped = true;
+            ps3_lv2_dump_range(ram, ram_size, 0x35E5C0, 0x140, "caller");
+            ps3_lv2_dump_range(ram, ram_size, 0x40BE00, 0x100, "wrapper");
+        }
+    }
+    zlib_hdr = ps3_rco_zlib_header(ram + in);
+    info_report("ps3-ppu: rco-inflate entry %u (thread %d, lr 0x%" PRIX64
+                "): packed 0x%X..0x%X (%u byte(s)) -> unpacked "
+                "0x%X..0x%X (%u byte(s)), %s",
+                ps3_rco_entry_reports, s->thr_cur, cpu->env.lr,
+                in, in + in_len, in_len, out, out + out_len, out_len,
+                zlib_hdr ? "a zlib stream" : "not a zlib stream");
+    info_report("ps3-ppu:   the packed range starts %02X %02X %02X %02X "
+                "%02X %02X %02X %02X; the caller's entry is 0x%X"
+                "%s",
+                ram[in], ram[in + 1], ram[in + 2], ram[in + 3],
+                ram[in + 4], ram[in + 5], ram[in + 6], ram[in + 7], desc,
+                desc && (uint64_t)desc + PS3_RCO_DESC_LEN <= ram_size ?
+                "" : " (outside RAM)");
+
+    /*
+     * Where the packed range came from: a read that delivered into it is the
+     * strongest answer, because the loader can move the file between the read
+     * and the inflate.  No reader and no match in the assembled .rco means the
+     * wrapper was handed something that never was file data at all.
+     */
+    k = s->read_ring_pos < PS3_READ_RING ? s->read_ring_pos : PS3_READ_RING;
+    for (i = 0; i < k; i++) {
+        PS3ReadCall *r = &s->read_ring[(s->read_ring_pos - k + i) %
+                                       PS3_READ_RING];
+
+        if (r->got > 0 && in >= r->buf &&
+            in < (uint64_t)r->buf + r->got) {
+            from = r;
+            info_report("ps3-ppu:   that range came from %s at file 0x%" PRIX64
+                        " (0x%" PRIX64 " into the 0x%" PRId64 " byte(s) "
+                        "read into 0x%X)",
+                        r->path ?: "?", r->off + (in - r->buf),
+                        in - r->buf, r->got, r->buf);
+            break;
+        }
+    }
+    if (!from) {
+        size_t n = MIN((size_t)in_len, 64u);
+        bool in_file = false;
+
+        for (i = 0; s->rco_bytes && n && i + n <= s->rco_len; i++) {
+            if (!memcmp(s->rco_bytes + i, ram + in, n)) {
+                info_report("ps3-ppu:   it is the assembled .rco at file "
+                            "offset 0x%X", i);
+                in_file = true;
+                break;
+            }
+        }
+        if (!in_file) {
+            info_report("ps3-ppu:   no read delivered into it and its head is "
+                        "not in the assembled .rco");
+        }
+        for (i = k > 6 ? k - 6 : 0; i < k; i++) {
+            PS3ReadCall *r = &s->read_ring[(s->read_ring_pos - k + i) %
+                                           PS3_READ_RING];
+
+            info_report("ps3-ppu:   last read %u: %s file 0x%" PRIX64
+                        " +%" PRId64 " into 0x%X", i, r->path ?: "?",
+                        r->off, r->got, r->buf);
+        }
+        if (!zlib_hdr) {
+            ps3_rco_scan_file_copy(s, ram, ram_size, in);
+            /*
+             * The first image's packed stream is at file 0x12050 in this
+             * system_plugin.rco, so `in - 0x12050` is the base the texture
+             * path thinks the file starts at.  Its head says whether that base
+             * is a file copy at all.
+             */
+            if (in > 0x12050) {
+                uint32_t base = in - 0x12050;
+
+                info_report("ps3-ppu:   if that base is in-0x12050 = 0x%X, it "
+                            "starts %02X %02X %02X %02X %02X %02X %02X %02X",
+                            base, ram[base], ram[base + 1], ram[base + 2],
+                            ram[base + 3], ram[base + 4], ram[base + 5],
+                            ram[base + 6], ram[base + 7]);
+                tag = g_strdup_printf("rcoentry_%03u_base",
+                                      ps3_rco_entry_reports);
+                ps3_lv2_dump_range(ram, ram_size, base, 0x100, tag);
+            }
+        }
+    }
+    if (desc && (uint64_t)desc + PS3_RCO_DESC_LEN <= ram_size) {
+        info_report("ps3-ppu:   entry 0x%X: %02X %02X %02X %02X %02X %02X "
+                    "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    desc, ram[desc], ram[desc + 1], ram[desc + 2],
+                    ram[desc + 3], ram[desc + 4], ram[desc + 5],
+                    ram[desc + 6], ram[desc + 7], ram[desc + 8],
+                    ram[desc + 9], ram[desc + 10], ram[desc + 11],
+                    ram[desc + 12], ram[desc + 13], ram[desc + 14],
+                    ram[desc + 15]);
+        tag = g_strdup_printf("rcoentry_%03u_desc", ps3_rco_entry_reports);
+        ps3_lv2_dump_range(ram, ram_size, desc, PS3_RCO_DESC_LEN, tag);
+    }
+    tag = g_strdup_printf("rcoentry_%03u_in", ps3_rco_entry_reports);
+    ps3_lv2_dump_range(ram, ram_size, in, in_len, tag);
+    /*
+     * The window the range sits in: the arena's own bookkeeping is what says
+     * whether the loader allocated this block and what still points at it.
+     */
+    {
+        uint32_t start = in > 0x200 ? in - 0x200 : 0;
+        uint32_t len = MIN((uint64_t)in_len + 0xA00, ram_size - start);
+
+        tag = g_strdup_printf("rcoentry_%03u_win", ps3_rco_entry_reports);
+        ps3_lv2_dump_range(ram, ram_size, start, len, tag);
+    }
+}
+
+/*
+ * Look for the stream in one thread's frames.  The stack grows down and the
+ * call chain that built the z_stream is still live, so the wrapper's frame is
+ * above the current sp.  A found stream is reported and dumped; returns true
+ * when one was new.
+ */
+static bool ps3_lv2_inflate_stream_in_thread(PS3BootROMState *s, uint8_t *ram,
+                                             uint64_t ram_size, PS3Thread *t)
 {
     uint32_t sp, at, in_start, in_len, out_start, out_len;
-    PS3Thread *t;
 
-    if (!s->rco_watch || s->rco_watch - 1 != (unsigned)s->thr_cur) {
-        return;
-    }
-    if (++s->rco_watch_calls > 400) {
-        s->rco_watch = 0;
-        return;
-    }
-    if (s->thr_cur < 0 || !s->thr[s->thr_cur].used ||
-        s->rco_stream_reports >= 4) {
-        return;
-    }
-    t = &s->thr[s->thr_cur];
     sp = (uint32_t)t->gpr[1];
     if (sp < 0x10000 || sp >= ram_size) {
-        return;
+        return false;
     }
 
-    /* The stack grows down: the wrapper's frame is above the current one. */
     for (at = sp & ~3u; (uint64_t)at + 0x38 <= ram_size &&
                        at < sp + 0x8000; at += 4) {
         bool zlib_hdr;
@@ -15297,7 +15882,7 @@ static void ps3_lv2_inflate_stream_probe(PS3BootROMState *s, uint8_t *ram,
             continue;
         }
         if (in_start == s->rco_stream_in) {
-            return;                 /* this one is already on the record */
+            return false;           /* this one is already on the record */
         }
         s->rco_stream_in = in_start;
         s->rco_stream_reports++;
@@ -15307,6 +15892,8 @@ static void ps3_lv2_inflate_stream_probe(PS3BootROMState *s, uint8_t *ram,
                     "(stream in thread 0x%X's frame at 0x%X)",
                     in_len, in_start, in_start + in_len, out_len,
                     out_start, out_start + out_len, t->id, at);
+        ps3_lv2_dump_range(ram, ram_size, in_start, in_len, "inflate-in");
+        ps3_lv2_dump_range(ram, ram_size, out_start, out_len, "inflate-out");
         info_report("ps3-ppu:   the input starts %02X %02X %02X %02X %02X "
                     "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X "
                     "%02X (%s)",
@@ -15338,7 +15925,118 @@ static void ps3_lv2_inflate_stream_probe(PS3BootROMState *s, uint8_t *ram,
                 }
             }
         }
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Read the ranges back out of the frame the VSH's inflate wrapper left on a
+ * thread's stack after the resource loader read an .rco.  The reader is looked
+ * at first, then every other thread: the loader can hand the buffer to a
+ * worker between the read and the inflate, and the wrapper's frame is still
+ * above whichever thread runs it.
+ */
+static void ps3_lv2_inflate_stream_probe(PS3BootROMState *s, uint8_t *ram,
+                                         uint64_t ram_size)
+{
+    unsigned pass, ti;
+
+    if (!s->rco_watch) {
         return;
+    }
+    if (++s->rco_watch_calls > 2000) {
+        if (s->rco_path && !s->rco_stream_reports) {
+            info_report("ps3-ppu:   no live inflate stream in 2000 calls after "
+                        "%s was read: the loader did not inflate it here",
+                        s->rco_path);
+        }
+        s->rco_watch = 0;
+        return;
+    }
+    if (s->rco_stream_reports >= 4) {
+        return;
+    }
+    /*
+     * The thread that did the read on every call, and the others only every
+     * 32nd: a thread's frames are worth 8 KiB of scan each, and the reader is
+     * the one that has the loader's chain on its stack.
+     */
+    for (pass = 0; pass < 2; pass++) {
+        if (pass == 1 && (s->rco_watch_calls & 31) != 0) {
+            return;
+        }
+        for (ti = 0; ti < PS3_THREAD_MAX; ti++) {
+            if (!s->thr[ti].used) {
+                continue;
+            }
+            if ((pass == 0) != (s->rco_watch - 1 == ti)) {
+                continue;
+            }
+            if (ps3_lv2_inflate_stream_in_thread(s, ram, ram_size,
+                                                 &s->thr[ti])) {
+                s->rco_watch = 0;   /* one stream per read of the file */
+                return;
+            }
+        }
+    }
+}
+
+/*
+ * Announce an lv2 config service to the queue sys_config_open was given, the
+ * way lv2 announces the two implicit padmanager services: one queue event per
+ * listener, carrying the event's id in data2 and the size the guest must make
+ * room for in data3.  The event itself is kept until
+ * sys_config_get_service_event reads it out.
+ */
+static void ps3_lv2_config_announce(PS3BootROMState *s, uint8_t *ram,
+                                    uint64_t ram_size, uint32_t service,
+                                    uint32_t listener)
+{
+    /* The padmanager's data: the HID descriptor lv2 reports a pad with. */
+    static const uint8_t hid_info[0x1a] = {
+        0x01, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x05, 0x4c, 0x02, 0x68, 0x00, 0x10, 0x91, 0x88, 0x04, 0x00,
+        0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+    };
+    unsigned i, slot = ARRAY_SIZE(s->lv2_cfg_ev);
+    int q;
+    PS3Event ev;
+
+    for (i = 0; i < ARRAY_SIZE(s->lv2_cfg_ev); i++) {
+        if (s->lv2_cfg_ev[i].used &&
+            s->lv2_cfg_ev[i].service == service) {
+            slot = i;                   /* re-announced: reuse the record */
+            break;
+        }
+        if (!s->lv2_cfg_ev[i].used && slot == ARRAY_SIZE(s->lv2_cfg_ev)) {
+            slot = i;
+        }
+    }
+    if (slot == ARRAY_SIZE(s->lv2_cfg_ev)) {
+        return;
+    }
+    s->lv2_cfg_ev[slot].used = true;
+    s->lv2_cfg_ev[slot].id = ++s->lv2_next_id;
+    s->lv2_cfg_ev[slot].listener = listener;
+    s->lv2_cfg_ev[slot].service = service;
+    s->lv2_cfg_ev[slot].size = sizeof(hid_info);
+    memcpy(s->lv2_cfg_ev[slot].data, hid_info, sizeof(hid_info));
+
+    q = ps3_eq_index(s, s->lv2_cfg_queue);
+    if (q < 0) {
+        return;                         /* nobody is listening yet */
+    }
+    ev.source = 1;                      /* SYS_CONFIG_EVENT_SOURCE_SERVICE */
+    ev.data1 = s->lv2_cfg_handle;
+    ev.data2 = (1ULL << 32) | s->lv2_cfg_ev[slot].id;
+    ev.data3 = 0x28 + sizeof(hid_info); /* sizeof(sys_config_service_event_t) */
+    ps3_eq_push(&s->eq[q], &ev);
+    ps3_eq_wake(s, ram, ram_size, q);
+    if (s->ppu_trace) {
+        info_report("ps3-ppu: lv2: config: service 0x%X announced to queue "
+                    "0x%X (event %u, listener 0x%X)", service, s->eq[q].id,
+                    s->lv2_cfg_ev[slot].id, listener);
     }
 }
 
@@ -15359,8 +16057,19 @@ static void ps3_lv2_service(PS3BootROMState *s)
     cpu = POWERPC_CPU(cs);
     ram = memory_region_get_ram_ptr(s->ram);
     ram_size = memory_region_size(s->ram);
-    /* Record the ranges the VSH's XMB resource loader hands its inflate. */
-    if (s->ppu_trace) {
+    /*
+     * With the private dump on, watch the resource loader's inflate wrapper
+     * itself: its entry is where the ranges it is handed can still be read.
+     */
+    if (!ps3_pc_hook_state && (s->ppu_trace || g_getenv("PS3_DUMP_RCO"))) {
+        ps3_pc_hook_state = s;
+        ps3_pc_hook_fn = ps3_rco_inflate_hook;
+        info_report("ps3-ppu: rco-inflate: watching the wrapper entry at "
+                    "0x%X", PS3_RCO_INFLATE_PC);
+    }
+    /* Record the ranges the VSH's XMB resource loader hands its inflate.
+     * The probe returns at once unless an .rco was just read. */
+    if (s->ppu_trace || s->rco_watch) {
         ps3_lv2_inflate_stream_probe(s, ram, ram_size);
     }
     /*
@@ -16421,14 +17130,20 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     case 0x160: {               /* sys_memory_get_user_memory_size(info*) */
-        uint32_t used = s->lv2_heap - 0x01000000;
+        /*
+         * The guest sizes its own heap from this answer, so it has to name the
+         * band that heap actually owns - not all of RAM, which is what it used
+         * to say while the container was handing out blocks in the same space.
+         * The container is a separate pool and does not come out of this one.
+         */
+        uint32_t total = PS3_LV2_GUEST_HEAP_END - PS3_LV2_GUEST_HEAP_BASE;
 
         if ((uint64_t)a0 + 8 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
         }
-        ps3_put_be32(ram + a0, (uint32_t)ram_size);
-        ps3_put_be32(ram + a0 + 4, (uint32_t)ram_size - used);
+        ps3_put_be32(ram + a0, total);
+        ps3_put_be32(ram + a0 + 4, total);
         ret = 0;
         break;
     }
@@ -16438,7 +17153,6 @@ static void ps3_lv2_service(PS3BootROMState *s)
      * and the map/unmap calls simply succeed.  This is the range the library
      * keeps its mapped surfaces in, so it starts above the guest's own heap.
      */
-#define PS3_LV2_MMAP_BASE   0x08000000u
 #define PS3_LV2_MMAP_ALIGN  0x00001000u
     case 0x146:                 /* sys_mmapper_allocate_fixed_address */
     case 0x147:                 /* sys_mmapper_enable_page_fault_notification */
@@ -16475,12 +17189,12 @@ static void ps3_lv2_service(PS3BootROMState *s)
          * is exactly ram_size, so the VSH's heap was outside the machine and
          * the pointers it built from it faulted.
          */
-        if (!s->lv2_mmap_next || s->lv2_mmap_next >= ram_size) {
+        if (!s->lv2_mmap_next || s->lv2_mmap_next >= PS3_LV2_MMAP_END) {
             s->lv2_mmap_next = PS3_LV2_MMAP_BASE;
         }
         addr = s->lv2_mmap_next;
         {
-            uint64_t room = (ram_size - addr) &
+            uint64_t room = (PS3_LV2_MMAP_END - addr) &
                             ~(uint64_t)(PS3_LV2_MMAP_ALIGN - 1);
             uint64_t step = MIN(size, room);
 
@@ -18019,26 +18733,74 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EFAULT;
             break;
         }
-        ps3_put_be32(ram + a1, ++s->lv2_next_id);
+        /* The queue is where the service events go, and the handle is what
+         * their data1 carries so the guest can tell which config it is for. */
+        s->lv2_cfg_queue = a0;
+        s->lv2_cfg_handle = ++s->lv2_next_id;
+        ps3_put_be32(ram + a1, s->lv2_cfg_handle);
         ret = 0;
         break;
     case 0x205:                 /* sys_config_close(config) */
         ret = 0;
         break;
-    case 0x206:                 /* sys_config_get_service_event(...) */
-        /* No service event is ever queued: the ports do not change. */
-        ret = PS3_LV2_ESRCH;
+    case 0x206: {               /* sys_config_get_service_event(cfg, event,
+                                 * event*, size) */
+        unsigned i;
+
+        if (!a2 || (uint64_t)a2 + a3 > ram_size || a3 < 0x28) {
+            ret = PS3_LV2_EFAULT;
+            break;
+        }
+        for (i = 0; i < ARRAY_SIZE(s->lv2_cfg_ev); i++) {
+            if (s->lv2_cfg_ev[i].used && s->lv2_cfg_ev[i].id == a1) {
+                break;
+            }
+        }
+        if (i == ARRAY_SIZE(s->lv2_cfg_ev)) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        if (a3 < 0x28 + s->lv2_cfg_ev[i].size) {
+            ret = PS3_LV2_EAGAIN;
+            break;
+        }
+        /* sys_config_service_event_t: listener, registered, service, user,
+         * verbosity, data_size, padding, then the service's data. */
+        ps3_put_be32(ram + a2 + 0x00, s->lv2_cfg_ev[i].listener);
+        ps3_put_be32(ram + a2 + 0x04, 1);
+        ps3_put_be64(ram + a2 + 0x08, s->lv2_cfg_ev[i].service);
+        ps3_put_be64(ram + a2 + 0x10, 0);
+        ps3_put_be64(ram + a2 + 0x18, 1);
+        ps3_put_be32(ram + a2 + 0x20, s->lv2_cfg_ev[i].size);
+        ps3_put_be32(ram + a2 + 0x24, 0);
+        memcpy(ram + a2 + 0x28, s->lv2_cfg_ev[i].data,
+               s->lv2_cfg_ev[i].size);
+        ret = 0;
         break;
+    }
     case 0x207: {               /* sys_config_add_service_listener(cfg,
                                  * service, verbosity, in, size, type,
                                  * listener*) */
         uint32_t out = cpu->env.gpr[9];
+        uint32_t listener;
 
         if (!out || (uint64_t)out + 4 > ram_size) {
             ret = PS3_LV2_EFAULT;
             break;
         }
-        ps3_put_be32(ram + out, ++s->lv2_next_id);
+        listener = ++s->lv2_next_id;
+        ps3_put_be32(ram + out, listener);
+        /*
+         * lv2 only sends the padmanager announcement to a listener whose
+         * buffer starts 0x01 - an HID descriptor of the pad that woke the
+         * manager.  The listener is told about the services that already
+         * exist, which for a console with a pad is the two padmanagers.
+         */
+        if (a3 && a4 && (uint64_t)a3 < ram_size && ram[a3] == 0x01 &&
+            (a1 == 0x11 || a1 == 0x12)) {
+            ps3_lv2_config_announce(s, ram, ram_size, (uint32_t)a1,
+                                    listener);
+        }
         ret = 0;
         break;
     }
@@ -18362,10 +19124,25 @@ static void ps3_lv2_service(PS3BootROMState *s)
              * An .rco goes on to the VSH's inflate; arm the record of the
              * ranges it is handed (ps3_lv2_inflate_stream_probe).
              */
-            if (s->ppu_trace && r->path &&
+            if ((s->ppu_trace || g_getenv("PS3_DUMP_RCO")) && r->path &&
                 g_str_has_suffix(r->path, ".rco")) {
+                struct stat rs;
+                uint64_t rsize = 0;
+
+                if (fstat(hfd, &rs) == 0) {
+                    rsize = (uint64_t)rs.st_size;
+                }
                 s->rco_watch = (unsigned)s->thr_cur + 1;
                 s->rco_watch_calls = 0;
+                if (!s->ppu_trace) {
+                    info_report("ps3-ppu:   rco read %s file 0x%" PRIX64
+                                " +%d into 0x%X (lr 0x%" PRIX64 ")",
+                                r->path, r->off, got, a1, r->lr);
+                }
+                if (got > 0) {
+                    ps3_lv2_rco_collect(s, ram + a1, got, r->off, rsize,
+                                        r->path);
+                }
             }
         }
         if (s->ppu_trace) {
@@ -19713,16 +20490,16 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
                                       erk48, &from_table, why, sizeof(why))) {
                 /*
                  * A .2 loader has no keyset that opens it directly: its ERK is
-                 * wrapped under the console's PCK2, so that is the only way in
-                 * - and the key it yields is the real per-console ERK, which is
-                 * exactly what the ladders want.
+                 * wrapped under the console's eid_root_key, so that is the only
+                 * way in - and the key it yields is the real per-console ERK,
+                 * which is exactly what the ladders want.
                  */
                 uint8_t pck2[48];
                 size_t wrap_off = 0;
 
                 if (!s->has_pck2) {
                     error_setg(errp, "ps3-boot-rom: %s: no keyset opened it "
-                               "(%s); a .2 loader needs the console's PCK2 "
+                               "(%s); a .2 loader needs the console's eid_root_key "
                                "(pck2/pck2-file)", images[i].path, why);
                     return false;
                 }
@@ -19737,9 +20514,9 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
 
                 memcpy(s->erk, erk48, sizeof(s->erk));
                 s->has_erk = true;
-                s->erk_from = "the ERK the loader carries, unwrapped under PCK2";
+                s->erk_from = "the ERK the loader carries, unwrapped under eid_root_key";
                 s->erk_wrap_off = (uint32_t)wrap_off;
-                opened_by = "PCK2";
+                opened_by = "eid_root_key";
                 adopted = true;
                 info_report("ps3-boot-rom: %s: %s", images[i].path, why);
             }
@@ -19803,7 +20580,7 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
 }
 
 /*
- * The console's per-console root key 2, as hex or as a 48-byte file.  Nothing
+ * The console's eid_root_key, as hex or as a 48-byte file.  Nothing
  * needs it unless a .2 loader is opened, so it is optional; when it is given the
  * .2 loader's wrapped ERK is what the ladders then run on.
  */
@@ -19815,7 +20592,7 @@ static bool ps3_pck2_setup(PS3BootROMState *s, Error **errp)
         if (!ps3_stage_parse_hex(s->pck2_prop, s->pck2, sizeof(s->pck2),
                                  &plen) || plen != sizeof(s->pck2)) {
             error_setg(errp, "ps3-boot-rom: pck2 must be 96 hex digits (48 "
-                       "bytes: the per-console root key 2)");
+                       "bytes: the console's eid_root_key)");
             return false;
         }
         s->has_pck2 = true;
@@ -19831,7 +20608,7 @@ static bool ps3_pck2_setup(PS3BootROMState *s, Error **errp)
             return false;
         }
         if (klen != sizeof(s->pck2)) {
-            error_setg(errp, "ps3-boot-rom: %s is %u byte(s), PCK2 is 48",
+            error_setg(errp, "ps3-boot-rom: %s is %u byte(s), eid_root_key is 48",
                        s->pck2_file, (unsigned)klen);
             return false;
         }
@@ -19840,7 +20617,7 @@ static bool ps3_pck2_setup(PS3BootROMState *s, Error **errp)
     }
 
     if (s->has_pck2) {
-        info_report("ps3-boot-rom: per-console root key 2 (PCK2) read; the "
+        info_report("ps3-boot-rom: eid_root_key read; the "
                     ".2 loaders' ERK can be unwrapped");
     }
 
@@ -20334,8 +21111,14 @@ static bool ps3_hdd_tree_setup(PS3BootROMState *s, Error **errp)
     g_autofree char *stamp = NULL;
     g_autofree gchar *have = NULL;
     uint32_t generation, root;
+    /*
+     * dev_hdd1 is the FAT32 cache partition, and both media carry it: a disk
+     * console keeps it on the disk beside dev_hdd0, the 12 GB SuperSlim keeps
+     * it on its eMMC.  It is unpacked like the rest, so /dev_hdd1 is there on
+     * whichever medium the console boots from.
+     */
     const char *devs[] = { "dev_flash", "dev_flash2", "dev_flash3",
-                           "dev_hdd0" };
+                           "dev_hdd0", "dev_hdd1" };
     char text[32];
     gsize have_len = 0;
     bool fresh = true;
@@ -20399,7 +21182,7 @@ static bool ps3_hdd_tree_setup(PS3BootROMState *s, Error **errp)
      */
     {
         gchar **slot[] = { &s->dev_flash, &s->dev_flash2, &s->dev_flash3,
-                           &s->hdd_dir };
+                           &s->hdd_dir, &s->hdd1_dir };
 
         for (i = 0; i < ARRAY_SIZE(devs); i++) {
             g_autofree char *dir = g_build_filename(tree, devs[i], NULL);
@@ -20603,10 +21386,10 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         }
     }
     /*
-     * PCK2 is the console's per-console root key 2: it unwraps the ERK the .2
+     * eid_root_key is the console's per-console root key: it unwraps the ERK the .2
      * loaders carry, which is what the following SELF stages then use.  It is
      * read before the storage ladder because a .2 loader image is opened with
-     * it - the loader's own ERK is the ladder's key, and PCK2 is the only way to
+     * it - the loader's own ERK is the ladder's key, and eid_root_key is the only way to
      * get at that without the console handing it over.  Like every other key
      * here it comes from the caller's dump, never the model.
      */
@@ -20716,6 +21499,39 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
 
         memcpy(s->readout_bytes, buf, 32);
         s->has_readout = true;
+        g_free(buf);
+        buf = NULL;
+    }
+
+    /*
+     * A second channel-66 key for a NAND/eMMC medium.  The readout belongs to
+     * the mask ROM, so one key normally opens every console's first container;
+     * when a chip dump is sealed for a different one - a NAND console's metldr
+     * beside a NOR console's lv0ldr - the eMMC path needs its own, and the two
+     * media can then be booted from the same command line.
+     */
+    if (s->nand_readout) {
+        if (!ps3_readout_from_hex(s->nand_readout, s->nand_readout_bytes)) {
+            error_setg(errp, "ps3-boot-rom: nand-readout must be 64 hex "
+                       "digits");
+            return;
+        }
+        s->has_nand_readout = true;
+    } else if (s->nand_readout_file) {
+        if (!g_file_get_contents(s->nand_readout_file, &buf, &len, &err)) {
+            error_setg(errp, "ps3-boot-rom: cannot read %s: %s",
+                       s->nand_readout_file, err->message);
+            g_error_free(err);
+            return;
+        }
+        if (len != 32) {
+            g_free(buf);
+            error_setg(errp, "ps3-boot-rom: the nand-readout file must be "
+                       "32 bytes");
+            return;
+        }
+        memcpy(s->nand_readout_bytes, buf, 32);
+        s->has_nand_readout = true;
         g_free(buf);
         buf = NULL;
     }
@@ -21016,8 +21832,8 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
  */
 /*
  * Open a stage SELF the way the chain does: with the ERK unwrapped from the
- * caller's PCK2 when one is supplied, and with the published loader keysets
- * otherwise.  A PCK2 that does not belong to the image falls through to the
+ * caller's eid_root_key when one is supplied, and with the published loader keysets
+ * otherwise.  An eid_root_key that does not belong to the image falls through to the
  * keyset search, so a wrong key is reported by the normal "no keyset opened"
  * message rather than silently corrupting the stage.
  */
@@ -21099,9 +21915,9 @@ static int ps3_spu_stage(PS3BootROMState *s)
         int opened;
 
         /*
-         * A .2 loader carries its ERK wrapped under the caller's PCK2.  Open
+         * A .2 loader carries its ERK wrapped under the caller's eid_root_key.  Open
          * it that way first; ps3_self_load_ls then sees sections that are
-         * already plaintext and loads them as they stand.  A PCK2 from a
+         * already plaintext and loads them as they stand.  An eid_root_key from a
          * different console simply does not open the metadata, and the normal
          * keyset search below still runs.
          */
@@ -21416,7 +22232,7 @@ static bool ps3_lv2_warm_reset(PS3BootROMState *s)
     s->lv2_next_id = 0;
     s->lv2_container_size = 0;
     s->lv2_mmap_next = 0;
-    s->lv2_heap = 0x01000000;
+    s->lv2_heap = PS3_LV2_CONTAINER_BASE;
     s->thr_cur = -1;
     s->sched_pending = false;
     s->sched_queued = false;
@@ -22481,7 +23297,7 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         s->lv2_stub_next = 0;
         s->lv2_export_full = false;
         s->lv2_exit_status = 0;
-        s->lv2_heap = 0x01000000;
+        s->lv2_heap = PS3_LV2_CONTAINER_BASE;
         ps3_put_be32(ram + PS3_LV2_HEAP, s->lv2_heap);
 
         s->ppu_entry = code;
@@ -22560,6 +23376,9 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
     DEFINE_PROP_STRING("readout", PS3BootROMState, readout),
     DEFINE_PROP_STRING("readout-file", PS3BootROMState, readout_file),
+    DEFINE_PROP_STRING("nand-readout", PS3BootROMState, nand_readout),
+    DEFINE_PROP_STRING("nand-readout-file", PS3BootROMState,
+                       nand_readout_file),
     DEFINE_PROP_BOOL("selftest", PS3BootROMState, selftest, true),
     DEFINE_PROP_BOOL("mic-selftest", PS3BootROMState, mic_selftest, false),
     DEFINE_PROP_BOOL("pad-selftest", PS3BootROMState, pad_selftest, false),
@@ -22574,6 +23393,11 @@ static void ps3_rom_unrealize(DeviceState *dev)
 {
     PS3BootROMState *s = PS3_BOOT_ROM(dev);
     unsigned i;
+
+    if (ps3_pc_hook_state == s) {
+        ps3_pc_hook_state = NULL;
+        ps3_pc_hook_fn = NULL;
+    }
 
     for (i = 0; i < PS3_SPU_LV2_GROUPS; i++) {
         ps3_spu_lv2_group_free(&s->spug[i]);

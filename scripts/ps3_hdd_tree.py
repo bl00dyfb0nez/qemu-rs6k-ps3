@@ -3,8 +3,19 @@
 
 A console keeps its firmware and its /dev_hdd0 files inside the disk, so the
 model's HDD image can carry them too.  This tool writes the tree the model
-reads (see `ps3_hdd_tree_setup()' in hw/ppc/rs6000_ps3.c): a superblock at
-32 MiB, then one 4 KiB block per directory or file.
+reads (see `ps3_hdd_tree_setup()' in hw/ppc/rs6000_ps3.c): a superblock, then
+one 4 KiB block per directory or file.
+
+Two media carry such a tree, and the superblock sits where each one puts it:
+
+  HDD / raw disk   32 MiB in (0x02000000), past the disk's 16 MiB flash copy
+  NAND / eMMC      past the 256 MiB flash region, at 0x10040000 - the chip's
+                   own first 256 KiB are the CFI preamble, so the flash region
+                   starts at 0x40000 and the tree after it
+
+The layout is otherwise identical.  The tool works out which one an existing
+image is from the magic's position, and a new image is a disk unless --emmc,
+--nand or --base says otherwise.
 
 Layout, all integers big-endian:
 
@@ -44,6 +55,10 @@ Examples
   # what is in the image?
   scripts/ps3_hdd_tree.py ps3-hdd.img --list
 
+  # a 12 GiB eMMC image (the SuperSlim's single chip) instead of a disk
+  scripts/ps3_hdd_tree.py -o ps3-emmc.img --size 12G --emmc \\
+      --root /path/to/rs3
+
 Then the model boots from the disk's own firmware:
 
   qemu-system-ppc64 -M rs6000-ps3 -drive if=pflash,...,file=CECH4301C.bin \\
@@ -57,7 +72,11 @@ import struct
 import sys
 
 MAGIC = b"PS3HDFS1"
-SUPER_OFF = 0x02000000
+SUPER_OFF = 0x02000000            # a disk: past its 16 MiB flash copy
+EMMC_FLASH_OFF = 0x00040000       # the chip's CFI preamble ends here
+EMMC_FLASH_SIZE = 0x10000000      # 256 MiB of flash, as on NAND
+def emmc_tree_off():
+    return EMMC_FLASH_OFF + EMMC_FLASH_SIZE
 BLOCK = 4096
 NAME_MAX = 48
 ENTRY = 64
@@ -66,8 +85,11 @@ TYPE_DIR = 1
 TYPE_FILE = 2
 SECTOR = 512
 
-# The devices a console's disk carries, in the order the model looks for them.
-DEVICES = ("dev_flash", "dev_flash2", "dev_flash3", "dev_hdd0")
+# The devices a console's storage carries, in the order the model looks for
+# them.  dev_hdd1 is the FAT32 cache partition, and it is on both media: a
+# console with a disk keeps it on the disk, the 12 GB SuperSlim keeps it on its
+# eMMC beside dev_hdd0, so the same tree root serves either one.
+DEVICES = ("dev_flash", "dev_flash2", "dev_flash3", "dev_hdd0", "dev_hdd1")
 
 
 def parse_size(text):
@@ -78,8 +100,18 @@ def parse_size(text):
     return int(text, 0)
 
 
+def probe_magic(path, off):
+    """Is the tree's superblock where this medium puts it?"""
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            return f.read(len(MAGIC)) == MAGIC
+    except OSError:
+        return False
+
+
 class Image:
-    def __init__(self, path, size=None):
+    def __init__(self, path, size=None, base=None, medium=None):
         self.path = path
         if not os.path.exists(path):
             if size is None:
@@ -88,15 +120,33 @@ class Image:
             with open(path, "wb") as f:
                 f.truncate(size)
         self.size = os.path.getsize(path)
+
+        if base is not None:
+            self.base, self.medium = base, "custom"
+        elif medium == "emmc":
+            self.base, self.medium = emmc_tree_off(), "emmc"
+        elif medium == "hdd":
+            self.base, self.medium = SUPER_OFF, "hdd"
+        elif probe_magic(path, SUPER_OFF):
+            self.base, self.medium = SUPER_OFF, "hdd"
+        elif probe_magic(path, emmc_tree_off()):
+            self.base, self.medium = emmc_tree_off(), "emmc"
+        else:
+            # Nothing there yet: a new image is a disk unless told otherwise.
+            self.base, self.medium = SUPER_OFF, "hdd"
+
+        if self.base + BLOCK > self.size:
+            raise SystemExit("%s is smaller than its tree offset 0x%X"
+                             % (path, self.base))
         self.f = open(path, "r+b")
 
     def read_block(self, block):
-        self.f.seek(SUPER_OFF + block * BLOCK)
+        self.f.seek(self.base + block * BLOCK)
         return self.f.read(BLOCK)
 
     def write_block(self, block, data):
         assert len(data) <= BLOCK, len(data)
-        self.f.seek(SUPER_OFF + block * BLOCK)
+        self.f.seek(self.base + block * BLOCK)
         self.f.write(data + b"\x00" * (BLOCK - len(data)))
 
     def close(self):
@@ -199,6 +249,14 @@ def list_dir(image, block, prefix="", depth=0):
 
 
 def main(argv=None):
+    # A console's tree holds names in the firmware's own languages, and a
+    # Windows console codepage cannot represent all of them: without this a
+    # listing stops at the first such name instead of printing the tree.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -206,11 +264,24 @@ def main(argv=None):
     ap.add_argument("-o", "--output", help="image to create (same as image)")
     ap.add_argument("--size", help="size when creating an image, e.g. 20G")
     ap.add_argument("--root", help="directory holding dev_flash, dev_flash2, "
-                                   "dev_flash3 and dev_hdd0")
+                                   "dev_flash3, dev_hdd0 and dev_hdd1")
     ap.add_argument("--dev", action="append", metavar="NAME=DIR",
                     help="override one device directory (repeatable)")
     ap.add_argument("--list", action="store_true",
                     help="print the tree stored in the image")
+    layout = ap.add_mutually_exclusive_group()
+    layout.add_argument("--emmc", "--nand", dest="medium",
+                        action="store_const", const="emmc",
+                        help="the image is a NAND/eMMC chip: tree at 0x%X"
+                             % emmc_tree_off())
+    layout.add_argument("--hdd", "--disk", dest="medium",
+                        action="store_const", const="hdd",
+                        help="the image is a disk: tree at 32 MiB")
+    layout.add_argument("--base", type=lambda s: int(s, 0),
+                        help="the tree's superblock offset, in bytes")
+    layout.add_argument("--auto", dest="medium", action="store_const",
+                        const=None,
+                        help="use whichever offset holds the magic (default)")
     ap.add_argument("--erk-file", help="refused: this tool writes plain images")
     ap.add_argument("--erk", help="refused: this tool writes plain images")
     args = ap.parse_args(argv)
@@ -221,7 +292,8 @@ def main(argv=None):
                          "the tree is written (see ps3_hdd_create.py)")
 
     image_path = args.output or args.image
-    image = Image(image_path, parse_size(args.size) if args.size else None)
+    image = Image(image_path, parse_size(args.size) if args.size else None,
+                  base=args.base, medium=args.medium)
 
     try:
         if args.list:
@@ -229,7 +301,8 @@ def main(argv=None):
             if not sup:
                 raise SystemExit("%s carries no tree" % image_path)
             root, generation = sup
-            print("%s: generation %d" % (image_path, generation))
+            print("%s: %s layout, tree at 0x%X, generation %d"
+                  % (image_path, image.medium, image.base, generation))
             for name, kind, size, first in list_dir(image, root):
                 if kind == TYPE_DIR:
                     print("  %s/" % name)
@@ -281,9 +354,10 @@ def main(argv=None):
         builder.write_super(root, generation)
         used = builder.next_block * BLOCK
 
-        print("%s: generation %d, %d KiB of tree in a %d MiB image"
-              % (image_path, generation, used // 1024,
-                 image.size // (1024 * 1024)))
+        print("%s: %s layout, tree at 0x%X, generation %d, %d KiB of tree "
+              "in a %d MiB image"
+              % (image_path, image.medium, image.base, generation,
+                 used // 1024, image.size // (1024 * 1024)))
         return 0
     finally:
         image.close()

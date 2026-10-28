@@ -50,6 +50,13 @@
 #include "accel/tcg/iommu.h"
 #endif
 
+/*
+ * The PS3 model watches one guest address per run (hw/ppc/rs6000_ps3.c).
+ * The pointer is NULL for every other machine and target, so the test in the
+ * loop below is a load of a constant and a predictable branch.
+ */
+void (*ps3_pc_hook_fn)(struct CPUState *cs, uint64_t pc);
+
 /* -icount align implementation. */
 
 typedef struct SyncClocks {
@@ -969,6 +976,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
             if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
                 break;
+            }
+
+            if (unlikely(ps3_pc_hook_fn)) {
+                ps3_pc_hook_fn(cpu, s.pc);
             }
 
             tb = tb_lookup(cpu, s);
