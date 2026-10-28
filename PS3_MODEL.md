@@ -276,7 +276,7 @@ retail one that cannot carry it, the given ERK is kept for the ladder.
 ### A `.2` loader: the ERK it carries is wrapped
 
 The loaders on a Metldr.2 console hold their ERK wrapped under the console's
-eid_root_key, so no keyset opens them directly.  Give it (the `pck2` property)
+eid_root_key, so no keyset opens them directly.  Give it (the `pck1` property)
 and the model unwraps every 16-byte aligned window of the image's first 0x10000 bytes,
 letting the loader's own root-header check say which one is the ERK; the winner
 is then opened for real before it becomes the ladder's key:
