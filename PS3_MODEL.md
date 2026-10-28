@@ -9,11 +9,10 @@ see `AGENTS.md` and `docs/devel/code-provenance.rst`.  Nothing here is needed to
 build or use the rest of QEMU.
 
 This file is the short form: what to build, what to run and what passing looks
-like.  The research behind every behaviour - per-call findings, disassembly
-notes, the runs that settled each answer - lives in the ps3tools tree as
-`PS3_MODEL.md` with `EMER_INIT.md`, `FAULT_HARNESS.md`, `FLASH_LAYOUT.md`,
-`SUPERSLIM_MAP.md`, `KP_PROVENANCE.md`, `BOOTLDR_DISASM.md`,
-`LV0_LV1_DISASM.md`, `CONFIG_RING_TO_CISD.md` and `THREAD.md` beside it.
+like.  The reasoning behind each behaviour is in this file and in the comments
+next to the code it describes: the model's logs are the record of the runs that
+settled each answer, and every one of them names the call, the address and the
+guest state it read.
 
 # Credits
 
@@ -121,7 +120,7 @@ is what `ps3_self.c` opens the loaders and application SELFs with and what the
 ATA/flash ladders and an HDD image's key sector are built from; `lv1ldr` and
 `nand-loader` supply the console's own loader images, whose seed block is read
 out and used for those ladders instead of the model's copy of the constants.
-No per-console key is ever written to a log, only fingerprints.
+No per-console key, and no value derived from one, is ever written to a log.
 
 ## Files
 
@@ -216,12 +215,25 @@ Q=build-ps3-gui/qemu-system-ppc64.exe          # the SDL build
 
 ```sh
 $Q -M rs6000-ps3 -display sdl,gl=on -vga rsx,gl=on \
-   -bios .tmp/rom/rom.bin \
+   -global ps3-boot-rom.own-rom=on \
    -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
    -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img \
    -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin \
    -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
 ```
+
+`own-rom=on` is the form to run and the form to ship: the chain is opened,
+decrypted and verified by the model's own container opener (`ps3_rom_open`),
+and no mask boot ROM is supplied, loaded or executed, so a distribution of this
+tree carries no Sony code.  The stages, their checks and the chain of trust are
+the same ones the ROM path runs - the only thing dropped is the replay of the
+0x400-byte ROM on the SPU interpreter.
+
+Passing `-bios rom.bin` instead runs the ROM replay path, which is there to
+check the model's opener against the ROM's result.  That means shipping a dump
+of Sony's boot ROM, so it is a developer check, not a way to run the model.
+`-bios` together with `own-rom=on` is refused: a run that says it does not use
+the mask ROM must not have one loaded behind it.
 
 The application comes from the image's own tree: `hdd-file` (or `emmc-file`)
 carries `dev_flash`, `dev_flash2` and `dev_flash3`, and those are mounted from
@@ -244,7 +256,7 @@ that key comes from, and nothing has to be handed over separately:
 ```sh
 $Q -M rs6000-ps3 -display sdl \
    -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
-   -global ps3-boot-rom.lv1ldr=C:/Users/Thewoodsman/Documents/ps3tools-main/lv1ldr_493.self \
+   -global ps3-boot-rom.lv1ldr=lv1ldr.self \
    -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img \
    -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
 ```
@@ -465,19 +477,8 @@ $LD -Ttext=0x02000000 -e _start -o .tmp/sys_audio_test.elf .tmp/sys_audio_test.o
 | `ps3_emmc_create.py [dump] --identify` / `-o emmc_12g.img --tree-root ...` | identify a NAND/eMMC dump (model, firmware, ldr revision, region table), then build the 12 GB image: flash region at 0x40000 and the `dev_flash*`/`dev_hdd0` tree past 256 MiB |
 
 `scripts/PS3_TOOLS.md` is the index for those four: inputs, outputs, workflows
-and what each one refuses to do.  No key is ever printed: the tools report
-fingerprints only.
-
-The key chain itself has a tool on the ps3tools side, `chain_keys.py`, next to
-`bootldrdec.py` and `find_erk.py`:
-
-| Invocation | What it does |
-| --- | --- |
-| `chain_keys.py --flash dump.bin --readout ch66.bin --scan-lv0 --eid0 eEID.bin` | open the container, read PCK1 out of it (accepted only when it authenticates the EID0's CMAC) |
-| `chain_keys.py --lv1ldr lv1ldr.self` | no key on the command line: the ERK is read out of the loader (the key that opened it) and the ladder runs on that |
-| `chain_keys.py --lv1ldr lv1ldr.2.self --pck2 <96 hex>` | a `.2` loader: unwrap the ERK it carries with PCK2, confirmed by the image opening with it, and run the ladder on the unwrapped key |
-| `chain_keys.py --pck1 <96 hex> --lv1ldr lv1ldr.self --nand-loader nand.bin --qemu` | open both loaders, report the seed block's offset against the NOR and NAND reference offsets, derive the ATA and encdec keys, and print the `-global` lines this model takes |
-| `chain_keys.py --selftest` | seal a container and a loader, then prove each rung on them: tag, root-header check, seed discovery at both media's offsets, the ladder against a second implementation, and the EID0 check |
+and what each one refuses to do.  No key is ever printed, and nothing derived
+from one is printed either.
 
 ## Status
 

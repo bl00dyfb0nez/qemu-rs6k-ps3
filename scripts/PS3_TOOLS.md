@@ -3,7 +3,7 @@
 Four self-contained Python tools for the `rs6000-ps3` model.  They need nothing
 but a Python 3 interpreter (`ps3_ram_dump.py --disasm` additionally wants
 `capstone`); no key, no firmware dump and no Sony code is carried in this tree,
-and no per-console key is ever printed - the tools report fingerprints only.
+and no per-console key is ever printed, nor anything derived from one.
 
 | Tool | What it does |
 | --- | --- |

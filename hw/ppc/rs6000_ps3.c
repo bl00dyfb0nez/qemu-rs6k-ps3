@@ -1459,6 +1459,14 @@ struct PS3BootROMState {
     bool tree_emmc;                 /* the file tree is on the eMMC */
     char *boot_medium;
     bool boot_logo;                 /* the boot screen, once the chain is done */
+    /*
+     * Boot without the mask ROM.  The chain is opened, decrypted and verified
+     * by the model's own container opener (ps3_rom_open) instead of replaying
+     * the console's 0x400-byte boot ROM on the SPU, so no Sony code has to be
+     * supplied or shipped.  The stages after it, and every check they make,
+     * are the same ones the ROM path runs.
+     */
+    bool own_rom;
     QEMUTimer *home_timer;          /* the home screen after the wordmark */
     /*
      * The application lv2 starts.  It comes from one of two places and nowhere
@@ -2367,7 +2375,10 @@ static void ps3_rom_boot(PS3BootROMState *s)
     memory_region_set_readonly(&s->ls_mr, false);
     memset(memory_region_get_ram_ptr(&s->ls_mr), 0, PS3_LS_SIZE);
 
-    if (s->rom_len != PS3_ROM_SIZE) {
+    if (s->own_rom) {
+        info_report("ps3-boot-rom: own loader path: the mask ROM is not used; "
+                    "the container is opened and verified by the model");
+    } else if (s->rom_len != PS3_ROM_SIZE) {
         snprintf(why, sizeof(why), "the mask ROM is 0x%x bytes, expected 0x400",
                  (unsigned)s->rom_len);
         ps3_rom_set_status(s, PS3_BOOT_BAD_ROM, why);
@@ -2420,7 +2431,7 @@ static void ps3_rom_boot(PS3BootROMState *s)
          * model, with the same channel-66 readout and the container's
          * effective address on the signal channels.
          */
-        if (s->spu_run && s->spu) {
+        if (s->spu_run && s->spu && !s->own_rom) {
             ps3_spu_set_ch66(s->spu, ch66);
             ps3_spu_set_sig(s->spu, 0, s->container_offset);
             ps3_spu_set_trace(s->spu, s->spu_trace);
@@ -15349,7 +15360,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
     ram = memory_region_get_ram_ptr(s->ram);
     ram_size = memory_region_size(s->ram);
     /* Record the ranges the VSH's XMB resource loader hands its inflate. */
-    ps3_lv2_inflate_stream_probe(s, ram, ram_size);
+    if (s->ppu_trace) {
+        ps3_lv2_inflate_stream_probe(s, ram, ram_size);
+    }
     /*
      * A new `sc` has entered the trampoline: its frame is not folded up yet -
      * unless this is the call whose frame is already folded, published again
@@ -17437,7 +17450,13 @@ static void ps3_lv2_service(PS3BootROMState *s)
          * it for as long as the loader retries, and only the first one has the
          * thread's stack still where it was.
          */
-        if (!s->lv2_inflate_reported &&
+        /*
+         * The record below reads the guest's own frames and messages, so it is
+         * a diagnosis, not part of the machine: it only runs with the lv2 call
+         * trace on, and a production run neither collects it nor pays for the
+         * scans that look for it.
+         */
+        if (!s->lv2_inflate_reported && s->ppu_trace &&
             (ps3_mem_has(ram + a1, a2, "inflate failed") ||
              ps3_mem_has(ram + a1, a2, "inflateInit failed") ||
              ps3_mem_has(ram + a1, a2, "resource load failed"))) {
@@ -18343,7 +18362,8 @@ static void ps3_lv2_service(PS3BootROMState *s)
              * An .rco goes on to the VSH's inflate; arm the record of the
              * ranges it is handed (ps3_lv2_inflate_stream_probe).
              */
-            if (r->path && g_str_has_suffix(r->path, ".rco")) {
+            if (s->ppu_trace && r->path &&
+                g_str_has_suffix(r->path, ".rco")) {
                 s->rco_watch = (unsigned)s->thr_cur + 1;
                 s->rco_watch_calls = 0;
             }
@@ -20700,6 +20720,18 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
         buf = NULL;
     }
 
+    if (s->rom_file && s->own_rom) {
+        /*
+         * own-rom=on is the promise that no boot ROM is used.  Loading the
+         * image anyway would quietly put Sony's code back in the machine, so
+         * it is refused outright rather than ignored.
+         */
+        error_setg(errp, "ps3-boot-rom: own-rom=on and -bios %s were both "
+                   "given; own-rom means the mask ROM is not used at all, so "
+                   "drop one of the two", s->rom_file);
+        return;
+    }
+
     if (s->rom_file) {
         if (!g_file_get_contents(s->rom_file, &buf, &len, &err)) {
             error_setg(errp, "ps3-boot-rom: cannot read %s: %s", s->rom_file,
@@ -20725,7 +20757,12 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
 
         memory_region_set_readonly(&s->rom_mr, true);
     } else {
-        info_report("ps3-boot-rom: no -bios image; the mask ROM is blank");
+        if (s->own_rom) {
+            info_report("ps3-boot-rom: own-rom=on: the mask ROM is not used; "
+                        "the chain is opened and verified by the model");
+        } else {
+            info_report("ps3-boot-rom: no -bios image; the mask ROM is blank");
+        }
     }
 
     if (s->blk) {
@@ -22499,6 +22536,7 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("emmc-size", PS3BootROMState, emmc_size, 12 * GiB),
     DEFINE_PROP_STRING("boot-medium", PS3BootROMState, boot_medium),
     DEFINE_PROP_BOOL("boot-logo", PS3BootROMState, boot_logo, true),
+    DEFINE_PROP_BOOL("own-rom", PS3BootROMState, own_rom, false),
     /* Boot with the EEPROM's recover flag set, i.e. into the recovery loop. */
     DEFINE_PROP_BOOL("recover", PS3BootROMState, recover_prop, false),
 

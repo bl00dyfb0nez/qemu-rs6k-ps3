@@ -13,8 +13,8 @@ disk portable between runs:
     ps3_hdd_create.py --erk-file .tmp/erk.bin --size 1G -o .tmp/test.raw
 
 The data area is left zeroed (an unformatted disk): the console - and the
-model's guest - formats it on first boot.  No key is printed; only a
-fingerprint, because a PCK1 in a log is a console in a log.
+model's guest - formats it on first boot.  No key is printed, and nothing
+derived from one either: a PCK1 in a log is a console in a log.
 
     -o/--output      image to create
     --size           bytes ("20G", "512M", or a number); default 20 GiB
