@@ -56,6 +56,17 @@ Examples
   # a console with no files on it yet: flash only, storage left empty
   scripts/ps3_emmc_create.py CECH4201A.NAND.BIN -o emmc_12g.img
 
+  # read a finished image back: dump placement, erased padding, the seal
+  # boundary and the tree inside it, all against the dump it came from
+  scripts/ps3_emmc_create.py CECH4201A.NAND.BIN -o emmc_12g.img \\
+      --verify --erk-file erk48.bin
+
+A NOR console (CECH-4301C and the other 40xxB/C, plus every earlier Slim) has
+no eMMC and no storage area at 0x10000000: its firmware is the 16 MiB NOR chip,
+which scripts/ps3_flash_layout.py builds, carves and verifies.  The storage of a
+NOR console is its disk - ps3_hdd_create.py / ps3_hdd_tree.py - sealed with the
+same ENCDEC ladder from that console's own ERK.
+
 Then the model boots from it without a flash image or an HDD:
 
   qemu-system-ppc64 -M rs6000-ps3 -display sdl \\
@@ -126,6 +137,10 @@ def sony_size(text):
     return int(text, 0)
 
 
+class SealToolMissing(Exception):
+    """No C compiler and no seal tool already built from these sources."""
+
+
 def encdec_tool():
     """Build (once) the seal tool from the model's own AES/XTS sources.
 
@@ -158,29 +173,35 @@ def encdec_tool():
 
     os.makedirs(TOOL_DIR, exist_ok=True)
 
-    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
-    if not cc:
-        raise SystemExit("no C compiler (cc/gcc/clang) to build the seal tool "
-                         "from hw/ppc/ps3_aes; drop --erk to leave the storage "
-                         "area as it stands")
+    stamp = os.path.join(TOOL_DIR, "ps3_encdec.build")
+    newest = max(os.path.getmtime(src) for src in srcs)
+    current = os.path.exists(exe) and os.path.getmtime(exe) >= newest and \
+        os.path.exists(stamp)
 
     # 64-bit offsets: the storage area starts past 2 GiB, so a 32-bit off_t
     # would seek into the wrong place on a 12 GB image.  The tool also seeks
     # through the platform's 64-bit call and checks where it landed, so this
     # define is belt and braces - and it is part of the stamp below, so a tool
     # built with a different line is rebuilt rather than reused.
-    cmd = [cc, "-O2", "-std=gnu11", "-D_FILE_OFFSET_BITS=64",
-           "-I", AES_DIR, "-I", os.path.join(TOOL_DIR, "shim"),
-           "-o", exe] + srcs
-    line = subprocess.list2cmdline(cmd)
-    stamp = os.path.join(TOOL_DIR, "ps3_encdec.build")
-    newest = max(os.path.getmtime(src) for src in srcs)
-
-    if os.path.exists(exe) and os.path.getmtime(exe) >= newest and \
-            os.path.exists(stamp):
-        with open(stamp, "r", encoding="utf-8") as f:
-            if f.read().strip() == line:
-                return exe
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if cc:
+        cmd = [cc, "-O2", "-std=gnu11", "-D_FILE_OFFSET_BITS=64",
+               "-I", AES_DIR, "-I", os.path.join(TOOL_DIR, "shim"),
+               "-o", exe] + srcs
+        line = subprocess.list2cmdline(cmd)
+        if current:
+            with open(stamp, "r", encoding="utf-8") as f:
+                if f.read().strip() == line:
+                    return exe
+    elif current:
+        # No compiler here, but the last build of this very tool is still
+        # newer than the sources it links: verifying a finished image does not
+        # need a compiler, only the binary that wrote it.
+        return exe
+    else:
+        raise SealToolMissing(
+            "no C compiler (cc/gcc/clang) to build the seal tool from "
+            "hw/ppc/ps3_aes")
 
     print("seal tool  : %s" % line)
     done = subprocess.run(cmd, capture_output=True, text=True)
@@ -204,7 +225,13 @@ def seal_storage(path, total, erk):
     if length <= 0:
         raise SystemExit("no storage area to seal at 0x%X" % TREE_OFF)
 
-    done = subprocess.run([encdec_tool(), path, hex(TREE_OFF), hex(length), "-"],
+    try:
+        tool = encdec_tool()
+    except SealToolMissing as e:
+        raise SystemExit("%s; drop --erk to leave the storage area as it stands"
+                         % e)
+
+    done = subprocess.run([tool, path, hex(TREE_OFF), hex(length), "-"],
                           input=erk, capture_output=True)
     if done.returncode:
         raise SystemExit("cannot seal %s:\n%s"
@@ -533,6 +560,218 @@ def build(args, data, info):
           (args.output, total, total / 1e9))
 
 
+def _compare(f, off, blob, chunk=16 * MiB):
+    """Does the image hold `blob` at `off`?  Returns (same, first bad byte)."""
+    f.seek(off)
+    done = 0
+    while done < len(blob):
+        n = min(chunk, len(blob) - done)
+        got = f.read(n)
+        if got != blob[done:done + n]:
+            for i in range(n):
+                if got[i] != blob[done + i]:
+                    return False, done + i
+        done += n
+    return True, done
+
+
+def _erased(f, off, end, chunk=16 * MiB):
+    """Is every byte of [off, end) 0xFF?  Returns (yes, first bad offset)."""
+    f.seek(off)
+    while off < end:
+        n = min(chunk, end - off)
+        got = f.read(n)
+        if got != b"\xff" * n:
+            for i in range(n):
+                if got[i] != 0xFF:
+                    return False, off + i
+        off += n
+    return True, end
+
+
+def _tool_crypt(path, off, length, erk, decrypt):
+    """Run the seal tool over a range, the same binary the builder used."""
+    cmd = [encdec_tool(), path, hex(off), hex(length), "-"]
+    if decrypt:
+        cmd.append("decrypt")
+    done = subprocess.run(cmd, input=erk, capture_output=True)
+    if done.returncode:
+        raise SystemExit("cannot %s %s at 0x%X:\n%s"
+                         % ("open" if decrypt else "re-seal", path, off,
+                            done.stderr.decode("utf-8", "replace").strip()))
+
+
+def dir_entries(block):
+    """The entries of one directory block: name, type, size, first block."""
+    out = []
+    at = ps3_hdd_tree.DIR_HEAD
+    while at + ps3_hdd_tree.ENTRY <= len(block) and block[at]:
+        n = block[at]
+        kind = block[at + 1]
+        size = struct.unpack_from(">I", block, at + 4)[0]
+        first = struct.unpack_from(">Q", block, at + 8)[0]
+        name = block[at + 16:at + 16 + n].decode("latin-1")
+        out.append((name, kind, size, first))
+        at += ps3_hdd_tree.ENTRY
+    return out
+
+
+def sealed_read(path, off, length, erk):
+    """Read a range through the model's XTS and put the image back.
+
+    The range is decrypted in place, read, then re-encrypted and compared with
+    what was there: an image whose seal does not round trip is left untouched
+    (and reported by the caller), rather than silently modified by a check.
+    """
+    with open(path, "rb") as f:
+        f.seek(off)
+        raw = f.read(length)
+
+    _tool_crypt(path, off, length, erk, decrypt=True)
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            plain = f.read(length)
+    finally:
+        _tool_crypt(path, off, length, erk, decrypt=False)
+
+    with open(path, "rb") as f:
+        f.seek(off)
+        back = f.read(length)
+
+    if back != raw:
+        with open(path, "r+b") as f:       # put the original bytes back
+            f.seek(off)
+            f.write(raw)
+        raise SystemExit("%s: the seal at 0x%X does not re-encrypt to the bytes "
+                         "that were there; the image was restored and is not "
+                         "one this tool wrote" % (path, off))
+    return plain
+
+
+def verify_image(args, data, info):
+    """Re-read a finished image and check what the builder promises.
+
+    Three things can be wrong without the model noticing until it boots: the
+    dump went in at the wrong NAND position, the padding is not erased flash,
+    or the seal covers the wrong range.  Each is checked against the dump the
+    image was built from, and the storage area is read through the model's own
+    XTS to prove the tree is where the seal starts.
+    """
+    if not args.output:
+        raise SystemExit("--verify needs -o/--output naming the image to check")
+
+    path = args.output
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise SystemExit("cannot read %s: %s" % (path, e.strerror or e))
+
+    total = sony_size(args.total)
+    base = info["base"]
+    flash = data[:FLASH_AREA - base]
+    flash_end = base + len(flash)
+    ok = True
+
+    def report(name, good, detail):
+        nonlocal ok
+        ok = ok and good
+        print("%-11s: %-58s %s" % (name, detail, "ok" if good else "FAIL"))
+        return good
+
+    print("verifying   : %s against %s" % (path, args.source))
+    report("image", size == total, "%d bytes, expected %d" % (size, total))
+
+    with open(path, "rb") as f:
+        good, at = _compare(f, base, flash)
+        report("dump", good,
+               "0x%X..0x%X is the dump%s"
+               % (base, flash_end,
+                  "" if good else " (first difference at 0x%X)"
+                  % (base + at)))
+
+        if flash_end < FLASH_AREA:
+            good, at = _erased(f, flash_end, FLASH_AREA)
+            report("padding", good,
+                   "0x%X..0x%X is 0xFF (erased flash)%s"
+                   % (flash_end, FLASH_AREA,
+                      "" if good else " (not erased at 0x%X)" % at))
+        else:
+            report("padding", flash_end == FLASH_AREA,
+                   "none: the dump fills the NAND-mapped area")
+
+        # The seal has to begin exactly at the storage area: whatever sits in
+        # the last sector before it is still the dump or the padding, never the
+        # ciphertext of a seal that started a sector early.
+        if TREE_OFF - SECTOR >= flash_end:
+            f.seek(TREE_OFF - SECTOR)
+            good = f.read(SECTOR) == b"\xff" * SECTOR
+            report("seal start", good,
+                   "sector 0x%X, before the storage area, is still padding"
+                   % ((TREE_OFF - SECTOR) // SECTOR))
+        else:
+            f.seek(TREE_OFF - SECTOR)
+            good = f.read(SECTOR) == data[TREE_OFF - SECTOR - base:
+                                         TREE_OFF - base]
+            report("seal start", good,
+                   "sector 0x%X, before the storage area, is still the dump"
+                   % ((TREE_OFF - SECTOR) // SECTOR))
+
+    if not args.erk:
+        print("%-11s: %-58s %s" % ("tree", "sealed storage; pass --erk-file "
+                                   "to unseal and check it", "skipped"))
+        print("result      : %s (the seal itself was not checked)"
+              % ("ok" if ok else "FAILED"))
+        return 0 if ok else 1
+
+    try:
+        superblk = sealed_read(path, TREE_OFF, BLOCK, args.erk)
+    except SealToolMissing as e:
+        print("%-11s: %-58s %s" % ("seal", str(e), "skipped"))
+        print("result      : %s (the seal itself was not checked)"
+              % ("ok" if ok else "FAILED"))
+        return 0 if ok else 1
+    except SystemExit as e:
+        report("seal", False, str(e))
+        print("result      : FAILED")
+        return 1
+
+    if not superblk.strip(b"\0"):
+        print("%-11s: %-58s %s" % ("tree", "storage area is empty (built "
+                                   "without --tree-root)", "skipped"))
+        print("result      : %s" % ("ok" if ok else "FAILED"))
+        return 0 if ok else 1
+
+    magic = superblk[:8] == ps3_hdd_tree.MAGIC
+    root, generation = struct.unpack_from(">II", superblk, 8)
+    blocks = (size - TREE_OFF) // BLOCK
+    entries = []
+
+    if magic and 0 < root < blocks:
+        entries = dir_entries(sealed_read(path, TREE_OFF + root * BLOCK,
+                                          BLOCK, args.erk))
+
+    report("seal", magic and 0 < root < blocks,
+           "storage opens to PS3HDFS1, root block %u, generation %u"
+           % (root, generation) if magic else
+           "storage does not open to PS3HDFS1")
+
+    # Every device the model looks for has to be a directory in the root, or
+    # the boot stops at the one that is missing.
+    dirs = [name for name, kind, _size, _first in entries
+            if kind == ps3_hdd_tree.TYPE_DIR]
+    missing = [d for d in ps3_hdd_tree.DEVICES if d not in dirs]
+    report("tree", entries and not missing,
+           "root holds %u entr%s; %u block(s)%s"
+           % (len(entries), "y" if len(entries) == 1 else "ies", blocks,
+              "" if not missing else "; missing %s" % ", ".join(missing)))
+    if entries and not missing:
+        print("%-11s: %s" % ("devices", ", ".join(dirs)))
+
+    print("result      : %s" % ("ok" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
 def read_erk(args):
     """The 48-byte ERK from --erk-file or --erk, or None when neither is given."""
     if args.erk_file:
@@ -579,6 +818,9 @@ def main(argv=None):
                     help="the same 48 bytes in a file")
     ap.add_argument("--identify", action="store_true",
                     help="only say what the dump is")
+    ap.add_argument("--verify", action="store_true",
+                    help="re-read -o/--output and check its flash, padding, "
+                         "tree and seal against the dump")
     args = ap.parse_args(argv)
 
     args.erk = read_erk(args)
@@ -597,6 +839,9 @@ def main(argv=None):
 
     if args.identify:
         return 0
+
+    if args.verify:
+        return verify_image(args, data, info)
 
     if not args.output:
         ap.error("-o/--output is required to build an image")
