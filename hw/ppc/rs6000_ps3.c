@@ -1718,6 +1718,7 @@ static void ps3_put_be32(uint8_t *p, uint32_t v)
 #define PS3_LV2_ENOENT  ((int32_t)0x80010006)
 #define PS3_LV2_EPERM   ((int32_t)0x80010009)
 #define PS3_LV2_EFAULT  ((int32_t)0x8001000D)
+#define PS3_LV2_EALIGN  ((int32_t)0x80010010)
 #define PS3_LV2_EISDIR  ((int32_t)0x80010012)
 #define PS3_LV2_EEXIST  ((int32_t)0x80010014)
 #define PS3_LV2_ENOTCONN ((int32_t)0x80010016)
@@ -3120,25 +3121,46 @@ static const MemoryRegionOps ps3_ppe_uart_ops = {
 
 /*
  * The memory container: a bump heap in the top band of RAM, clear of the
- * region the guest's own allocator grows through.  Both allocate calls hand
- * out 256-byte aligned blocks from it, and free is a no-op, which is all the
- * guest's allocator needs from a container this simple.
+ * region the guest's own allocator grows through.  Free is a no-op, which is
+ * all the guest's allocator needs from a container this simple.
+ *
+ * The granularity is lv2's, not the request's: flags 0x200
+ * (SYS_MEMORY_ATTRIBUTE_PAGE_SIZE_64K) means 64 KiB pages and 0 means 1 MiB,
+ * the block starts on one of those pages and covers whole ones.  The guest's
+ * libc builds its own arena on top of these blocks and writes a page's worth
+ * of bookkeeping into the block it was given, so a 256-byte block with a
+ * 64 KiB page's structures in it runs straight over whatever was handed out
+ * next door - which is how the XMB's resource table and the packed stream it
+ * names were lost between the accessor and the inflate.
  */
 static int32_t ps3_lv2_alloc(PS3BootROMState *s, uint8_t *ram,
-                             uint64_t ram_size, uint32_t size, uint32_t out)
+                             uint64_t ram_size, uint32_t size, uint32_t out,
+                             uint32_t flags)
 {
-    uint32_t heap;
-
-    heap = s->lv2_heap;
-    uint32_t end = (heap + size + 0xFF) & ~0xFFu;
+    uint32_t heap, page, page_size;
 
     if (!size) {
-        return PS3_LV2_EINVAL;
+        return PS3_LV2_EALIGN;
     }
     if ((uint64_t)out + 4 > ram_size) {
         return PS3_LV2_EFAULT;
     }
+    page = (flags & 0x200) ? 0x10000 : 0x100000;
+    page_size = (size + page - 1) & ~(page - 1);
+    if (page_size < size) {
+        return PS3_LV2_EALIGN;
+    }
+    if (page_size != size && g_getenv("PS3_DUMP_RCO")) {
+        info_report("ps3-ppu: lv2: allocate of %u byte(s) with flags 0x%X "
+                    "takes a whole %u-byte page", size, flags, page);
+    }
+    heap = (s->lv2_heap + page - 1) & ~(page - 1);
+    uint32_t end = heap + page_size;
+
     if (end < heap || (uint64_t)end + 0x100 > ram_size) {
+        info_report("ps3-ppu: lv2: allocate %u byte(s) with flags 0x%X failed: "
+                    "the container is at 0x%X of 0x%" PRIX64, size, flags,
+                    s->lv2_heap, ram_size);
         return PS3_LV2_ENOMEM;
     }
 
@@ -3153,7 +3175,9 @@ static int32_t ps3_lv2_alloc(PS3BootROMState *s, uint8_t *ram,
     if (g_getenv("PS3_DUMP_RCO")) {
         static unsigned n;
 
-        if (n < 200) {
+        /* Every block, while the dump is on: which call claimed an address is
+         * the whole question when two of them end up at the same one. */
+        if (n < 8192) {
             CPUState *cs = qemu_get_cpu(0);
 
             n++;
@@ -15629,6 +15653,26 @@ static void ps3_rco_scan_file_copy(PS3BootROMState *s, uint8_t *ram,
     ps3_rco_find_packed_copy(s, ram, ram_size);
 }
 
+/*
+ * The range the loader was handed, watched from the moment it is named.  A
+ * block that reads as a zlib header at the accessor and as anything else at
+ * the wrapper was written in between, and the pc of the translation block
+ * that did it is the answer to "who claimed this address".  One range at a
+ * time is enough: the first entry is the one that fails.
+ */
+static struct {
+    uint32_t addr, len;
+    uint8_t first[0x40];
+    bool on;
+    unsigned reports;
+} ps3_rco_watch;
+
+/* The lv2 call the guest last made: a clobber traced to the 0xC00 trampoline
+ * is a host-side store inside that call, so the number names the handler. */
+static uint32_t ps3_rco_last_nr = ~0u;
+static uint32_t ps3_rco_last_a0, ps3_rco_last_a1, ps3_rco_last_a2;
+static uint64_t ps3_rco_last_pc;
+
 static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
 {
     PS3BootROMState *s = ps3_pc_hook_state;
@@ -15643,6 +15687,50 @@ static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
 
     if (!s) {
         return;
+    }
+    if (ps3_rco_watch.on) {
+        ram = memory_region_get_ram_ptr(s->ram);
+        ram_size = memory_region_size(s->ram);
+        if (pc != PS3_RCO_INFLATE_PC && pc != PS3_RCO_ACCESSOR_PC &&
+            pc != PS3_RCO_GETTER_PC) {
+            /* Remember what ran last: the store happened in that block. */
+            static uint64_t prev;
+
+            if (prev && prev != pc) {
+                ps3_rco_last_pc = prev;
+            }
+            prev = pc;
+        }
+        if ((uint64_t)ps3_rco_watch.addr + ps3_rco_watch.len <= ram_size &&
+            memcmp(ram + ps3_rco_watch.addr, ps3_rco_watch.first,
+                   ps3_rco_watch.len)) {
+            info_report("ps3-ppu:   the %u byte(s) at 0x%X were overwritten "
+                        "after the accessor named them: now %02X %02X %02X "
+                        "%02X %02X %02X %02X %02X, by the block at pc 0x%"
+                        PRIX64 " (thread %d, lr 0x%" PRIX64 ", lv2 call 0x%X "
+                        "with 0x%X, 0x%X, 0x%X), last block 0x%" PRIX64,
+                        ps3_rco_watch.len, ps3_rco_watch.addr,
+                        ram[ps3_rco_watch.addr], ram[ps3_rco_watch.addr + 1],
+                        ram[ps3_rco_watch.addr + 2],
+                        ram[ps3_rco_watch.addr + 3],
+                        ram[ps3_rco_watch.addr + 4],
+                        ram[ps3_rco_watch.addr + 5],
+                        ram[ps3_rco_watch.addr + 6],
+                        ram[ps3_rco_watch.addr + 7],
+                        pc, s->thr_cur, cpu->env.lr, ps3_rco_last_nr,
+                        ps3_rco_last_a0, ps3_rco_last_a1, ps3_rco_last_a2,
+                        ps3_rco_last_pc);
+            tag = g_strdup_printf("clobber_%u", ps3_rco_watch.reports);
+            ps3_lv2_dump_range(ram, ram_size, ps3_rco_watch.addr, 0x200, tag);
+            ps3_lv2_dump_range(ram, ram_size, (uint32_t)pc & ~0xFFu, 0x300,
+                               "clobberpc");
+            if (++ps3_rco_watch.reports >= 2) {
+                ps3_rco_watch.on = false;
+            } else {
+                memcpy(ps3_rco_watch.first, ram + ps3_rco_watch.addr,
+                       ps3_rco_watch.len);
+            }
+        }
     }
     if (pc == PS3_RCO_GETTER_PC) {
         uint32_t ctx = cpu->env.gpr[3];
@@ -15689,6 +15777,15 @@ static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
         info_report("ps3-ppu: rco-accessor: ctx 0x%X slot 0x%X holds base 0x%X, "
                     "handle 0x%X (thread %d)", ctx, slot, base, handle,
                     s->thr_cur);
+        if (!ps3_rco_watch.on && base > 0x10000 &&
+            (uint64_t)base + 0x40 <= ram_size) {
+            ps3_rco_watch.addr = base;
+            ps3_rco_watch.len = 0x40;
+            memcpy(ps3_rco_watch.first, ram + base, 0x40);
+            ps3_rco_watch.on = true;
+            info_report("ps3-ppu:   watching the 0x40 byte(s) at 0x%X the "
+                        "accessor named", base);
+        }
         if (n == 1) {
             ps3_lv2_dump_range(ram, ram_size, ctx & ~0xFFu, 0x200, "ctx");
             ps3_lv2_dump_range(ram, ram_size, slot & ~0x3Fu, 0x80, "slot");
@@ -15743,8 +15840,12 @@ static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
 
         if (!code_dumped) {
             code_dumped = true;
-            ps3_lv2_dump_range(ram, ram_size, 0x35E5C0, 0x140, "caller");
+            ps3_lv2_dump_range(ram, ram_size, 0x35E3C0, 0x340, "caller");
             ps3_lv2_dump_range(ram, ram_size, 0x40BE00, 0x100, "wrapper");
+            /* The two accessors and the getter behind them, whole. */
+            ps3_lv2_dump_range(ram, ram_size, 0x36A0C0, 0x600, "accessors");
+            ps3_lv2_dump_range(ram, ram_size, 0x17B700, 0x400, "checkfn");
+            ps3_lv2_dump_range(ram, ram_size, 0x0CA000, 0x100, "openfile");
         }
     }
     zlib_hdr = ps3_rco_zlib_header(ram + in);
@@ -15844,6 +15945,7 @@ static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
     }
     tag = g_strdup_printf("rcoentry_%03u_in", ps3_rco_entry_reports);
     ps3_lv2_dump_range(ram, ram_size, in, in_len, tag);
+
     /*
      * The window the range sits in: the arena's own bookkeeping is what says
      * whether the loader allocated this block and what still points at it.
@@ -16089,6 +16191,66 @@ static void ps3_lv2_service(PS3BootROMState *s)
         }
     }
     nr = cpu->env.gpr[11];
+    /*
+     * A thread that calls the same number from the same return address over
+     * and over is looping on it, and the loop is invisible in a log that only
+     * prints the calls that change something.  Name it once per 256 repeats.
+     */
+    {
+        static uint32_t last_nr, last_lr, last_tid, repeat;
+        static unsigned main_calls;
+        uint32_t lr32 = (uint32_t)cpu->env.lr;
+
+        if (g_getenv("PS3_TRACE_MAIN") && s->thr_cur == 0 &&
+            main_calls < 400) {
+            main_calls++;
+            info_report("ps3-ppu: main: call 0x%X from 0x%X (r3 0x%X, "
+                        "r4 0x%X, r5 0x%X, r6 0x%X)",
+                        nr, lr32, (uint32_t)cpu->env.gpr[3],
+                        (uint32_t)cpu->env.gpr[4],
+                        (uint32_t)cpu->env.gpr[5],
+                        (uint32_t)cpu->env.gpr[6]);
+        }
+
+        if (nr == last_nr && lr32 == last_lr && s->thr_cur == last_tid) {
+            if (++repeat == 64 || !(repeat & 0xFF)) {
+                info_report("ps3-ppu: lv2: thread %d has called 0x%X from "
+                            "0x%X %u time(s) in a row (r3 0x%X, r4 0x%X, "
+                            "r5 0x%X)",
+                            s->thr_cur, nr, lr32, repeat,
+                            (uint32_t)cpu->env.gpr[3],
+                            (uint32_t)cpu->env.gpr[4],
+                            (uint32_t)cpu->env.gpr[5]);
+                if (g_getenv("PS3_DUMP_RCO") && repeat == 64) {
+                    /* The loop's own code, the buffer it polls and the RSX's
+                     * handshake areas, once, so the wait can be read. */
+                    g_autofree gchar *t = g_strdup_printf("spin_%u", lr32);
+
+                    ps3_lv2_dump_range(ram, ram_size, lr32 & ~0x7Fu, 0x400, t);
+                    ps3_lv2_dump_range(ram, ram_size, 0xD600000, 0x400,
+                                       "iomapped");
+                    ps3_lv2_dump_range(ram, ram_size, 0xD601200, 0x200,
+                                       "polled");
+                    ps3_lv2_dump_range(ram, ram_size, 0xE100000, 0x200,
+                                       "driverinfo");
+                    ps3_lv2_dump_range(ram, ram_size, 0xE200000, 0x200,
+                                       "reports");
+                    ps3_lv2_dump_range(ram, ram_size,
+                                       (uint32_t)cpu->env.gpr[1] & ~0xFFu,
+                                       0x300, "spinstack");
+                }
+            }
+        } else {
+            last_nr = nr;
+            last_lr = lr32;
+            last_tid = s->thr_cur;
+            repeat = 0;
+        }
+    }
+    ps3_rco_last_nr = nr;
+    ps3_rco_last_a0 = cpu->env.gpr[3];
+    ps3_rco_last_a1 = cpu->env.gpr[4];
+    ps3_rco_last_a2 = cpu->env.gpr[5];
     /*
      * The last few calls, kept in memory rather than printed: when a thread
      * lands on a vector, the calls that led there are what names the fault,
@@ -16691,6 +16853,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
             }
         }
         if (c < 0) {
+            info_report("ps3-ppu: lv2: cond_create: all %d conditions are in "
+                        "use (thread %d, lr 0x%" PRIX64 ")",
+                        PS3_COND_MAX, s->thr_cur, (uint64_t)cpu->env.lr);
             ret = PS3_LV2_EAGAIN;
             break;
         }
@@ -16698,6 +16863,10 @@ static void ps3_lv2_service(PS3BootROMState *s)
         s->cond[c].id = ++s->lv2_next_id;
         s->cond[c].mutex = a1;
         ps3_put_be32(ram + a0, s->cond[c].id);
+        if (s->ppu_trace) {
+            info_report("ps3-ppu: lv2: cond 0x%X created in slot %d on mutex "
+                        "0x%X (thread %d)", s->cond[c].id, c, a1, s->thr_cur);
+        }
         ret = 0;
         break;
     }
@@ -16725,6 +16894,28 @@ static void ps3_lv2_service(PS3BootROMState *s)
         int m = c >= 0 ? ps3_mutex_index(s, s->cond[c].mutex) : -1;
 
         if (c < 0 || m < 0) {
+            static uint32_t reported_cond;
+
+            /* A wait on a condition that is not there leaves the mutex held,
+             * and every thread queued on that mutex stalls behind it, so the
+             * first miss is worth a line even when lv2 tracing is off. */
+            if (c < 0 && reported_cond != a0) {
+                unsigned j, ids = 0;
+                char list[160];
+                int n = 0;
+
+                reported_cond = a0;
+                for (j = 0; j < PS3_COND_MAX && n < (int)sizeof(list) - 8; j++) {
+                    if (s->cond[j].used) {
+                        n += snprintf(list + n, sizeof(list) - n, "%s0x%X",
+                                      ids++ ? ", " : "", s->cond[j].id);
+                    }
+                }
+                info_report("ps3-ppu: lv2: cond_wait 0x%X: no such condition "
+                            "(%u created: %s) (thread %d, lr 0x%" PRIX64 ")",
+                            a0, ids, ids ? list : "none", s->thr_cur,
+                            (uint64_t)cpu->env.lr);
+            }
             if (s->ppu_trace) {
                 info_report("ps3-ppu: lv2: cond_wait: cond 0x%X %s, "
                             "mutex 0x%X %s (lr=0x%" PRIX64 ")",
@@ -17997,11 +18188,11 @@ static void ps3_lv2_service(PS3BootROMState *s)
         break;
     }
     case 0x15C:                 /* sys_memory_allocate(size, flags, addr*) */
-        ret = ps3_lv2_alloc(s, ram, ram_size, a0, a2);
+        ret = ps3_lv2_alloc(s, ram, ram_size, a0, a2, a1);
         break;
-    case 0x15E:                 /* sys_memory_allocate_from_container(id,
-                                 * size, flags, addr*) */
-        ret = ps3_lv2_alloc(s, ram, ram_size, a1, a3);
+    case 0x15E:                 /* sys_memory_allocate_from_container(size, cid,
+                                 * flags, addr*) - size first, as lv2 has it */
+        ret = ps3_lv2_alloc(s, ram, ram_size, a0, a3, a2);
         break;
     case 0x18E: {               /* sys_console_write(buf) */
         uint32_t at = a0;
@@ -18527,7 +18718,8 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EINVAL;
             break;
         }
-        if (ps3_lv2_alloc(s, ram, ram_size, 0x1000, a0) != 0) {
+        /* One 64 KiB page, which is the smallest the container hands out. */
+        if (ps3_lv2_alloc(s, ram, ram_size, 0x1000, a0, 0x200) != 0) {
             ret = PS3_LV2_ENOMEM;
             break;
         }
@@ -20331,6 +20523,53 @@ static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
  */
 #define PS3_EMMC_FLASH_OFF   0x00040000u
 
+/*
+ * The region table names its regions, and the first of them is the
+ * asecure_loader region the mask ROM opens, so the name is what identifies the
+ * table at either of the two offsets a NAND/eMMC image can put it at.
+ */
+static bool ps3_region_table_names(const uint8_t *p, size_t len)
+{
+    static const char first[] = "asecure_loader";
+    const size_t n = sizeof(first) - 1;
+    size_t i;
+
+    for (i = 0; i + n <= len; i++) {
+        if (!memcmp(p + i, first, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Where the flash region starts inside a NAND/eMMC image.
+ *
+ * Two shapes reach the model.  A device image begins with 256 KiB of CFI
+ * header and flash metadata, so its Flash Region Table sits at 0x40200.  A
+ * chip dump - and a NAND dump taken at flash 0 - begins with the table itself,
+ * at 0x200, and has no preamble at all.  The table says which shape this is,
+ * and the same 16 MiB view is then lined up with the offsets the ROM and the
+ * loaders use, so a dump of either kind boots without the caller having to
+ * declare its shape.
+ */
+static uint64_t ps3_medium_flash_base(BlockBackend *blk, uint64_t len)
+{
+    uint8_t head[0x300];
+
+    if (len >= PS3_EMMC_FLASH_OFF + sizeof(head) &&
+        blk_pread(blk, PS3_EMMC_FLASH_OFF, sizeof(head), head, 0) ==
+        (int)sizeof(head) && ps3_region_table_names(head, sizeof(head))) {
+        return PS3_EMMC_FLASH_OFF;
+    }
+    if (len >= sizeof(head) &&
+        blk_pread(blk, 0, sizeof(head), head, 0) == (int)sizeof(head) &&
+        ps3_region_table_names(head, sizeof(head))) {
+        return 0;
+    }
+    return PS3_EMMC_FLASH_OFF;
+}
+
 static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
 {
     const char *medium = s->boot_medium ?: "flash";
@@ -20344,14 +20583,16 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
     if (!strcmp(medium, "emmc")) {
         blk = s->emmc;
         /*
-         * An eMMC console's logical flash region starts 256 KiB into the
-         * device: the first 0x40000 bytes are the CFI header and the flash
-         * metadata block, and the Flash Region Table sits at 0x40200.  The
-         * mask ROM's view - the container it opens at offset 0, the search over
-         * first 16 MiB - begins at that 0x40000, so that is what the model
-         * copies.
+         * The flash region starts either 256 KiB into a device image (past the
+         * CFI header and metadata block) or at 0 in a NAND/eMMC dump that was
+         * taken from the region itself.  The image's own region table decides;
+         * see ps3_medium_flash_base.
          */
-        base = PS3_EMMC_FLASH_OFF;
+        base = ps3_medium_flash_base(blk, blk_getlength(blk));
+        info_report("ps3-boot-rom: the %s image's flash region starts at "
+                    "0x%" PRIX64 " (%s)", medium, base,
+                    base ? "a device image, past the CFI header and metadata"
+                         : "a chip dump, starting at the region table");
     } else if (!strcmp(medium, "hdd")) {
         blk = s->hdd;
     } else {

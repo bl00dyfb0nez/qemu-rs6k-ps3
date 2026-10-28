@@ -97,11 +97,9 @@ REGIONS = [
     ("crl2",           0xF80000, None,     0x40),
     ("drl2",           0xFA0000, None,     0x40),
     ("ocrl",           0xF69400, None,     0x130),
-    /*
-     * The container the mask boot ROM opens (0xFC0000 on NOR).  The model's
-     * chain check finds it by its own name string, `lv0ldr.2`; the key that
-     * opens it is the ROM's channel-66 readout, not anything in this slot.
-     */
+    # The container the mask boot ROM opens (0xFC0000 on NOR).  The model's
+    # chain check finds it by its own name string, `lv0ldr.2`; the key that
+    # opens it is the ROM's channel-66 readout, not anything in this slot.
     ("bootldr",        0xFC0000, 0x000000, 0x40000),
 ]
 
