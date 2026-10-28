@@ -1256,7 +1256,7 @@ struct PS3BootROMState {
     bool rsx_vsync, rsx_second_vhandler;
     uint32_t rsx_surface_format, rsx_surface_pitch, rsx_surface_offset;
     uint32_t rsx_surface_target, rsx_clear_color, rsx_begin_end;
-    uint64_t rsx_vblanks, rsx_flips, rsx_methods, rsx_draws;
+    uint64_t rsx_vblanks, rsx_vblank_wakes, rsx_flips, rsx_methods, rsx_draws;
     /*
      * The vertex pipeline's state.  The arrays are what SET_VERTEX_DATA_ARRAY
      * OFFSET/FORMAT describe, the index array is the one DRAW_INDEX_ARRAY
@@ -1358,6 +1358,13 @@ struct PS3BootROMState {
     uint32_t rsxaudio_handle;
     uint32_t rsxaudio_shmem;
     bool rsxaudio_running;
+    /*
+     * The event queues the guest registered in its shared page, one per port,
+     * as queue indices (-1 when that port has none).  The guest's audio thread
+     * waits on these for the per-period "block consumed" event, exactly as
+     * RPCS3's rsx_audio_data sends it; without them it waits forever.
+     */
+    int rsxaudio_eq[3];
     QEMUTimer *rsxaudio_timer;
     uint64_t rsxaudio_blocks;
 
@@ -7346,10 +7353,22 @@ static void ps3_sched_switch(PS3BootROMState *s, CPUPPCState *env)
     }
     s->all_parked_reported = false;
 
+    /*
+     * A thread that got a real slice may stall afresh later and should say so
+     * again.  One that only woke, ran a tick or two inside its own blocking
+     * call and blocked again has not moved, so its stall stays reported: a
+     * machine that waits on a service nothing answers otherwise prints the
+     * same paragraph about twenty threads forever, and the line that says what
+     * changed is buried under it.
+     */
+    if (start >= 0 && s->thr[start].used &&
+        s->sched_ticks - s->thr[start].last_run >= 2 * PS3_SCHED_SLICE_TICKS) {
+        s->thr[start].stall_reported = false;
+    }
+
     s->thr_cur = next;
     s->thr_slice = 0;
     s->thr[next].last_run = s->sched_ticks;
-    s->thr[next].stall_reported = false;
     ps3_thread_restore(&s->thr[next], env);
     if (s->ppu_trace) {
         info_report("ps3-ppu: sched: -> thread 0x%X at 0x%" PRIX64
@@ -7518,6 +7537,11 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
                     t->id, s->sched_ticks - t->last_run, t->nip,
                     t->blocked, t->parked, t->wait_eq, t->wait_mutex_id,
                     t->wait_cond_id, t->wait_sem_id, t->wait_ticks);
+        if (i == 0) {
+            info_report("ps3-ppu: sched:   rsx: %" PRIu64 " vblank(s), "
+                        "%" PRIu64 " delivered, %" PRIu64 " flip(s)",
+                        s->rsx_vblanks, s->rsx_vblank_wakes, s->rsx_flips);
+        }
 
         /*
          * A thread queued for a lock names the lock; who holds it is the
@@ -10624,11 +10648,78 @@ static bool ps3_lv2_fs_lib(PS3BootROMState *s, CPUPPCState *env, uint8_t *ram,
 #define PS3_RSXAUDIO_RING_ACTIVE  0x00
 #define PS3_RSXAUDIO_RING_READ    0x08
 #define PS3_RSXAUDIO_RING_WRITE   0x0C
+#define PS3_RSXAUDIO_RING_MAX     0x10
+#define PS3_RSXAUDIO_RING_NOTIFY  0x14
+#define PS3_RSXAUDIO_RING_STEP    0x18
+#define PS3_RSXAUDIO_RING_SILENCE 0x20
 #define PS3_RSXAUDIO_RING_NEXT    0x28
 #define PS3_RSXAUDIO_ENTRY_VALID  0x00
+#define PS3_RSXAUDIO_ENTRY_BLK    0x08
+#define PS3_RSXAUDIO_ENTRY_TIME   0x10
 #define PS3_RSXAUDIO_ENTRY_BUF    0x18
+#define PS3_RSXAUDIO_ENTRY_DMA    0x1C
+
+/*
+ * The page is 0x20000 bytes, not one 4 KiB page: the rings live in `ctrl`, and
+ * `ctrl` is the last 0x4000 bytes of it, after the four DMA regions.  The guest
+ * is handed the page's base and looks for its control block at +0x1C000, so
+ * everything here is relative to that address; see RPCS3's rsxaudio_shmem,
+ * where offsetof(rsxaudio_shmem, ctrl) is 0x1C000 and sizeof is 0x20000.
+ */
+#define PS3_RSXAUDIO_PAGE_SIZE    0x20000u
+#define PS3_RSXAUDIO_CTRL_BASE    0x1C000u
+#define PS3_RSXAUDIO_DMA_BASE     0x30000000u  /* lv2_rsxaudio::dma_io_base */
+#define PS3_RSXAUDIO_DMA_SERIAL   0x00000u
+#define PS3_RSXAUDIO_DMA_SPDIF0   0x10000u
+#define PS3_RSXAUDIO_DMA_SPDIF1   0x14000u
+#define PS3_RSXAUDIO_DMA_SILENCE  0x18000u
+#define PS3_RSXAUDIO_SERIAL_BLK   0x1000u      /* 4 streams of 4 blocks */
+#define PS3_RSXAUDIO_SPDIF_BLK    0x400u
+
+/*
+ * The three queues the guest stores in its control block, one per port, at
+ * `ctrl` + 0x694: ctrl.ringbuf[3] is 0x690 bytes, then a spare word, then
+ * event_queue_1_id.  The next two follow it 0x14 bytes apart.
+ */
+#define PS3_RSXAUDIO_CTRL_EQ      0x694
+#define PS3_RSXAUDIO_CTRL_EQ_STRIDE 0x14
+#define PS3_RSXAUDIO_PORTS        3
+/*
+ * The event a port's queue carries: the port's own name (lv2 uses the port
+ * memory address), the port number, the block index the DMA just finished and
+ * its timestamp.  RPCS3's rsx_audio_data sends exactly this tuple.
+ */
+#define PS3_RSXAUDIO_PORT_NAME(port) (0x8000000000400100ull + \
+                                      (uint64_t)(port) * 0x100ull)
+/* 256 samples at 48 kHz: one period of the hardware's audio clock. */
+#define PS3_RSXAUDIO_PERIOD_NS     5333333
 
 static void ps3_rsxaudio_tick(void *opaque);
+
+/*
+ * Push one period event into a port's queue, the way the hardware's DMA does
+ * when it consumes a block.  A port with no queue is silent; the ring is
+ * drained either way, so audio still plays when the guest never asked.
+ */
+static void ps3_rsxaudio_event(PS3BootROMState *s, unsigned port,
+                               uint64_t blk, uint64_t timestamp)
+{
+    PS3Event ev;
+    int q;
+
+    if (port >= PS3_RSXAUDIO_PORTS || (q = s->rsxaudio_eq[port]) < 0 ||
+        !s->eq[q].used) {
+        return;
+    }
+
+    ev.source = PS3_RSXAUDIO_PORT_NAME(port);
+    ev.data1 = port;
+    ev.data2 = blk;
+    ev.data3 = timestamp;
+    ps3_eq_push(&s->eq[q], &ev);
+    ps3_eq_wake(s, memory_region_get_ram_ptr(s->ram),
+                memory_region_size(s->ram), q);
+}
 
 static void ps3_rsxaudio_kick(PS3BootROMState *s)
 {
@@ -10637,7 +10728,88 @@ static void ps3_rsxaudio_kick(PS3BootROMState *s)
                                          ps3_rsxaudio_tick, s);
     }
     timer_mod(s->rsxaudio_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5000000);
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PS3_RSXAUDIO_PERIOD_NS);
+}
+
+/*
+ * One period of one port, in RPCS3's terms: the entry the guest left at
+ * `read_idx` is the one the DMA pulls next.  Its payload is named by dma_addr,
+ * an address in the io window at 0x30000000 the page backs; a guest that put a
+ * plain EA there instead is read through that, because both spellings reach the
+ * same samples and a block with valid clear is not touched at all.
+ *
+ * `update_status` is where the interesting part of the protocol is: it clears
+ * the entry, advances read_idx modulo rw_max_idx (the ring is not always the
+ * full 16 entries) and bumps queue_notify_idx, and only every step-th block
+ * raises the queue event - the guest counts those, and one event per block
+ * would make its mixer think the DMA had fallen behind.
+ */
+static void ps3_rsxaudio_period(PS3BootROMState *s, uint8_t *ram,
+                                uint64_t ram_size, unsigned port,
+                                uint32_t ctrl)
+{
+    uint32_t r = ctrl + port * PS3_RSXAUDIO_RING_STRIDE;
+    uint32_t max, rd, step, notify;
+    uint32_t entry, valid, dma;
+    uint64_t blk, timestamp;
+    uint8_t *data = NULL;
+    bool raised;
+
+    if (!ps3_be32(ram + r + PS3_RSXAUDIO_RING_ACTIVE)) {
+        return;
+    }
+
+    max = ps3_be32(ram + r + PS3_RSXAUDIO_RING_MAX);
+    if (max < 2 || max > PS3_RSXAUDIO_ENTRIES) {
+        max = PS3_RSXAUDIO_ENTRIES;
+    }
+    rd = ps3_be32(ram + r + PS3_RSXAUDIO_RING_READ);
+    if (rd >= max) {
+        rd = 0;
+    }
+
+    entry = r + PS3_RSXAUDIO_ENTRY_BASE + rd * PS3_RSXAUDIO_ENTRY_STRIDE;
+    valid = ps3_be32(ram + entry + PS3_RSXAUDIO_ENTRY_VALID);
+    if (!(valid & 1)) {
+        return;
+    }
+
+    dma = ps3_be32(ram + entry + PS3_RSXAUDIO_ENTRY_DMA);
+    if (dma >= PS3_RSXAUDIO_DMA_BASE &&
+        (uint64_t)(dma - PS3_RSXAUDIO_DMA_BASE) + PS3_RSXAUDIO_BLOCK_BYTES <=
+        PS3_RSXAUDIO_PAGE_SIZE) {
+        data = ram + s->rsxaudio_shmem + (dma - PS3_RSXAUDIO_DMA_BASE);
+    } else {
+        uint32_t buf = ps3_be32(ram + entry + PS3_RSXAUDIO_ENTRY_BUF);
+
+        if (buf && (uint64_t)buf + PS3_RSXAUDIO_BLOCK_BYTES <= ram_size) {
+            data = ram + buf;
+        }
+    }
+    if (data && port == 0) {
+        ps3_audio_play_f32be(s->audio, data);
+        s->rsxaudio_blocks++;
+    }
+
+    blk = ps3_be64(ram + entry + PS3_RSXAUDIO_ENTRY_BLK);
+    timestamp = ps3_be64(ram + entry + PS3_RSXAUDIO_ENTRY_TIME);
+
+    ps3_put_be32(ram + entry + PS3_RSXAUDIO_ENTRY_VALID, 0);
+    step = ps3_be32(ram + r + PS3_RSXAUDIO_RING_STEP);
+    if (step) {
+        notify = (ps3_be32(ram + r + PS3_RSXAUDIO_RING_NOTIFY) + 1) % step;
+        ps3_put_be32(ram + r + PS3_RSXAUDIO_RING_NOTIFY, notify);
+    } else {
+        notify = 0;
+    }
+    ps3_put_be32(ram + r + PS3_RSXAUDIO_RING_READ, (rd + 1) % max);
+    ps3_put_be64(ram + r + PS3_RSXAUDIO_RING_NEXT, blk + 1);
+
+    /* `(rw_max_idx > 2) ^ queue_notify_idx` is RPCS3's notify predicate. */
+    raised = (((max > 2) ? 1u : 0u) ^ notify) == 0;
+    if (raised) {
+        ps3_rsxaudio_event(s, port, blk, timestamp);
+    }
 }
 
 static void ps3_rsxaudio_tick(void *opaque)
@@ -10645,37 +10817,14 @@ static void ps3_rsxaudio_tick(void *opaque)
     PS3BootROMState *s = opaque;
     uint8_t *ram = memory_region_get_ram_ptr(s->ram);
     uint64_t ram_size = memory_region_size(s->ram);
-    uint32_t ring = s->rsxaudio_shmem;
-    unsigned taken = 0;
+    uint32_t ctrl = s->rsxaudio_shmem + PS3_RSXAUDIO_CTRL_BASE;
+    unsigned port;
 
-    if (s->rsxaudio_running && ring && (uint64_t)ring + 0x1000 <= ram_size &&
-        ps3_be32(ram + ring + PS3_RSXAUDIO_RING_ACTIVE)) {
-        while (taken < 8) {
-            uint32_t rd = ps3_be32(ram + ring + PS3_RSXAUDIO_RING_READ);
-            uint32_t wr = ps3_be32(ram + ring + PS3_RSXAUDIO_RING_WRITE);
-            uint32_t entry, valid, buf;
-
-            if (rd == wr) {
-                break;
-            }
-
-            entry = ring + PS3_RSXAUDIO_ENTRY_BASE +
-                    (rd % PS3_RSXAUDIO_ENTRIES) * PS3_RSXAUDIO_ENTRY_STRIDE;
-            valid = ps3_be32(ram + entry + PS3_RSXAUDIO_ENTRY_VALID);
-            buf = ps3_be32(ram + entry + PS3_RSXAUDIO_ENTRY_BUF);
-
-            if (valid && buf &&
-                (uint64_t)buf + PS3_RSXAUDIO_BLOCK_BYTES <= ram_size) {
-                ps3_audio_play_f32be(s->audio, ram + buf);
-                s->rsxaudio_blocks++;
-            }
-
-            /* The block is consumed whether or not it held audio. */
-            ps3_put_be32(ram + entry + PS3_RSXAUDIO_ENTRY_VALID, 0);
-            ps3_put_be64(ram + ring + PS3_RSXAUDIO_RING_NEXT,
-                         (uint64_t)rd + 1);
-            ps3_put_be32(ram + ring + PS3_RSXAUDIO_RING_READ, rd + 1);
-            taken++;
+    if (s->rsxaudio_running && s->rsxaudio_shmem &&
+        (uint64_t)ctrl + PS3_RSXAUDIO_PORTS * PS3_RSXAUDIO_RING_STRIDE <=
+        ram_size) {
+        for (port = 0; port < PS3_RSXAUDIO_PORTS; port++) {
+            ps3_rsxaudio_period(s, ram, ram_size, port, ctrl);
         }
     }
 
@@ -13263,7 +13412,9 @@ static void ps3_rsx_event(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
     ev.data2 = flags;
     ev.data3 = data3;
     ps3_eq_push(&s->eq[q], &ev);
-    ps3_eq_wake(s, ram, ram_size, q);
+    if (ps3_eq_wake(s, ram, ram_size, q) && (flags & PS3_RSX_EVENT_VBLANK)) {
+        s->rsx_vblank_wakes++;
+    }
 }
 
 /* The display circuit's vblank for one head. */
@@ -16410,10 +16561,14 @@ static void ps3_lv2_service(PS3BootROMState *s)
         s->eq[idx].key = key;
         s->eq[idx].size = a3;
         ps3_put_be32(ram + a0, s->eq[idx].id);
-        if (s->ppu_trace) {
-            info_report("ps3-ppu: lv2: event queue 0x%X created (key 0x%"
-                        PRIX64 ", %u bytes)", s->eq[idx].id, key, a3);
-        }
+        /*
+         * One line per queue, always: the queue a thread later parks on is
+         * only identifiable through this, and a boot creates a few dozen.
+         * The lr names the module that asked for it.
+         */
+        info_report("ps3-ppu: lv2: event queue 0x%X created (key 0x%"
+                    PRIX64 ", %u bytes, lr 0x%" PRIX64 ")",
+                    s->eq[idx].id, key, a3, (uint64_t)cpu->env.lr);
         ret = 0;
         break;
     }
@@ -16573,11 +16728,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
         s->ep[p].eq = q;
-        if (s->ppu_trace) {
-            info_report("ps3-ppu: lv2: event_port_connect_local: port 0x%X "
-                        "-> queue 0x%X (index %d)", s->ep[p].id,
-                        s->eq[q].id, q);
-        }
+        info_report("ps3-ppu: lv2: event_port_connect_local: port 0x%X "
+                    "-> queue 0x%X (index %d, lr 0x%" PRIX64 ")",
+                    s->ep[p].id, s->eq[q].id, q, (uint64_t)cpu->env.lr);
         ret = 0;
         break;
     }
@@ -18718,13 +18871,21 @@ static void ps3_lv2_service(PS3BootROMState *s)
             ret = PS3_LV2_EINVAL;
             break;
         }
-        /* One 64 KiB page, which is the smallest the container hands out. */
-        if (ps3_lv2_alloc(s, ram, ram_size, 0x1000, a0, 0x200) != 0) {
+        /* The whole 128 KiB page, which is what lv2 allocates for the rings. */
+        if (ps3_lv2_alloc(s, ram, ram_size, PS3_RSXAUDIO_PAGE_SIZE, a0, 0x200) != 0) {
             ret = PS3_LV2_ENOMEM;
             break;
         }
         shmem = ps3_be32(ram + a0);
-        memset(ram + shmem, 0, 0x1000);
+        memset(ram + shmem, 0, PS3_RSXAUDIO_PAGE_SIZE);
+        /*
+         * The control block starts zeroed the way RPCS3 leaves it: the word
+         * before the interrupt thread's priority is 0x8000 and the priority
+         * itself is the dead-beef marker the guest's own wrappers look for.
+         */
+        ps3_put_be32(ram + shmem + PS3_RSXAUDIO_CTRL_BASE + 0x6CC, 0x8000);
+        ps3_put_be32(ram + shmem + PS3_RSXAUDIO_CTRL_BASE + 0x6D0,
+                     0xDEADBEEF);
         s->rsxaudio_shmem = shmem;
         s->rsxaudio_handle = 1;
         ps3_put_be32(ram + a0, s->rsxaudio_handle);
@@ -18754,8 +18915,83 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ret = 0;
         break;
     case 0x28D:                 /* sys_rsxaudio_unimport_shared_memory(h) */
-    case 0x28E:                 /* sys_rsxaudio_create_connection(h) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        ret = 0;
+        break;
+    case 0x28E: {               /* sys_rsxaudio_create_connection(h) */
+        /*
+         * The guest has already created one event queue per port and stored
+         * their handles in its shared page; lv2 keeps them from here on and
+         * the DMA path sends each period's event to them.  This used to be a
+         * bare success, which left the guest's audio thread waiting on a queue
+         * nothing ever posted to, and the VSH with it.
+         */
+        unsigned port;
+
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        for (port = 0; port < PS3_RSXAUDIO_PORTS; port++) {
+            uint32_t ctrl = s->rsxaudio_shmem + PS3_RSXAUDIO_CTRL_BASE;
+            uint32_t id = s->rsxaudio_shmem ?
+                ps3_be32(ram + ctrl + PS3_RSXAUDIO_CTRL_EQ +
+                         port * PS3_RSXAUDIO_CTRL_EQ_STRIDE) : 0;
+            int q = id ? ps3_eq_index(s, id) : -1;
+
+            s->rsxaudio_eq[port] = q;
+            info_report("ps3-rsxaudio: port %u queue %s (id 0x%X%s)", port,
+                        q >= 0 ? "connected" : "absent", id,
+                        q >= 0 ? "" : ", the guest stored no handle");
+        }
+        /*
+         * The DMA side of each ring, filled the way RPCS3's create_connection
+         * fills it: the silence block's io address, the ring's own block count
+         * and the io address of every entry's payload.  A guest that reads any
+         * of them back - the mixer does, when it decides whether the DMA is
+         * keeping up - sees the same numbers a console's lv2 would hand it.
+         */
+        if (s->rsxaudio_shmem) {
+            uint32_t ctrl = s->rsxaudio_shmem + PS3_RSXAUDIO_CTRL_BASE;
+            uint32_t dma[PS3_RSXAUDIO_PORTS] = {
+                PS3_RSXAUDIO_DMA_SERIAL, PS3_RSXAUDIO_DMA_SPDIF0,
+                PS3_RSXAUDIO_DMA_SPDIF1,
+            };
+            uint32_t blk[PS3_RSXAUDIO_PORTS] = {
+                PS3_RSXAUDIO_SERIAL_BLK, PS3_RSXAUDIO_SPDIF_BLK,
+                PS3_RSXAUDIO_SPDIF_BLK,
+            };
+            unsigned e;
+
+            for (port = 0; port < PS3_RSXAUDIO_PORTS; port++) {
+                uint32_t r = ctrl + port * PS3_RSXAUDIO_RING_STRIDE;
+
+                ps3_put_be32(ram + r + PS3_RSXAUDIO_RING_SILENCE,
+                             PS3_RSXAUDIO_DMA_BASE + PS3_RSXAUDIO_DMA_SILENCE);
+                ps3_put_be32(ram + r + 0x04, 100);       /* ringbuf.unk2 */
+                for (e = 0; e < PS3_RSXAUDIO_ENTRIES; e++) {
+                    ps3_put_be32(ram + r + PS3_RSXAUDIO_ENTRY_BASE +
+                                 e * PS3_RSXAUDIO_ENTRY_STRIDE +
+                                 PS3_RSXAUDIO_ENTRY_DMA,
+                                 PS3_RSXAUDIO_DMA_BASE + dma[port] +
+                                 blk[port] * e);
+                }
+            }
+        }
+        ret = 0;
+        break;
+    }
     case 0x28F:                 /* sys_rsxaudio_close_connection(h) */
+        if (a0 != s->rsxaudio_handle) {
+            ret = PS3_LV2_ESRCH;
+            break;
+        }
+        memset(s->rsxaudio_eq, 0xFF, sizeof(s->rsxaudio_eq));
+        ret = 0;
+        break;
     case 0x290:                 /* sys_rsxaudio_prepare_process(h) */
         if (a0 != s->rsxaudio_handle) {
             ret = PS3_LV2_ESRCH;
@@ -18769,7 +19005,24 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
         if (!s->rsxaudio_running) {
+            unsigned port;
+
             s->rsxaudio_running = true;
+            /*
+             * The DMA announces itself to every active port before it pulls
+             * anything: source names the port, the rest of the tuple is zero.
+             * RPCS3's sys_rsxaudio_start_process sends the same event.
+             */
+            for (port = 0; port < PS3_RSXAUDIO_PORTS; port++) {
+                uint32_t r = s->rsxaudio_shmem + PS3_RSXAUDIO_CTRL_BASE +
+                             port * PS3_RSXAUDIO_RING_STRIDE;
+
+                if (s->rsxaudio_shmem &&
+                    (uint64_t)r + PS3_RSXAUDIO_RING_STRIDE <= ram_size &&
+                    ps3_be32(ram + r + PS3_RSXAUDIO_RING_ACTIVE)) {
+                    ps3_rsxaudio_event(s, port, 0, 0);
+                }
+            }
             ps3_rsxaudio_kick(s);
         }
         if (!s->lv2_audio_reported) {
@@ -21654,6 +21907,8 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     memset(kbd_s->rsx_zculls, 0, sizeof(kbd_s->rsx_zculls));
     kbd_s->rsx_db_count = 0;
     kbd_s->rsx_vblank_timer = NULL;
+    /* No port has a queue until the guest's create_connection names one. */
+    memset(kbd_s->rsxaudio_eq, 0xFF, sizeof(kbd_s->rsxaudio_eq));
 
     /* No guest thread has been created yet; the first switch registers one. */
     kbd_s->thr_cur = -1;
@@ -22720,6 +22975,7 @@ static bool ps3_lv2_warm_reset(PS3BootROMState *s)
     s->rsxaudio_running = false;
     s->rsxaudio_handle = 0;
     s->rsxaudio_shmem = 0;
+    memset(s->rsxaudio_eq, 0xFF, sizeof(s->rsxaudio_eq));
     s->rsxaudio_blocks = 0;
     s->vsh_why[0] = 0;
 
