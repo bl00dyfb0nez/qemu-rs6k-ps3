@@ -7521,6 +7521,26 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
 {
     unsigned i;
 
+    {
+        uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+        uint64_t ram_size = memory_region_size(s->ram);
+        uint32_t drv = s->rsx_driver;
+
+        if (drv && (uint64_t)drv + PS3_RSX_DI_SIZE <= ram_size) {
+            info_report("ps3-ppu: sched: rsx: %" PRIu64 " vblank(s), "
+                        "%" PRIu64 " delivered, %" PRIu64 " flip(s); "
+                        "drv 0x%X queue 0x%X handlers 0x%X",
+                        s->rsx_vblanks, s->rsx_vblank_wakes, s->rsx_flips,
+                        drv, ps3_be32(ram + drv + PS3_RSX_DI_QUEUE),
+                        ps3_be32(ram + drv + PS3_RSX_DI_HANDLERS));
+        } else {
+            info_report("ps3-ppu: sched: rsx: %" PRIu64 " vblank(s), "
+                        "%" PRIu64 " delivered, %" PRIu64 " flip(s); "
+                        "no driver info", s->rsx_vblanks,
+                        s->rsx_vblank_wakes, s->rsx_flips);
+        }
+    }
+
     for (i = 0; i < PS3_THREAD_MAX; i++) {
         PS3Thread *t = &s->thr[i];
 
@@ -7537,11 +7557,7 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
                     t->id, s->sched_ticks - t->last_run, t->nip,
                     t->blocked, t->parked, t->wait_eq, t->wait_mutex_id,
                     t->wait_cond_id, t->wait_sem_id, t->wait_ticks);
-        if (i == 0) {
-            info_report("ps3-ppu: sched:   rsx: %" PRIu64 " vblank(s), "
-                        "%" PRIu64 " delivered, %" PRIu64 " flip(s)",
-                        s->rsx_vblanks, s->rsx_vblank_wakes, s->rsx_flips);
-        }
+
 
         /*
          * A thread queued for a lock names the lock; who holds it is the
@@ -16349,7 +16365,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
      */
     {
         static uint32_t last_nr, last_lr, last_tid, repeat;
-        static unsigned main_calls;
+        static unsigned main_calls, ctx_calls;
         uint32_t lr32 = (uint32_t)cpu->env.lr;
 
         if (g_getenv("PS3_TRACE_MAIN") && s->thr_cur == 0 &&
@@ -16361,6 +16377,25 @@ static void ps3_lv2_service(PS3BootROMState *s)
                         (uint32_t)cpu->env.gpr[4],
                         (uint32_t)cpu->env.gpr[5],
                         (uint32_t)cpu->env.gpr[6]);
+        }
+        /*
+         * The boot path's first calls all happen long before the graphics
+         * bring-up, so the interesting window is the one that opens when the
+         * RSX context exists: what the main thread does between cellGcmInit
+         * and the first frame is what says why there is no frame.
+         */
+        if (g_getenv("PS3_TRACE_MAIN_CTX") && s->thr_cur == 0 &&
+            s->rsx_context && ctx_calls < 800) {
+            ctx_calls++;
+            info_report("ps3-ppu: ctxmain: call 0x%X from 0x%X nip 0x%"
+                        PRIX64 " (r3 0x%X, r4 0x%X, r5 0x%X, r6 0x%X) "
+                        "sp 0x%X",
+                        nr, lr32, (uint64_t)cpu->env.nip,
+                        (uint32_t)cpu->env.gpr[3],
+                        (uint32_t)cpu->env.gpr[4],
+                        (uint32_t)cpu->env.gpr[5],
+                        (uint32_t)cpu->env.gpr[6],
+                        (uint32_t)cpu->env.gpr[1]);
         }
 
         if (nr == last_nr && lr32 == last_lr && s->thr_cur == last_tid) {
@@ -19429,7 +19464,13 @@ static void ps3_lv2_service(PS3BootROMState *s)
         g_autofree gchar *host = ps3_lv2_path(s, ram, ram_size, a0);
         int host_flags, hfd, gfd;
 
-        if (s->ppu_trace) {
+        /*
+         * The VSH's own resources are the ones a boot that never draws is
+         * usually missing, so they are on record when asked for, and a path
+         * that is not there is always named: the guest only sees ENOENT, and
+         * "resource load failed" says nothing about which file.
+         */
+        if (s->ppu_trace || g_getenv("PS3_TRACE_RES")) {
             char path[160];
 
             if (ps3_lv2_guest_string(ram, ram_size, a0, path, sizeof(path))) {
@@ -19438,17 +19479,15 @@ static void ps3_lv2_service(PS3BootROMState *s)
             }
         }
         if (!host) {
-            /* Name the path: a missing one is what a boot that stops early
-             * is usually waiting on, and the guest only sees ENOENT. */
-            if (s->ppu_trace) {
-                char path[160];
+            static unsigned missed;
+            char path[160];
 
-                if (ps3_lv2_guest_string(ram, ram_size, a0, path,
-                                         sizeof(path))) {
-                    info_report("ps3-ppu: lv2: open(%s): no such path in "
-                                "the model (lr=0x%" PRIX64 ")", path,
-                                (uint64_t)cpu->env.lr);
-                }
+            if (missed < 48 &&
+                ps3_lv2_guest_string(ram, ram_size, a0, path, sizeof(path))) {
+                missed++;
+                info_report("ps3-ppu: lv2: open(%s): no such path in the "
+                            "model (lr=0x%" PRIX64 ")", path,
+                            (uint64_t)cpu->env.lr);
             }
             ret = PS3_LV2_ENOENT;
             break;

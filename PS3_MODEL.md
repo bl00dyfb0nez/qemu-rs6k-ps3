@@ -467,6 +467,17 @@ The model drives QEMU's audio subsystem: the guest's rsxaudio serial ring is
 the stereo mix that would go to HDMI and the AV multi out, and every 256-byte
 block the guest publishes is converted to 48 kHz s16 and played.
 
+The shared page `sys_rsxaudio_initialize` hands out is 0x20000 bytes, the size
+of RPCS3's `rsxaudio_shmem`: four DMA regions first, then the control block at
+offset 0x1C000. `ctrl.ringbuf[3]` starts at that address, `ctrl.event_queue_1_id`
+at `ctrl+0x694` and the other two 0x14 bytes apart, and every ring entry's payload
+is named by `dma_addr`, an io address at 0x30000000 the page backs. A period is
+256 samples: the 5.33 ms timer takes the entry at `read_idx`, plays it, clears
+`valid`, advances `read_idx` modulo `rw_max_idx` and bumps `queue_notify_idx`, and
+only every `queue_notify_step`-th block raises the port's queue event with the
+payload RPCS3 sends - port name as the source, then port, block index and
+timestamp. All of that is relative to the control block, not the page's base.
+
 ```sh
 # the host's default backend (drop -nodefaults: it suppresses the default
 # -audiodev, which is what makes a run come up silent)
