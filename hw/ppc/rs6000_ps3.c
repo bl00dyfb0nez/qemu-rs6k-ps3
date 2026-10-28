@@ -20401,7 +20401,7 @@ static void ps3_hex(const uint8_t *in, size_t n, char *out)
 static bool ps3_medium_tree_is_plaintext(BlockBackend *blk, uint64_t off);
 
 /* Where each medium puts the tree's superblock, in the image's own bytes. */
-#define PS3_EMMC_TREE_OFF    0x10040000u
+#define PS3_EMMC_TREE_OFF    0x10000000u
 #define PS3_HDD_TREE_OFF     0x02000000u
 
 static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
@@ -20517,9 +20517,11 @@ static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
  * was named.
  */
 /*
- * The eMMC console's flash region begins 256 KiB into the device (the CFI
- * header and the metadata block), and its storage area begins past the
- * 256 MiB flash region.  scripts/ps3_emmc_create.py writes this layout.
+ * The eMMC console's flash area begins at offset 0 of the chip: the region
+ * table sits at 0x200, asecure_loader at 0x800 and metldr.2's container at
+ * 0x840, exactly as on NOR.  Its storage area begins past that 256 MiB area,
+ * at 0x10000000.  scripts/ps3_emmc_create.py writes this layout; the 0x40000
+ * below is only the shift a reader's own preamble puts in front of a dump.
  */
 #define PS3_EMMC_FLASH_OFF   0x00040000u
 
@@ -20545,29 +20547,30 @@ static bool ps3_region_table_names(const uint8_t *p, size_t len)
 /*
  * Where the flash region starts inside a NAND/eMMC image.
  *
- * Two shapes reach the model.  A device image begins with 256 KiB of CFI
- * header and flash metadata, so its Flash Region Table sits at 0x40200.  A
- * chip dump - and a NAND dump taken at flash 0 - begins with the table itself,
- * at 0x200, and has no preamble at all.  The table says which shape this is,
- * and the same 16 MiB view is then lined up with the offsets the ROM and the
- * loaders use, so a dump of either kind boots without the caller having to
- * declare its shape.
+ * The eMMC maps its flash from offset 0, so a raw chip dump - the shape
+ * scripts/ps3_emmc_create.py writes - begins with the Flash Region Table at
+ * 0x200, and asecure_loader and metldr.2 then land on the same 0x800 / 0x840
+ * the ROM and the loaders use on NOR.  A dump whose reader kept a 256 KiB
+ * preamble in front of the region has the table at 0x40200 instead.  The
+ * table's position says which shape this is, so either kind boots without the
+ * caller having to declare it.
  */
 static uint64_t ps3_medium_flash_base(BlockBackend *blk, uint64_t len)
 {
     uint8_t head[0x300];
 
     if (len >= PS3_EMMC_FLASH_OFF + sizeof(head) &&
-        blk_pread(blk, PS3_EMMC_FLASH_OFF, sizeof(head), head, 0) ==
-        (int)sizeof(head) && ps3_region_table_names(head, sizeof(head))) {
+        blk_pread(blk, PS3_EMMC_FLASH_OFF, sizeof(head), head, 0) >= 0 &&
+        ps3_region_table_names(head, sizeof(head))) {
         return PS3_EMMC_FLASH_OFF;
     }
     if (len >= sizeof(head) &&
-        blk_pread(blk, 0, sizeof(head), head, 0) == (int)sizeof(head) &&
+        blk_pread(blk, 0, sizeof(head), head, 0) >= 0 &&
         ps3_region_table_names(head, sizeof(head))) {
         return 0;
     }
-    return PS3_EMMC_FLASH_OFF;
+    /* Nothing to read yet: the chip maps its flash from 0. */
+    return 0;
 }
 
 static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
@@ -20583,16 +20586,16 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
     if (!strcmp(medium, "emmc")) {
         blk = s->emmc;
         /*
-         * The flash region starts either 256 KiB into a device image (past the
-         * CFI header and metadata block) or at 0 in a NAND/eMMC dump that was
-         * taken from the region itself.  The image's own region table decides;
-         * see ps3_medium_flash_base.
+         * The flash area starts at 0 - the eMMC's mapping, and the shape
+         * scripts/ps3_emmc_create.py writes - unless a dump kept a 256 KiB
+         * preamble in front of the region.  The image's own region table
+         * decides; see ps3_medium_flash_base.
          */
         base = ps3_medium_flash_base(blk, blk_getlength(blk));
         info_report("ps3-boot-rom: the %s image's flash region starts at "
                     "0x%" PRIX64 " (%s)", medium, base,
-                    base ? "a device image, past the CFI header and metadata"
-                         : "a chip dump, starting at the region table");
+                    base ? "a dump with a preamble in front of the region"
+                         : "the region itself, table at 0x200");
     } else if (!strcmp(medium, "hdd")) {
         blk = s->hdd;
     } else {

@@ -330,9 +330,10 @@ ps3-vsh: .tmp/hdd_fs.img.tree\dev_flash\vsh\module\vsh.self: entry=0x6D5AC8, ...
 ### A NAND/eMMC console: the 12 GB image, flash and storage in one chip
 
 The SuperSlim's 12 GB console has no HDD and no NOR: its firmware lives in an
-eMMC chip that is mapped like NAND (256 MiB flash region at device offset
-0x40000, the storage area past it).  `scripts/ps3_emmc_create.py` writes that
-layout from a NAND dump, and the model boots from it with `boot-medium=emmc`:
+eMMC chip that is mapped like NAND (the 256 MiB flash area starts at device
+offset 0, the storage area straight after it at 0x10000000).
+`scripts/ps3_emmc_create.py` writes that layout from a NAND dump, and the model
+boots from it with `boot-medium=emmc`:
 
 ```sh
 $Q -M rs6000-ps3 -display sdl,gl=on -vga rsx,gl=on \
@@ -351,12 +352,15 @@ All three media stay supported, and each one is a boot target of its own:
 | NAND/eMMC | `boot-medium=emmc` + `emmc-file` | the eMMC's flash region | the eMMC's storage area |
 
 A NAND/eMMC chip keeps the same containers its NOR sibling does, at the front of
-its flash region, and the 12 GB SuperSlim is the eMMC console while the 250 GB and
+its flash area, and the 12 GB SuperSlim is the eMMC console while the 250 GB and
 500 GB 40xx are NOR: both put the asecure_loader region at 0x800 and metldr's
 container at 0x840, the region running to 0x2F000 with a ~0xF920-byte payload and
 the rest zero-filled.  `CECH4201A.NAND.BIN` carries the name `metldr.2` at flash
-0x820 and the header at 0x840, and that is the only copy anywhere in its 256 MiB.  The model resolves it by name there - it is not a fallback - and
-the eMMC's own tree at 0x10040000 carries `dev_flash*`, `dev_hdd0` and the empty
+0x820 and the header at 0x840, and that is the only copy anywhere in its 256 MiB.  The model resolves it by name there - it is not a fallback.
+The eMMC's arena is 256 MiB from offset 0 of the chip, so those are absolute
+offsets in the image as well: the region table sits at 0x200, and only a dump
+that kept a 256 KiB reader preamble in front of the region has it at 0x40200.
+The eMMC's own tree at 0x10000000 carries `dev_flash*`, `dev_hdd0` and the empty
 `dev_hdd1` cache partition.
 
 That container is sealed for the chip's own channel-66 root key.  Given a readout

@@ -6,17 +6,18 @@ that eMMC is mapped exactly like NAND.  Sony's layout, as the flash section of
 the ps3tools notes describes it and as this tool writes it:
 
     absolute offset  contents
-    0x00000..0x3FFFF  CFI header and the flash metadata block (256 KiB)
-    0x40000..         the logical flash region; the Flash Region Table sits at
-                      0x40200, i.e. 0x200 into this region, and the region is
-                      256 MiB (0x10000000) long
+    0x00000..         the NAND-mapped flash area, 256 MiB from offset 0: the
+                      Flash Region Table at 0x200, asecure_loader at 0x800 and
+                      metldr.2's container at 0x840 - the same offsets NOR
+                      flash uses
     0x10000000..      the storage area, which is where the console keeps its
                       dev_flash / dev_flash2 / dev_flash3 / dev_hdd0 / dev_hdd1 files
 
-A dump taken from the console (GameOS or a chip reader that skips the preamble)
-starts at 0x40000, so this tool detects that base on its own: such a dump begins
-with the Flash Region Table at 0x200, whose first word is 1 and whose second is
-a small entry count.
+Nothing sits in front of the flash area: a raw chip dump begins with the very
+bytes the chip answers for offset 0, and they are copied in at 0.  A dump whose
+reader kept a 256 KiB preamble in front of the region has its table at 0x40200
+instead of 0x200; that preamble is dropped, so the region lands at 0x0 and
+metldr.2 stays at 0x840 either way.  Where the table is tells the two apart.
 
 Identification comes first, because the layout it writes depends on what the
 image is:
@@ -66,11 +67,13 @@ import ps3_hdd_tree                       # noqa: E402  (the tree writer)
 MiB = 1024 * 1024
 GiB = 1024 * MiB
 
-# Sony's flash layout for the eMMC consoles.
-PREAMBLE = 0x40000              # CFI header + metadata before the flash region
-FLASH_SIZE = 0x10000000         # the flash region itself: 256 MiB
+# Sony's flash layout for the eMMC consoles.  The NAND-mapped area - region
+# table, asecure_loader and the containers - starts at offset 0 of the chip and
+# is 256 MiB long; the console's storage follows it.
+FLASH_AREA = 0x10000000         # the whole NAND-mapped area: 256 MiB from 0
+PREAMBLE = 0x40000              # a reader's preamble, when it kept one
 FRT_OFF = 0x200                 # Flash Region Table, inside the flash region
-TREE_OFF = PREAMBLE + FLASH_SIZE  # storage area: 256 MiB + 256 KiB
+TREE_OFF = FLASH_AREA           # storage area, straight after the flash area
 BLOCK = 4096
 
 # "12GB" as Sony sells it, decimal, not 12 GiB.
@@ -99,18 +102,21 @@ def sony_size(text):
 
 
 def flash_base(data):
-    """Where the dump starts: the flash region (0x40000) or the device (0)."""
-    if len(data) >= FRT_OFF + 0x10 and be32(data, FRT_OFF) == 1 and \
-            1 <= be32(data, FRT_OFF + 4) <= 64:
-        return 0
-    if len(data) >= 0x10 and be32(data, FRT_OFF - 0x40000) == 1 and \
-            1 <= be32(data, FRT_OFF - 0x40000 + 4) <= 64:
-        return 0x40000
+    """The dump's offset of the flash region's byte 0.
+
+    A raw chip dump starts at the region, so its table is at 0x200 and the
+    region is at 0.  A reader that kept the preamble in front shifts both by
+    0x40000, and the table is then at 0x40200.  The first word of the table is
+    1 and its second is a small entry count.
+    """
+    for base in (0, PREAMBLE):
+        at = base + FRT_OFF
+        if len(data) >= at + 0x10 and be32(data, at) == 1 and \
+                1 <= be32(data, at + 4) <= 64:
+            return base
     if data[:4] in NAND_MAGIC:
         return 0
-    # A console dump that starts at the region: FRT at 0x200.
-    if len(data) >= 0x210 and be32(data, FRT_OFF - 0x40000) == 1:
-        return 0x40000
+    # Nothing recognisable: a console dump that starts at the region.
     return 0
 
 
@@ -236,7 +242,8 @@ def identify(data, model_hint):
 def print_identification(info):
     print("flash type : eMMC (NAND-mapped, 256 MiB flash region)")
     print("dump base  : 0x%X%s" % (info["base"],
-          " (starts at the flash region)" if info["base"] else " (device image)"))
+          " (a preamble in front of the region)" if info["base"]
+          else " (the region itself, table at 0x200)"))
     print("model      : %s" % (info["model"] or "unknown (pass --model)"))
     print("ros0       : %s" % info["ros0"])
     print("ros1       : %s" % info["ros1"])
@@ -349,24 +356,19 @@ def build(args, data, info):
     out = EmmcImage(args.output, total)
     base = info["base"]
 
-    # The 256 KiB preamble: the dump's own if it carries one, otherwise a
-    # CFI-style header block followed by zeros, which is what a blank chip
-    # reads as before the firmware region.
-    if base == PREAMBLE and data[:4] in NAND_MAGIC:
-        out.write_at(0, data[:PREAMBLE])
-        print("preamble    : from the dump (0x%X bytes)" % PREAMBLE)
-    else:
-        head = bytearray(PREAMBLE)
-        head[0:4] = b"\xFA\xCE\x0F\xFF"
-        out.write_at(0, bytes(head))
-        print("preamble    : synthesised CFI header (the dump has none)")
+    # The flash area begins at offset 0 of the chip, so the region goes in at 0.
+    # A dump that kept a preamble in front of it is shifted forward by it, and
+    # dropping that shift is what puts metldr.2 at 0x840 as the chip maps it.
+    if base:
+        print("preamble    : dropping the dump's 0x%X bytes in front of the "
+              "region" % base)
 
-    flash = data[base:base + FLASH_SIZE]
-    if len(flash) < FLASH_SIZE:
-        flash = flash + b"\x00" * (FLASH_SIZE - len(flash))
-    out.write_at(PREAMBLE, flash)
-    print("flash       : 0x%X bytes at 0x%X (FRT at 0x%X)"
-          % (len(flash), PREAMBLE, PREAMBLE + FRT_OFF))
+    flash = data[base:base + FLASH_AREA]
+    if len(flash) < FLASH_AREA:
+        flash = flash + b"\x00" * (FLASH_AREA - len(flash))
+    out.write_at(0, flash)
+    print("flash       : 0x%X bytes at 0x0 (FRT at 0x%X, asecure_loader at "
+          "0x800, metldr.2 at 0x840)" % (len(flash), FRT_OFF))
 
     if args.tree_root:
         if not os.path.isdir(args.tree_root):

@@ -9,9 +9,9 @@ one 4 KiB block per directory or file.
 Two media carry such a tree, and the superblock sits where each one puts it:
 
   HDD / raw disk   32 MiB in (0x02000000), past the disk's 16 MiB flash copy
-  NAND / eMMC      past the 256 MiB flash region, at 0x10040000 - the chip's
-                   own first 256 KiB are the CFI preamble, so the flash region
-                   starts at 0x40000 and the tree after it
+  NAND / eMMC      straight past the 256 MiB NAND-mapped area, at 0x10000000 -
+                   the flash area begins at offset 0 of the chip, so the tree
+                   sits right after it
 
 The layout is otherwise identical.  The tool works out which one an existing
 image is from the magic's position, and a new image is a disk unless --emmc,
@@ -73,10 +73,9 @@ import sys
 
 MAGIC = b"PS3HDFS1"
 SUPER_OFF = 0x02000000            # a disk: past its 16 MiB flash copy
-EMMC_FLASH_OFF = 0x00040000       # the chip's CFI preamble ends here
-EMMC_FLASH_SIZE = 0x10000000      # 256 MiB of flash, as on NAND
+EMMC_FLASH_SIZE = 0x10000000      # the NAND-mapped area, 256 MiB from offset 0
 def emmc_tree_off():
-    return EMMC_FLASH_OFF + EMMC_FLASH_SIZE
+    return EMMC_FLASH_SIZE
 BLOCK = 4096
 NAME_MAX = 48
 ENTRY = 64
