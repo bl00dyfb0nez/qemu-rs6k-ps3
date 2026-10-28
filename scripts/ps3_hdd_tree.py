@@ -11,7 +11,10 @@ Two media carry such a tree, and the superblock sits where each one puts it:
   HDD / raw disk   32 MiB in (0x02000000), past the disk's 16 MiB flash copy
   NAND / eMMC      straight past the 256 MiB NAND-mapped area, at 0x10000000 -
                    the flash area begins at offset 0 of the chip, so the tree
-                   sits right after it
+                   sits right after it.  A tree this tool writes is plaintext;
+                   ps3_emmc_create.py --erk-file is what seals it the way the
+                   console's encdec block does, so list or fill a sealed image
+                   by rebuilding it there rather than writing blocks into it
 
 The layout is otherwise identical.  The tool works out which one an existing
 image is from the magic's position, and a new image is a disk unless --emmc,

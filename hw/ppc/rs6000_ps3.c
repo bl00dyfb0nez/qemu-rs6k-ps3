@@ -20311,12 +20311,37 @@ static bool ps3_hdd_write(PS3BootROMState *s, uint64_t sector, void *buf,
 
     return true;
 }
+/* Where each medium puts the tree's superblock, in the image's own bytes. */
+#define PS3_EMMC_TREE_OFF    0x10000000u
+#define PS3_HDD_TREE_OFF     0x02000000u
+
+/* The first sector the eMMC's encdec block covers: the storage area. */
+#define PS3_EMMC_STORAGE_SECTOR (PS3_EMMC_TREE_OFF / PS3_LV2_SECTOR)
+
 /*
- * The eMMC, sector for sector.  Every access goes through ps3_emmc_crypt with
- * the encdec keys, so the host image stays the ciphertext the console wrote
- * and the guest sees the plaintext flash; a kernel image built for this model
- * can be dropped into the same image the console uses.
+ * The eMMC, sector for sector.  Its flash area is NAND and reads as it stands;
+ * everything past the 256 MiB area is the storage the encdec block seals, so
+ * those sectors go through XTS with the pair PCK1 derives - the same function
+ * and the same shape the HDD's data area uses, one ladder over.  The host
+ * image therefore stays the ciphertext the console wrote and the guest sees
+ * the plaintext tree, which is what scripts/ps3_emmc_create.py writes.
  */
+static void ps3_emmc_crypt_range(PS3BootROMState *s, uint64_t sector,
+                                 uint8_t *buf, size_t sectors, bool encrypt)
+{
+    uint64_t i;
+
+    for (i = 0; i < sectors; i++) {
+        uint64_t at = sector + i;
+
+        if (at < PS3_EMMC_STORAGE_SECTOR) {
+            continue;                   /* NAND: stored as it stands */
+        }
+        ps3_xts_crypt_sector(s->emmc_data_key, s->emmc_tweak_key, at,
+                             buf + i * PS3_LV2_SECTOR, PS3_LV2_SECTOR, encrypt);
+    }
+}
+
 static bool ps3_emmc_read(PS3BootROMState *s, uint64_t sector, void *buf,
                           size_t sectors)
 {
@@ -20330,8 +20355,7 @@ static bool ps3_emmc_read(PS3BootROMState *s, uint64_t sector, void *buf,
     }
 
     if (s->emmc_keyed) {
-        ps3_emmc_crypt(s->emmc_data_key, s->emmc_tweak_key, sector, buf,
-                       sectors * PS3_LV2_SECTOR, false);
+        ps3_emmc_crypt_range(s, sector, buf, sectors, false);
     }
 
     return true;
@@ -20350,8 +20374,7 @@ static bool ps3_emmc_write(PS3BootROMState *s, uint64_t sector, void *buf,
         size_t len = sectors * PS3_LV2_SECTOR;
 
         sealed = g_memdup2(buf, len);
-        ps3_emmc_crypt(s->emmc_data_key, s->emmc_tweak_key, sector, sealed,
-                       len, true);
+        ps3_emmc_crypt_range(s, sector, sealed, sectors, true);
         buf = sealed;
     }
 
@@ -20399,10 +20422,6 @@ static void ps3_hex(const uint8_t *in, size_t n, char *out)
 
 /* Defined with the tree layout below; the storage openers ask it early. */
 static bool ps3_medium_tree_is_plaintext(BlockBackend *blk, uint64_t off);
-
-/* Where each medium puts the tree's superblock, in the image's own bytes. */
-#define PS3_EMMC_TREE_OFF    0x10000000u
-#define PS3_HDD_TREE_OFF     0x02000000u
 
 static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
 {
@@ -20479,30 +20498,30 @@ static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
                    s->emmc_keyed ? "ENCDEC KEYS FROM EID ROOT KEY" : "UNKEYED");
 
     /*
-     * Sector 7 is past any header a real image starts with and inside the
-     * region the loaders occupy, so a decrypt/encrypt round trip there proves
-     * the ladder and the IV before the guest reads the flash.
+     * The tree's first sector is the one place a sealed image and an
+     * unsealed one differ recognisably, so a decrypt/encrypt round trip
+     * there proves the ladder and the tweak before the guest reads it.
      */
     {
         uint8_t raw[PS3_LV2_SECTOR], plain[PS3_LV2_SECTOR], back[PS3_LV2_SECTOR];
 
-        if (blk_pread(s->emmc, 7 * PS3_LV2_SECTOR, sizeof(raw), raw, 0) == 0) {
+        if (blk_pread(s->emmc, PS3_EMMC_TREE_OFF, sizeof(raw), raw, 0) == 0) {
             memcpy(plain, raw, sizeof(plain));
-            if (!ps3_emmc_read(s, 7, plain, 1) ||
-                !ps3_emmc_write(s, 7, plain, 1)) {
-                error_setg(errp, "ps3-boot-rom: eMMC sector 7 does not round "
-                           "trip");
+            if (!ps3_emmc_read(s, PS3_EMMC_STORAGE_SECTOR, plain, 1) ||
+                !ps3_emmc_write(s, PS3_EMMC_STORAGE_SECTOR, plain, 1)) {
+                error_setg(errp, "ps3-boot-rom: the eMMC's storage sector does "
+                           "not round trip");
                 return false;
             }
             memset(back, 0, sizeof(back));
-            if (blk_pread(s->emmc, 7 * PS3_LV2_SECTOR, sizeof(back), back,
+            if (blk_pread(s->emmc, PS3_EMMC_TREE_OFF, sizeof(back), back,
                           0) < 0 || memcmp(raw, back, sizeof(raw))) {
                 error_setg(errp, "ps3-boot-rom: eMMC re-encryption did not "
-                           "reproduce sector 7");
+                           "reproduce the storage sector");
                 return false;
             }
-            info_report("ps3-boot-rom: eMMC sector 7: decrypt and re-encrypt "
-                        "reproduce the image byte for byte");
+            info_report("ps3-boot-rom: eMMC storage sector: decrypt and "
+                        "re-encrypt reproduce the image byte for byte");
         }
     }
 
@@ -20517,11 +20536,13 @@ static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
  * was named.
  */
 /*
- * The eMMC console's flash area begins at offset 0 of the chip: the region
- * table sits at 0x200, asecure_loader at 0x800 and metldr.2's container at
- * 0x840, exactly as on NOR.  Its storage area begins past that 256 MiB area,
- * at 0x10000000.  scripts/ps3_emmc_create.py writes this layout; the 0x40000
- * below is only the shift a reader's own preamble puts in front of a dump.
+ * The eMMC maps its flash from offset 0 of the chip, bootldr first: the region
+ * table then sits at 0x40200, asecure_loader at 0x40800 and metldr.2's
+ * container at 0x40840, the NAND positions docs/flash.txt gives them.  Most
+ * dumps begin where the HV lets the guest see flash - the 0FACE0FF block, with
+ * the table at 0x200 - which is NAND 0x40000, past the masked bootldr block.
+ * The storage area begins past the 256 MiB area, at 0x10000000.
+ * scripts/ps3_emmc_create.py writes this layout.
  */
 #define PS3_EMMC_FLASH_OFF   0x00040000u
 
@@ -20547,13 +20568,13 @@ static bool ps3_region_table_names(const uint8_t *p, size_t len)
 /*
  * Where the flash region starts inside a NAND/eMMC image.
  *
- * The eMMC maps its flash from offset 0, so a raw chip dump - the shape
- * scripts/ps3_emmc_create.py writes - begins with the Flash Region Table at
- * 0x200, and asecure_loader and metldr.2 then land on the same 0x800 / 0x840
- * the ROM and the loaders use on NOR.  A dump whose reader kept a 256 KiB
- * preamble in front of the region has the table at 0x40200 instead.  The
- * table's position says which shape this is, so either kind boots without the
- * caller having to declare it.
+ * A guest-view dump begins with the 0FACE0FF block whose Flash Region Table
+ * sits at 0x200; that block is NAND 0x40000, so the table is at 0x40200 on the
+ * chip and asecure_loader/metldr.2 land at 0x40800/0x40840.  A dump taken from
+ * NAND 0 has the table at 0x40200 right at its start.  Either way the view the
+ * ROM and the loaders run on is the same 16 MiB from the table's block, with
+ * metldr.2 at 0x840 in it, so the table's position says which shape this is and
+ * neither needs the caller to declare it.
  */
 static uint64_t ps3_medium_flash_base(BlockBackend *blk, uint64_t len)
 {
@@ -20586,16 +20607,15 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
     if (!strcmp(medium, "emmc")) {
         blk = s->emmc;
         /*
-         * The flash area starts at 0 - the eMMC's mapping, and the shape
-         * scripts/ps3_emmc_create.py writes - unless a dump kept a 256 KiB
-         * preamble in front of the region.  The image's own region table
-         * decides; see ps3_medium_flash_base.
+         * The flash area starts at 0 (bootldr first), and a guest-view dump
+         * begins 0x40000 further in, where the HV lets firmware see flash.
+         * The image's own region table decides; see ps3_medium_flash_base.
          */
         base = ps3_medium_flash_base(blk, blk_getlength(blk));
         info_report("ps3-boot-rom: the %s image's flash region starts at "
                     "0x%" PRIX64 " (%s)", medium, base,
-                    base ? "a dump with a preamble in front of the region"
-                         : "the region itself, table at 0x200");
+                    base ? "a guest-view dump, bootldr masked"
+                         : "NAND 0, table at 0x40200");
     } else if (!strcmp(medium, "hdd")) {
         blk = s->hdd;
     } else {
@@ -20635,10 +20655,7 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
         return false;
     }
 
-    if (!strcmp(medium, "emmc") && s->emmc_keyed) {
-        ps3_emmc_crypt(s->emmc_data_key, s->emmc_tweak_key, 0, s->flash,
-                       sectors * PS3_LV2_SECTOR, false);
-    } else if (!strcmp(medium, "hdd") && s->hdd_keyed) {
+    if (!strcmp(medium, "hdd") && s->hdd_keyed) {
         /*
          * Sector 0 of a keyed disk is the wrapped key sector, not data, and
          * the chain does not start there; leave it out of the view.
@@ -21099,8 +21116,7 @@ typedef struct PS3HddTreeEnt {
 /*
  * The tree sits past the flash on whichever medium carries it: 32 MiB into a
  * disk image (which keeps a 16 MiB flash copy in its first blocks), and past
- * the 256 MiB flash region on an eMMC, whose own first 256 KiB are the CFI
- * preamble.
+ * the eMMC's 256 MiB NAND-mapped area, which starts at offset 0 of the chip.
  */
 static bool ps3_hdd_tree_block(PS3BootROMState *s, uint64_t block, void *buf)
 {
@@ -21127,8 +21143,8 @@ static bool ps3_hdd_tree_block(PS3BootROMState *s, uint64_t block, void *buf)
 /*
  * Is the medium's stored tree still plaintext?  Both media put the tree's
  * superblock at the same field of their layout (the disk at 32 MiB, the eMMC
- * past its 256 MiB flash region), and the eight bytes there are the one thing
- * a decrypt cannot produce by accident.  Read without any key applied.
+ * past its 256 MiB NAND-mapped area), and the eight bytes there are the one
+ * thing a decrypt cannot produce by accident.  Read without any key applied.
  */
 static bool ps3_medium_tree_is_plaintext(BlockBackend *blk, uint64_t off)
 {
@@ -21643,10 +21659,14 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     if (!ps3_hdd_setup(s, errp)) {
         return;
     }
-    if (!ps3_hdd_tree_setup(s, errp)) {
+    /*
+     * The eMMC opens before the tree is looked for: a tree on the eMMC is only
+     * reachable through s->emmc and s->emmc_size, which that setup fills in.
+     */
+    if (!ps3_emmc_setup(s, errp)) {
         return;
     }
-    if (!ps3_emmc_setup(s, errp)) {
+    if (!ps3_hdd_tree_setup(s, errp)) {
         return;
     }
     if (!ps3_boot_medium_setup(s, errp)) {

@@ -343,6 +343,15 @@ $Q -M rs6000-ps3 -display sdl,gl=on -vga rsx,gl=on \
    -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
 ```
 
+The builder seals the storage area with the console's own ERK when one is named
+(`--erk-file erk48.bin`): PCK1 through the static encdec seeds gives the data
+and tweak keys, and every 512-byte sector past 0x10000000 is XTS-AES-128 with
+its own sector number as the tweak.  That is the same `ps3_xts_crypt_sector`
+the HDD's data area uses - the tool is built from
+`hw/ppc/ps3_aes/{aes,ps3_aes,ps3_encdec}.c`, so an image it writes is one the
+model reads back - and the flash area stays plaintext NAND.  Without an ERK the
+tree is stored as it stands and the model says so and reads it unkeyed.
+
 All three media stay supported, and each one is a boot target of its own:
 
 | medium | argument | chain comes from | file tree comes from |
@@ -351,16 +360,19 @@ All three media stay supported, and each one is a boot target of its own:
 | HDD (raw) | `boot-medium=hdd` + `hdd-file` | the first 16 MiB of the disk | the disk's own `dev_flash*`/`dev_hdd0` |
 | NAND/eMMC | `boot-medium=emmc` + `emmc-file` | the eMMC's flash region | the eMMC's storage area |
 
-A NAND/eMMC chip keeps the same containers its NOR sibling does, at the front of
-its flash area, and the 12 GB SuperSlim is the eMMC console while the 250 GB and
-500 GB 40xx are NOR: both put the asecure_loader region at 0x800 and metldr's
-container at 0x840, the region running to 0x2F000 with a ~0xF920-byte payload and
-the rest zero-filled.  `CECH4201A.NAND.BIN` carries the name `metldr.2` at flash
-0x820 and the header at 0x840, and that is the only copy anywhere in its 256 MiB.  The model resolves it by name there - it is not a fallback.
-The eMMC's arena is 256 MiB from offset 0 of the chip, so those are absolute
-offsets in the image as well: the region table sits at 0x200, and only a dump
-that kept a 256 KiB reader preamble in front of the region has it at 0x40200.
-The eMMC's own tree at 0x10000000 carries `dev_flash*`, `dev_hdd0` and the empty
+A NAND/eMMC chip keeps the same containers its NOR sibling does, and the 12 GB
+SuperSlim is the eMMC console while the 250 GB and 500 GB 40xx are NOR.  NAND
+numbers its flash from 0 with bootldr first, so the region table sits at 0x40200,
+asecure_loader at 0x40800 and metldr's container at 0x40840, the region running
+to 0x6F000 with a ~0xF920-byte payload and the rest zero-filled; the model's
+view starts at the table's block (NAND 0x40000, the part the HV leaves visible),
+so metldr is at 0x840 of that view.  `CECH4201A.NAND.BIN` carries the name
+`metldr.2` at view 0x820 and the header at 0x840, and that is the only copy
+anywhere in its 256 MiB.  The model resolves it by name there - it is not a
+fallback.  The image keeps the chip's own offsets: the dump's first byte goes in
+at 0x40000, so the table lands at 0x40200 and the regions on the positions
+`docs/flash.txt` lists (eEID 0x80800, ros 0xC0000, cvtrm 0xEC0000), and the
+eMMC's tree at 0x10000000 carries `dev_flash*`, `dev_hdd0` and the empty
 `dev_hdd1` cache partition.
 
 That container is sealed for the chip's own channel-66 root key.  Given a readout
@@ -501,7 +513,7 @@ $LD -Ttext=0x02000000 -e _start -o .tmp/sys_audio_test.elf .tmp/sys_audio_test.o
 | `ps3_hdd_create.py --erk-file ... --size 20G -o disk.raw --verify` | raw disk: sector 0 is the ATA key block under PCK1, the rest XTS; `--size` takes `20G`/`512M`/`1MiB` or bytes, up to 1 TB |
 | `ps3_hdd_tree.py` | put `dev_flash`, `dev_flash2`, `dev_flash3`, `dev_hdd0` trees into such an image (and take them out again) |
 | `ps3_ram_dump.py --launch` / `--read ... --disasm` | dump guest RAM from a running machine over QMP, then read or disassemble it in place |
-| `ps3_emmc_create.py [dump] --identify` / `-o emmc_12g.img --tree-root ...` | identify a NAND/eMMC dump (model, firmware, ldr revision, region table), then build the 12 GB image: flash region at 0x40000 and the `dev_flash*`/`dev_hdd0`/`dev_hdd1` tree past 256 MiB |
+| `ps3_emmc_create.py [dump] --identify` / `-o emmc_12g.img --tree-root ...` | identify a NAND/eMMC dump (model, firmware, ldr revision, region table), then build the 12 GB image: the dump at its NAND position 0x40000 (region table 0x40200, metldr.2 0x40840; view 0x840) and the `dev_flash*`/`dev_hdd0`/`dev_hdd1` tree at 0x10000000 |
 
 `scripts/PS3_TOOLS.md` is the index for those four: inputs, outputs, workflows
 and what each one refuses to do.  No key is ever printed, and nothing derived

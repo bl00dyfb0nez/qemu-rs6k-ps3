@@ -74,25 +74,21 @@ bool ps3_ladder_seeds(const uint8_t *img, size_t len, uint8_t seeds[128],
 
 /*
  * The flash keys: the "encdec" half of the same ladder, which is what the
- * console encrypts its eMMC sectors with.  A superslim keeps its firmware on
- * eMMC instead of the NOR, so PCK1 has to yield these as well as the ATA pair.
+ * console encrypts its eMMC storage sectors with.  A superslim keeps its
+ * firmware on eMMC instead of the NOR, so PCK1 has to yield these as well as
+ * the ATA pair.  The eMMC's *flash* area is NAND and stays plaintext; only the
+ * storage area past it is sealed under these keys.
  */
 void ps3_encdec_keys(const uint8_t erk[48], uint8_t data_key[32],
                      uint8_t tweak_key[32]);
 
 /*
- * AES-128-CBC over whole 512-byte eMMC sectors: `sector' is the first one in
- * the buffer and `len' must be a multiple of 512.  Encryption and decryption
- * both go through here, so a sector the model writes reads back.
- */
-void ps3_emmc_crypt(const uint8_t data_key[32], const uint8_t tweak_key[32],
-                    uint64_t sector, uint8_t *buf, size_t len, bool encrypt);
-
-/*
  * XTS-AES over one sector with the ATA keys: 256-bit data and tweak keys,
  * the sizes naehrwert's ps3_decrypt_tools derive and the order the consoles'
  * ATA controllers use.  `sector` is the sector number; `len` must be a
- * multiple of 16 and no larger than a sector (512 bytes).
+ * multiple of 16 and no larger than a sector (512 bytes).  The eMMC's storage
+ * area goes through this same function, with the encdec pair above instead:
+ * one cipher, two ladders, exactly as the console's own encdec block does it.
  */
 void ps3_xts_crypt_sector(const uint8_t data_key[32],
                           const uint8_t tweak_key[32], uint64_t sector,

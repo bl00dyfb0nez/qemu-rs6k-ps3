@@ -301,56 +301,9 @@ void ps3_encdec_keys(const uint8_t erk[48], uint8_t data_key[32],
     ps3_encdec_keys_seeds(erk, ps3_ladder_default, data_key, tweak_key);
 }
 
-/*
- * One eMMC sector: AES-128-CBC over the 512 bytes, keyed with the low half of
- * the encdec data key, and the IV built from the tweak half with the sector
- * number folded into it - so the same plaintext sector lands in different
- * ciphertext at a different address, which is the property the console's
- * flash relies on.
- *
- * The sector-number placement is the model's: the ladder above is the
- * console's (kgen.c), but the exact IV the eMMC controller feeds is not
- * published, so `ps3_emmc_iv' is the single place to change if a dump says
- * otherwise.  Writes go back through the same function, so an image the model
- * wrote always reads back.
- */
-static void ps3_emmc_iv(const uint8_t tweak_key[32], uint64_t sector,
-                        uint8_t iv[16])
-{
-    unsigned i;
-
-    memcpy(iv, tweak_key, 16);
-    for (i = 0; i < 8; i++) {
-        iv[8 + i] ^= (sector >> (8 * i)) & 0xFF;
-    }
-}
-
-void ps3_emmc_crypt(const uint8_t data_key[32], const uint8_t tweak_key[32],
-                    uint64_t sector, uint8_t *buf, size_t len, bool encrypt)
-{
-    aes_context ctxt;
-    uint8_t iv[16], chunk[512];
-    size_t off;
-
-    if (!len || (len & 511)) {
-        return;
-    }
-
-    if ((encrypt ? aes_setkey_enc(&ctxt, data_key, 128)
-                 : aes_setkey_dec(&ctxt, data_key, 128)) != 0) {
-        return;
-    }
-
-    for (off = 0; off < len; off += sizeof(chunk)) {
-        ps3_emmc_iv(tweak_key, sector + off / sizeof(chunk), iv);
-        memcpy(chunk, buf + off, sizeof(chunk));
-        aes_crypt_cbc(&ctxt, encrypt ? AES_ENCRYPT : AES_DECRYPT,
-                      sizeof(chunk), iv, chunk, buf + off);
-    }
-}
-
 /* ---------------------------------------------------------------------- */
-/* XTS-AES over one HDD sector.                                            */
+/* XTS-AES over one sector: the HDD's data area and the eMMC's storage.     */
+/* ---------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------- */
 /* Known answers, so a broken AES-256 or XTS path fails at boot, not later. */
@@ -461,15 +414,15 @@ bool ps3_aes_selftest(char *why, size_t why_len)
         }
         ps3_encdec_keys(erk, data_key, tweak_key);
         memcpy(sector_ct, sector_pt, sizeof(sector_ct));
-        ps3_emmc_crypt(data_key, tweak_key, 9, sector_ct, sizeof(sector_ct),
-                       true);
+        ps3_xts_crypt_sector(data_key, tweak_key, 9, sector_ct,
+                             sizeof(sector_ct), true);
         if (!memcmp(sector_ct, sector_pt, sizeof(sector_ct))) {
             snprintf(why, why_len,
                      "the eMMC path did not encrypt the sector");
             return false;
         }
-        ps3_emmc_crypt(data_key, tweak_key, 9, sector_ct, sizeof(sector_ct),
-                       false);
+        ps3_xts_crypt_sector(data_key, tweak_key, 9, sector_ct,
+                             sizeof(sector_ct), false);
         if (memcmp(sector_ct, sector_pt, sizeof(sector_ct))) {
             snprintf(why, why_len,
                      "the eMMC path does not return the plaintext");
@@ -478,13 +431,13 @@ bool ps3_aes_selftest(char *why, size_t why_len)
 
         /* A different address has to move the ciphertext. */
         memcpy(sector_ct, sector_pt, sizeof(sector_ct));
-        ps3_emmc_crypt(data_key, tweak_key, 10, sector_ct, sizeof(sector_ct),
-                       true);
-        ps3_emmc_crypt(data_key, tweak_key, 9, sector_ct, sizeof(sector_ct),
-                       false);
+        ps3_xts_crypt_sector(data_key, tweak_key, 10, sector_ct,
+                             sizeof(sector_ct), true);
+        ps3_xts_crypt_sector(data_key, tweak_key, 9, sector_ct,
+                             sizeof(sector_ct), false);
         if (!memcmp(sector_ct, sector_pt, sizeof(sector_ct))) {
             snprintf(why, why_len,
-                     "the eMMC sector number is not part of the IV");
+                     "the eMMC sector number is not part of the tweak");
             return false;
         }
     }

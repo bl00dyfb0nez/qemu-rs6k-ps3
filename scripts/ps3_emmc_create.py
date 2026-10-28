@@ -6,18 +6,21 @@ that eMMC is mapped exactly like NAND.  Sony's layout, as the flash section of
 the ps3tools notes describes it and as this tool writes it:
 
     absolute offset  contents
-    0x00000..         the NAND-mapped flash area, 256 MiB from offset 0: the
-                      Flash Region Table at 0x200, asecure_loader at 0x800 and
-                      metldr.2's container at 0x840 - the same offsets NOR
-                      flash uses
+    0x00000..0x3FFFF  bootldr, the block the HV masks from the guest's flash
+    0x40000..         the flash area the region table describes: its 0FACE0FF
+                      DEADBEEF block, the Flash Region Table at 0x40200,
+                      asecure_loader at 0x40800 and metldr.2's container at
+                      0x40840 - the NAND-mapped positions docs/lv1rev.txt and
+                      docs/flash.txt list
     0x10000000..      the storage area, which is where the console keeps its
                       dev_flash / dev_flash2 / dev_flash3 / dev_hdd0 / dev_hdd1 files
 
-Nothing sits in front of the flash area: a raw chip dump begins with the very
-bytes the chip answers for offset 0, and they are copied in at 0.  A dump whose
-reader kept a 256 KiB preamble in front of the region has its table at 0x40200
-instead of 0x200; that preamble is dropped, so the region lands at 0x0 and
-metldr.2 stays at 0x840 either way.  Where the table is tells the two apart.
+The table's own entries are relative to the table, so a reader that starts at
+the table's block (0FACE0FF at its 0x14, the table at 0x200) begins at NAND
+0x40000 - the shape most dumps come in, bootldr masked away.  Its bytes go in at
+0x40000 and every entry then lands on the position the docs give: asecure_loader
+0x40800, eEID 0x80800, ros 0xC0000 with its two banks, cvtrm 0xEC0000.  A dump
+that already starts at NAND 0 (its table at 0x40200) goes in as it stands.
 
 Identification comes first, because the layout it writes depends on what the
 image is:
@@ -40,9 +43,10 @@ Examples
   # what is this dump?
   scripts/ps3_emmc_create.py CECH4201A.NAND.BIN --identify
 
-  # the full 12 GB image, firmware tree included
+  # the full 12 GB image, firmware tree included and sealed with the
+  # console's own EID root key (PCK1), as the encdec block writes it
   scripts/ps3_emmc_create.py CECH4201A.NAND.BIN -o emmc_12g.img \\
-      --tree-root /path/to/rs3
+      --tree-root /path/to/rs3 --erk-file erk48.bin
 
   # a console with no files on it yet: flash only, storage left empty
   scripts/ps3_emmc_create.py CECH4201A.NAND.BIN -o emmc_12g.img
@@ -57,22 +61,30 @@ Then the model boots from it without a flash image or an HDD:
 
 import argparse
 import os
+import shutil
 import struct
+import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 
 import ps3_hdd_tree                       # noqa: E402  (the tree writer)
 
 MiB = 1024 * 1024
 GiB = 1024 * MiB
+SECTOR = 512
 
-# Sony's flash layout for the eMMC consoles.  The NAND-mapped area - region
-# table, asecure_loader and the containers - starts at offset 0 of the chip and
-# is 256 MiB long; the console's storage follows it.
+# The model's own AES/XTS sources, and where the seal tool is built from them.
+ROOT = os.path.dirname(HERE)
+AES_DIR = os.path.join(ROOT, "hw", "ppc", "ps3_aes")
+TOOL_DIR = os.path.join(ROOT, ".tmp", "ps3-encdec")
+
+# Sony's flash layout for the eMMC consoles.  The NAND-mapped area is 256 MiB
+# from offset 0 of the chip, bootldr first; the console's storage follows it.
 FLASH_AREA = 0x10000000         # the whole NAND-mapped area: 256 MiB from 0
-PREAMBLE = 0x40000              # a reader's preamble, when it kept one
-FRT_OFF = 0x200                 # Flash Region Table, inside the flash region
+BOOTLDR_OFF = 0x40000           # where the region table's block sits in it
+FRT_OFF = 0x200                 # Flash Region Table, inside that block
 TREE_OFF = FLASH_AREA           # storage area, straight after the flash area
 BLOCK = 4096
 
@@ -101,33 +113,107 @@ def sony_size(text):
     return int(text, 0)
 
 
-def flash_base(data):
-    """The dump's offset of the flash region's byte 0.
+def encdec_tool():
+    """Build (once) the seal tool from the model's own AES/XTS sources.
 
-    A raw chip dump starts at the region, so its table is at 0x200 and the
-    region is at 0.  A reader that kept the preamble in front shifts both by
-    0x40000, and the table is then at 0x40200.  The first word of the table is
-    1 and its second is a small entry count.
+    hw/ppc/ps3_aes is what qemu-system-ppc64 links, so the image this writes is
+    the image ps3_xts_crypt_sector reads back - including the tweak the model
+    folds the sector number into.  A C compiler is the only thing it needs, and
+    the binary is rebuilt whenever one of those sources changes.
     """
-    for base in (0, PREAMBLE):
-        at = base + FRT_OFF
-        if len(data) >= at + 0x10 and be32(data, at) == 1 and \
-                1 <= be32(data, at + 4) <= 64:
-            return base
-    if data[:4] in NAND_MAGIC:
+    exe = os.path.join(TOOL_DIR, "ps3_encdec" + (".exe" if os.name == "nt"
+                                                 else ""))
+    srcs = [os.path.join(AES_DIR, "ps3_encdec.c"),
+            os.path.join(AES_DIR, "ps3_aes.c"),
+            os.path.join(AES_DIR, "aes.c")]
+    shim = os.path.join(TOOL_DIR, "shim", "qemu", "osdep.h")
+
+    for src in srcs:
+        if not os.path.exists(src):
+            raise SystemExit("missing %s: the storage area is sealed with the "
+                             "model's own XTS" % src)
+
+    if not os.path.exists(shim):
+        os.makedirs(os.path.dirname(shim), exist_ok=True)
+        with open(shim, "w") as f:
+            f.write("/* Stand-in for qemu/osdep.h: ps3_aes.c needs nothing "
+                    "from it. */\n"
+                    "#ifndef QEMU_OSDEP_H\n#define QEMU_OSDEP_H\n"
+                    "#include <stdbool.h>\n#include <stddef.h>\n"
+                    "#include <stdint.h>\n#include <stdio.h>\n"
+                    "#include <stdlib.h>\n#include <string.h>\n#endif\n")
+
+    newest = max(os.path.getmtime(src) for src in srcs)
+    if os.path.exists(exe) and os.path.getmtime(exe) >= newest:
+        return exe
+
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        raise SystemExit("no C compiler (cc/gcc/clang) to build the seal tool "
+                         "from hw/ppc/ps3_aes; drop --erk to leave the storage "
+                         "area as it stands")
+
+    os.makedirs(TOOL_DIR, exist_ok=True)
+    cmd = [cc, "-O2", "-std=gnu11", "-D_FILE_OFFSET_BITS=64",
+           "-I", AES_DIR, "-I", os.path.join(TOOL_DIR, "shim"),
+           "-o", exe] + srcs
+    done = subprocess.run(cmd, capture_output=True, text=True)
+    if done.returncode:
+        raise SystemExit("cannot build the seal tool:\n%s"
+                         % (done.stderr.strip() or done.stdout.strip()))
+    return exe
+
+
+def seal_storage(path, total, erk):
+    """Seal the storage area with the console's ERK, XTS-AES-128 per sector.
+
+    The flash area stays as it stands - it is NAND - and the model only applies
+    the encdec keys past it, so this is the same boundary.  The key goes in over
+    stdin rather than through a file or the command line.
+    """
+    length = ((total - TREE_OFF) // SECTOR) * SECTOR
+    if length <= 0:
+        raise SystemExit("no storage area to seal at 0x%X" % TREE_OFF)
+
+    done = subprocess.run([encdec_tool(), path, hex(TREE_OFF), hex(length), "-"],
+                          input=erk, capture_output=True)
+    if done.returncode:
+        raise SystemExit("cannot seal %s:\n%s"
+                         % (path, done.stderr.decode("utf-8", "replace").strip()))
+    return done.stdout.decode("utf-8", "replace").strip(), length
+
+
+def flash_base(data):
+    """Where the dump's first byte belongs in the chip's own offsets.
+
+    Most dumps begin where the HV lets the guest see flash - the 0FACE0FF block
+    with the region table at 0x200 - and that is NAND 0x40000, past the bootldr
+    block.  A dump taken from NAND 0 has the table at 0x40200 and goes in at 0.
+    The first word of the table is 1 and its second is a small entry count.
+    """
+    if len(data) >= FRT_OFF + 0x10 and be32(data, FRT_OFF) == 1 and \
+            1 <= be32(data, FRT_OFF + 4) <= 64:
+        return BOOTLDR_OFF
+    if len(data) >= BOOTLDR_OFF + FRT_OFF + 0x10 and \
+            be32(data, BOOTLDR_OFF + FRT_OFF) == 1 and \
+            1 <= be32(data, BOOTLDR_OFF + FRT_OFF + 4) <= 64:
         return 0
-    # Nothing recognisable: a console dump that starts at the region.
-    return 0
+    if data[:4] in NAND_MAGIC:
+        return BOOTLDR_OFF
+    # Nothing recognisable: treat it as a guest-view dump.
+    return BOOTLDR_OFF
 
 
 def region_table(data, base):
     """The Flash Region Table: name, offset (absolute in flash), length.
 
     Its entries are 0x30 bytes - u64 offset, u64 length, char name[32] - and
-    the offsets are relative to the table itself, which is why the first entry
-    (asecure_loader) reads 0x600 and lands at 0x800.
+    the offsets are relative to the table itself, so the first entry
+    (asecure_loader) reads 0x600 and lands at NAND 0x40800, the position
+    docs/flash.txt gives it.
     """
-    at = base + FRT_OFF
+    at = FRT_OFF                      # the table inside the dump
+    nand = base + FRT_OFF             # ... and where the chip puts it
     if at + 0x10 > len(data) or be32(data, at) != 1:
         raise SystemExit("no Flash Region Table at 0x%X: not a NAND/eMMC dump"
                          % at)
@@ -140,7 +226,7 @@ def region_table(data, base):
         if e + 0x30 > len(data):
             raise SystemExit("the Flash Region Table runs past the dump")
         name = data[e + 0x10:e + 0x30].split(b"\0")[0].decode("latin-1")
-        out.append((name, at + be64(data, e), be64(data, e + 8)))
+        out.append((name, nand + be64(data, e), be64(data, e + 8)))
     return out
 
 
@@ -191,13 +277,15 @@ def ros_version(region, files):
 
 
 def identify(data, model_hint):
+    """What the dump is: its shape, its regions and its loader bank."""
     base = flash_base(data)
     regs = region_table(data, base)
-    names = {name: (off, size) for name, off, size in regs}
     ros = None
     for name, off, size in regs:
         if name in ("ros", "ros0"):
-            ros = data[off:off + min(size, 0xE00000)]
+            # `off` is a NAND position; the dump starts `base` bytes into NAND.
+            at = off - base
+            ros = data[at:at + min(size, 0xE00000)]
             break
 
     info = {
@@ -241,9 +329,9 @@ def identify(data, model_hint):
 
 def print_identification(info):
     print("flash type : eMMC (NAND-mapped, 256 MiB flash region)")
-    print("dump base  : 0x%X%s" % (info["base"],
-          " (a preamble in front of the region)" if info["base"]
-          else " (the region itself, table at 0x200)"))
+    print("dump base  : NAND 0x%X%s" % (info["base"],
+          " (the guest-view dump, bootldr masked)" if info["base"]
+          else " (from NAND 0, table at 0x40200)"))
     print("model      : %s" % (info["model"] or "unknown (pass --model)"))
     print("ros0       : %s" % info["ros0"])
     print("ros1       : %s" % info["ros1"])
@@ -356,19 +444,16 @@ def build(args, data, info):
     out = EmmcImage(args.output, total)
     base = info["base"]
 
-    # The flash area begins at offset 0 of the chip, so the region goes in at 0.
-    # A dump that kept a preamble in front of it is shifted forward by it, and
-    # dropping that shift is what puts metldr.2 at 0x840 as the chip maps it.
-    if base:
-        print("preamble    : dropping the dump's 0x%X bytes in front of the "
-              "region" % base)
-
-    flash = data[base:base + FLASH_AREA]
-    if len(flash) < FLASH_AREA:
-        flash = flash + b"\x00" * (FLASH_AREA - len(flash))
-    out.write_at(0, flash)
-    print("flash       : 0x%X bytes at 0x0 (FRT at 0x%X, asecure_loader at "
-          "0x800, metldr.2 at 0x840)" % (len(flash), FRT_OFF))
+    # The dump goes in at its NAND-mapped position, so the table's entries land
+    # where the docs list them: asecure_loader 0x40800 and metldr.2 0x40840 for
+    # a guest-view dump, the same minus 0x40000 for one taken from NAND 0.
+    flash = data[:FLASH_AREA - base]
+    if len(flash) < FLASH_AREA - base:
+        flash = flash + b"\x00" * (FLASH_AREA - base - len(flash))
+    out.write_at(base, flash)
+    print("flash       : 0x%X bytes at 0x%X (FRT at 0x%X, asecure_loader at "
+          "0x%X, metldr.2 at 0x%X)"
+          % (len(flash), base, base + FRT_OFF, base + 0x800, base + 0x840))
 
     if args.tree_root:
         if not os.path.isdir(args.tree_root):
@@ -382,8 +467,40 @@ def build(args, data, info):
         print("storage     : empty (no --tree-root)")
 
     out.close()
+
+    if args.erk:
+        line, length = seal_storage(args.output, total, args.erk)
+        print("sealed      : %s - 0x%X bytes from 0x%X with the console's ERK "
+              "(encdec ladder, XTS-AES-128)" % (line, length, TREE_OFF))
+    else:
+        print("sealed      : no --erk-file/--erk; the storage area stays in the "
+              "clear and the model reads it unkeyed")
+
     print("image       : %s, %d bytes (%.2f GB)" %
           (args.output, total, total / 1e9))
+
+
+def read_erk(args):
+    """The 48-byte ERK from --erk-file or --erk, or None when neither is given."""
+    if args.erk_file:
+        try:
+            with open(args.erk_file, "rb") as f:
+                key = f.read(49)
+        except OSError as e:
+            raise SystemExit("cannot read %s: %s"
+                             % (args.erk_file, e.strerror or e))
+    elif args.erk:
+        try:
+            key = bytes.fromhex(args.erk.strip())
+        except ValueError:
+            raise SystemExit("--erk is not hex")
+    else:
+        return None
+
+    if len(key) != 48:
+        raise SystemExit("the ERK is 48 bytes (32 key + 16 IV), not %d"
+                         % len(key))
+    return key
 
 
 def main(argv=None):
@@ -401,9 +518,17 @@ def main(argv=None):
     ap.add_argument("--tree-root",
                     help="a directory holding dev_flash, dev_flash2, "
                          "dev_flash3, dev_hdd0 and dev_hdd1 to store in the image")
+    ap.add_argument("--erk",
+                    help="the console's 48-byte EID root key (PCK1) as 96 hex "
+                         "digits; seals the storage area the way the encdec "
+                         "block writes it")
+    ap.add_argument("--erk-file",
+                    help="the same 48 bytes in a file")
     ap.add_argument("--identify", action="store_true",
                     help="only say what the dump is")
     args = ap.parse_args(argv)
+
+    args.erk = read_erk(args)
 
     if not args.source:
         ap.error("the dump to read is required")
