@@ -73,6 +73,22 @@ bool ps3_ladder_seeds(const uint8_t *img, size_t len, uint8_t seeds[128],
                       size_t *off, char *why, size_t why_len);
 
 /*
+ * The same block found without the published constants: every 0x80-byte
+ * window of four random-looking 32-byte runs is a candidate, and `verify' is
+ * what decides - it derives the keys for a candidate and says whether they
+ * open the console's own storage.  A loader image whose seeds a revision has
+ * changed is therefore still read out of the console's own file, and with
+ * nothing baked into the model.  The window is tried in both of the loaders'
+ * interleaves; `off' is where it was and `tried' how many candidates it took.
+ */
+typedef bool (*ps3_ladder_verify_fn)(const uint8_t seeds[128], void *opaque);
+
+bool ps3_ladder_seeds_scan(const uint8_t *img, size_t len,
+                           ps3_ladder_verify_fn verify, void *opaque,
+                           uint8_t seeds[128], size_t *off,
+                           unsigned *tried, char *why, size_t why_len);
+
+/*
  * The flash keys: the "encdec" half of the same ladder, which is what the
  * console encrypts its eMMC storage sectors with.  A superslim keeps its
  * firmware on eMMC instead of the NOR, so PCK1 has to yield these as well as

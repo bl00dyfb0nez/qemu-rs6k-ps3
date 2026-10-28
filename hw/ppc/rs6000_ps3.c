@@ -20315,8 +20315,126 @@ static bool ps3_hdd_write(PS3BootROMState *s, uint64_t sector, void *buf,
 #define PS3_EMMC_TREE_OFF    0x10000000u
 #define PS3_HDD_TREE_OFF     0x02000000u
 
+/* The eight bytes at the tree's superblock: the one thing a decrypt cannot
+ * produce by accident. */
+#define PS3_HDD_TREE_MAGIC   "PS3HDFS1"
+
 /* The first sector the eMMC's encdec block covers: the storage area. */
 #define PS3_EMMC_STORAGE_SECTOR (PS3_EMMC_TREE_OFF / PS3_LV2_SECTOR)
+
+/* Defined with the tree layout below; the storage openers ask it early. */
+static bool ps3_medium_tree_is_plaintext(BlockBackend *blk, uint64_t off);
+
+/*
+ * A read-only look at a medium's file, for the seed search below: it runs
+ * before the medium itself is opened, and it must not disturb the image.
+ */
+static BlockBackend *ps3_medium_probe_open(const char *path)
+{
+    QDict *opts;
+    Error *err = NULL;
+    BlockBackend *blk;
+
+    if (!path || !g_file_test(path, G_FILE_TEST_EXISTS)) {
+        return NULL;
+    }
+
+    opts = qdict_new();
+    qdict_put_str(opts, "driver", "raw");
+    blk = blk_new_open(path, NULL, opts, 0, &err);   /* read only */
+    if (!blk) {
+        error_free(err);
+        return NULL;
+    }
+
+    return blk;
+}
+
+typedef struct PS3LadderProbe {
+    PS3BootROMState *s;
+    uint8_t hdd_head[16];           /* the stored tree sector's first block */
+    uint8_t emmc_head[16];
+    bool hdd_sealed, emmc_sealed;
+} PS3LadderProbe;
+
+/*
+ * The medium's own proof that a seed window is the loader's block.
+ *
+ * The four seeds exist to derive the ATA and encdec keys, and both media store
+ * their file tree under exactly those keys.  So a window is the block when the
+ * keys it derives turn the stored tree sector back into its superblock: the
+ * console's own image answers the question, and the answer does not depend on
+ * where the window sits or on what the published seeds are.  A medium whose
+ * tree is stored as it stands (a host tool wrote it unkeyed) proves nothing
+ * about the ladder and is skipped.
+ */
+static bool ps3_ladder_seeds_open_storage(const uint8_t seeds[128],
+                                          void *opaque)
+{
+    PS3LadderProbe *p = opaque;
+    uint8_t data_key[32], tweak_key[32], head[16];
+
+    /*
+     * Every medium that can answer has to say yes, not one of them: the disk
+     * proves the ATA pair and the eMMC proves the encdec pair, so with both
+     * given the whole 0x80-byte block is pinned and not just one of its halves.
+     */
+    if (p->hdd_sealed) {
+        memcpy(head, p->hdd_head, sizeof(head));
+        ps3_ata_keys_seeds(p->s->erk, seeds, data_key, tweak_key);
+        ps3_xts_crypt_sector(data_key, tweak_key,
+                             PS3_HDD_TREE_OFF / PS3_LV2_SECTOR,
+                             head, sizeof(head), false);
+        if (memcmp(head, PS3_HDD_TREE_MAGIC, sizeof(PS3_HDD_TREE_MAGIC) - 1)) {
+            return false;
+        }
+    }
+
+    if (p->emmc_sealed) {
+        memcpy(head, p->emmc_head, sizeof(head));
+        ps3_encdec_keys_seeds(p->s->erk, seeds, data_key, tweak_key);
+        ps3_xts_crypt_sector(data_key, tweak_key, PS3_EMMC_STORAGE_SECTOR,
+                             head, sizeof(head), false);
+        if (memcmp(head, PS3_HDD_TREE_MAGIC, sizeof(PS3_HDD_TREE_MAGIC) - 1)) {
+            return false;
+        }
+    }
+
+    return p->hdd_sealed || p->emmc_sealed;
+}
+
+/*
+ * The two media as the search needs them: opened read-only for its duration,
+ * with the one stored block a candidate is decided by already read, so a scan
+ * over a large loader costs a few AES blocks per window and no I/O.
+ */
+static void ps3_ladder_probe_open(PS3LadderProbe *p, PS3BootROMState *s)
+{
+    BlockBackend *blk;
+
+    memset(p, 0, sizeof(*p));
+    p->s = s;
+
+    blk = ps3_medium_probe_open(s->hdd_file);
+    if (blk) {
+        if (!ps3_medium_tree_is_plaintext(blk, PS3_HDD_TREE_OFF) &&
+            blk_pread(blk, PS3_HDD_TREE_OFF, sizeof(p->hdd_head),
+                      p->hdd_head, 0) == 0) {
+            p->hdd_sealed = true;
+        }
+        blk_unref(blk);
+    }
+
+    blk = ps3_medium_probe_open(s->emmc_file);
+    if (blk) {
+        if (!ps3_medium_tree_is_plaintext(blk, PS3_EMMC_TREE_OFF) &&
+            blk_pread(blk, PS3_EMMC_TREE_OFF, sizeof(p->emmc_head),
+                      p->emmc_head, 0) == 0) {
+            p->emmc_sealed = true;
+        }
+        blk_unref(blk);
+    }
+}
 
 /*
  * The eMMC, sector for sector.  Its flash area is NAND and reads as it stands;
@@ -20419,9 +20537,6 @@ static void ps3_hex(const uint8_t *in, size_t n, char *out)
     }
     out[2 * n] = 0;
 }
-
-/* Defined with the tree layout below; the storage openers ask it early. */
-static bool ps3_medium_tree_is_plaintext(BlockBackend *blk, uint64_t off);
 
 static bool ps3_emmc_setup(PS3BootROMState *s, Error **errp)
 {
@@ -20682,7 +20797,10 @@ static bool ps3_boot_medium_setup(PS3BootROMState *s, Error **errp)
  * A NOR console keeps its loader in the flash's ros bank as lv1ldr.self; a NAND
  * or eMMC console keeps the same ladder in the loader its ros bank carries, and
  * the two media put the block at different offsets - which is why the block is
- * looked for by its content and the offset is reported rather than assumed.  A
+ * looked for and the offset is reported rather than assumed.  The published
+ * constants identify it when the image carries them; an image that does not (a
+ * revision that changed the seeds, a loader out of this console) has the block
+ * located by structure instead, and the medium it keys is what confirms it.  A
  * SELF is opened with the key it carries: PCK1 when the console's own copy was
  * given, the loader keyset when the image is one out of a update package.  The
  * ERK that opened it is what the ladders then run on - it is the loader's own
@@ -20711,6 +20829,7 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
         size_t off = 0;
         char key_hex[97], iv_hex[33], why[160];
         const char *opened_by = NULL;
+        const char *found = NULL;
 
         if (!images[i].path) {
             continue;
@@ -20806,10 +20925,43 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
                         "stands", images[i].path);
         }
 
-        if (!ps3_ladder_seeds((const uint8_t *)buf, len, seeds, &off, why,
-                              sizeof(why))) {
-            error_setg(errp, "ps3-boot-rom: %s: %s", images[i].path, why);
-            return false;
+        if (ps3_ladder_seeds((const uint8_t *)buf, len, seeds, &off, why,
+                             sizeof(why))) {
+            found = "found by the published constants";
+        } else {
+            unsigned tried = 0;
+            PS3LadderProbe probe;
+
+            /*
+             * No published block in the image: locate it by structure.  Its
+             * four runs have to read as key material and, what actually
+             * decides it, the keys they derive have to open the console's own
+             * storage - so a revision that changed the seeds is still read
+             * out of the console's loader, with nothing baked in.
+             */
+            if (!s->has_erk) {
+                error_setg(errp, "ps3-boot-rom: %s: %s, and no key was given "
+                           "to test a window with", images[i].path, why);
+                return false;
+            }
+
+            ps3_ladder_probe_open(&probe, s);
+            if (!ps3_ladder_seeds_scan((const uint8_t *)buf, len,
+                                       ps3_ladder_seeds_open_storage, &probe,
+                                       seeds, &off, &tried, why,
+                                       sizeof(why))) {
+                error_setg(errp, "ps3-boot-rom: %s: %s; the block can be "
+                           "located by structure only against a storage image "
+                           "it keys, so give the console's HDD or eMMC",
+                           images[i].path, why);
+                return false;
+            }
+
+            found = "located by structure, by the keys it derives";
+            info_report("ps3-boot-rom: %s: no published seed block; the "
+                        "window at 0x%X was the %uth candidate whose keys "
+                        "open the console's storage",
+                        images[i].medium, (unsigned)off, tried);
         }
 
         if (s->has_ladder_seeds && memcmp(seeds, s->ladder_seeds, 128)) {
@@ -20825,15 +20977,16 @@ static bool ps3_ladder_seeds_setup(PS3BootROMState *s, Error **errp)
         s->ladder_medium[i] = images[i].medium;
         given++;
 
-        info_report("ps3-boot-rom: %s: %s: ladder seed block at 0x%X - the "
-                    "ATA and flash ladders run on the console's own seeds; the "
-                    "ladder's ERK is %s",
-                    images[i].medium, opened_by, (unsigned)off, s->erk_from);
+        info_report("ps3-boot-rom: %s: %s: ladder seed block at 0x%X, %s - "
+                    "the ATA and flash ladders run on the console's own seeds; "
+                    "the ladder's ERK is %s",
+                    images[i].medium, opened_by, (unsigned)off, found,
+                    s->erk_from);
     }
 
     if (given > 1) {
         info_report("ps3-boot-rom: the NOR and NAND loaders carry the same "
-                    "four seeds (0x%X and 0x%X); the model's own table agrees",
+                    "four seeds (at 0x%X and 0x%X)",
                     s->ladder_off[0], s->ladder_off[1]);
     }
 
@@ -21098,8 +21251,7 @@ static bool ps3_hdd_setup(PS3BootROMState *s, Error **errp)
  * from: it is unpacked once into `<image>.tree` and the dev_flash roots point
  * there, so the SELF files the VSH loads are the ones stored on the disk.
  */
-#define PS3_HDD_TREE_MAGIC   "PS3HDFS1"
-/* PS3_HDD_TREE_OFF lives beside the storage openers, which ask it early. */
+/* PS3_HDD_TREE_OFF and the magic live beside the storage openers. */
 #define PS3_HDD_TREE_BLOCK   4096u
 #define PS3_HDD_TREE_NAME    48
 #define PS3_HDD_TREE_ENTRY   64

@@ -88,6 +88,14 @@ FRT_OFF = 0x200                 # Flash Region Table, inside that block
 TREE_OFF = FLASH_AREA           # storage area, straight after the flash area
 BLOCK = 4096
 
+# Past the last byte the dump covers, flash reads as erased - 0xFF - and the
+# chip returns that from every block it has not written.  The builder writes
+# the padding out to the end of the NAND-mapped area instead of leaving the tail
+# of the file a sparse hole, so an image is the same bytes whether it is read
+# straight, copied without sparse support, or compared against the dump.
+PAD_FROM = 0x0F000000           # where the erased tail of the area is reported
+ERASED = 0xFF
+
 # "12GB" as Sony sells it, decimal, not 12 GiB.
 SONY_12GB = 12 * 1000 ** 3
 
@@ -143,9 +151,7 @@ def encdec_tool():
                     "#include <stdint.h>\n#include <stdio.h>\n"
                     "#include <stdlib.h>\n#include <string.h>\n#endif\n")
 
-    newest = max(os.path.getmtime(src) for src in srcs)
-    if os.path.exists(exe) and os.path.getmtime(exe) >= newest:
-        return exe
+    os.makedirs(TOOL_DIR, exist_ok=True)
 
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if not cc:
@@ -153,14 +159,32 @@ def encdec_tool():
                          "from hw/ppc/ps3_aes; drop --erk to leave the storage "
                          "area as it stands")
 
-    os.makedirs(TOOL_DIR, exist_ok=True)
+    # 64-bit offsets: the storage area starts past 2 GiB, so a 32-bit off_t
+    # would seek into the wrong place on a 12 GB image.  The tool also seeks
+    # through the platform's 64-bit call and checks where it landed, so this
+    # define is belt and braces - and it is part of the stamp below, so a tool
+    # built with a different line is rebuilt rather than reused.
     cmd = [cc, "-O2", "-std=gnu11", "-D_FILE_OFFSET_BITS=64",
            "-I", AES_DIR, "-I", os.path.join(TOOL_DIR, "shim"),
            "-o", exe] + srcs
+    line = subprocess.list2cmdline(cmd)
+    stamp = os.path.join(TOOL_DIR, "ps3_encdec.build")
+    newest = max(os.path.getmtime(src) for src in srcs)
+
+    if os.path.exists(exe) and os.path.getmtime(exe) >= newest and \
+            os.path.exists(stamp):
+        with open(stamp, "r", encoding="utf-8") as f:
+            if f.read().strip() == line:
+                return exe
+
+    print("seal tool  : %s" % line)
     done = subprocess.run(cmd, capture_output=True, text=True)
     if done.returncode:
-        raise SystemExit("cannot build the seal tool:\n%s"
-                         % (done.stderr.strip() or done.stdout.strip()))
+        raise SystemExit("cannot build the seal tool:\n  %s\n%s"
+                         % (line, done.stderr.strip() or done.stdout.strip()))
+
+    with open(stamp, "w", encoding="utf-8") as f:
+        f.write(line + "\n")
     return exe
 
 
@@ -358,6 +382,15 @@ class EmmcImage:
         self.f.seek(off)
         self.f.write(blob)
 
+    def write_pad(self, off, end, byte):
+        """Write one byte across a range, so the padding is in the file."""
+        chunk = bytes([byte]) * MiB
+        self.f.seek(off)
+        while off < end:
+            n = min(len(chunk), end - off)
+            self.f.write(chunk[:n])
+            off += n
+
     def close(self):
         self.f.close()
 
@@ -448,12 +481,27 @@ def build(args, data, info):
     # where the docs list them: asecure_loader 0x40800 and metldr.2 0x40840 for
     # a guest-view dump, the same minus 0x40000 for one taken from NAND 0.
     flash = data[:FLASH_AREA - base]
-    if len(flash) < FLASH_AREA - base:
-        flash = flash + b"\x00" * (FLASH_AREA - base - len(flash))
+    if base + len(data) > FLASH_AREA:
+        print("warning     : the dump runs 0x%X bytes past the NAND-mapped "
+              "area; that tail is not stored"
+              % (base + len(data) - FLASH_AREA))
     out.write_at(base, flash)
-    print("flash       : 0x%X bytes at 0x%X (FRT at 0x%X, asecure_loader at "
+    print("flash       : 0x%X byte(s) at 0x%X (FRT at 0x%X, asecure_loader at "
           "0x%X, metldr.2 at 0x%X)"
           % (len(flash), base, base + FRT_OFF, base + 0x800, base + 0x840))
+
+    # Erased flash reads as 0xFF, and a dump stops where its data does, so the
+    # rest of the NAND-mapped area is written out the way the chip returns it.
+    # The storage area then begins exactly at FLASH_AREA, whatever the dump's
+    # length was.
+    flash_end = base + len(flash)
+    if flash_end < FLASH_AREA:
+        out.write_pad(flash_end, FLASH_AREA, ERASED)
+        print("pad         : 0x%X..0x%X, 0x%02X (erased flash)"
+              % (flash_end, FLASH_AREA, ERASED))
+        if flash_end < PAD_FROM:
+            print("              0x%X..0x%X is the area's erased tail"
+                  % (PAD_FROM, FLASH_AREA))
 
     if args.tree_root:
         if not os.path.isdir(args.tree_root):

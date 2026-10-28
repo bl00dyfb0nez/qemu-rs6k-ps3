@@ -275,6 +275,116 @@ bool ps3_ladder_seeds(const uint8_t *img, size_t len, uint8_t seeds[128],
     return false;
 }
 
+/*
+ * Is a 32-byte run plausible key material?  The ladder's seeds are random
+ * bytes, so a block that uses only a handful of values, or that repeats one
+ * over and over, is code or padding rather than a seed.  This is a sieve, not
+ * a decision: what decides a window is whether the keys it derives open the
+ * console's own storage (see ps3_ladder_seeds_scan).
+ */
+static bool ps3_ladder_block_is_key_material(const uint8_t *b)
+{
+    uint8_t seen[256] = { 0 };
+    unsigned distinct = 0;
+
+    for (unsigned i = 0; i < 32; i++) {
+        if (!seen[b[i]]++) {
+            distinct++;
+        }
+    }
+
+    return distinct >= 24;
+}
+
+/*
+ * One window, read in the canonical order or in the loaders' other interleave
+ * (the same two pairs, the other way round), which is what `swap' selects.
+ */
+static void ps3_ladder_window(const uint8_t *img, size_t off, bool swap,
+                              uint8_t seeds[128])
+{
+    memcpy(seeds + 0x00, img + off + (swap ? 0x20 : 0x00), 32);
+    memcpy(seeds + 0x20, img + off + (swap ? 0x00 : 0x20), 32);
+    memcpy(seeds + 0x40, img + off + (swap ? 0x60 : 0x40), 32);
+    memcpy(seeds + 0x60, img + off + (swap ? 0x40 : 0x60), 32);
+}
+
+bool ps3_ladder_seeds_scan(const uint8_t *img, size_t len,
+                           ps3_ladder_verify_fn verify, void *opaque,
+                           uint8_t seeds[128], size_t *off,
+                           unsigned *tried, char *why, size_t why_len)
+{
+    unsigned windows = 0;
+    bool ok[4];
+    unsigned l;
+    size_t o;
+
+    if (tried) {
+        *tried = 0;
+    }
+
+    if (len < 128) {
+        snprintf(why, why_len, "the image is shorter than one seed block");
+        return false;
+    }
+
+    /*
+     * Every 32-byte-aligned window of four random-looking blocks is a
+     * candidate.  Nothing here knows where a loader puts its block or what
+     * its seeds are: the caller's verifier is what says yes, and it says yes
+     * only when the keys the window derives open the console's own storage.
+     */
+    for (l = 0; l < 4; l++) {
+        ok[l] = ps3_ladder_block_is_key_material(img + l * 0x20);
+    }
+
+    for (o = 0; o + 128 <= len; o += 0x20) {
+        uint8_t cand[128];
+
+        /*
+         * The sieve slides with the window: one new 32-byte run is judged per
+         * step, the other three keep their verdict, so a large image costs one
+         * pass over its bytes and not four.
+         */
+        if (o) {
+            ok[0] = ok[1];
+            ok[1] = ok[2];
+            ok[2] = ok[3];
+            ok[3] = ps3_ladder_block_is_key_material(img + o + 0x60);
+        }
+
+        if (!ok[0] || !ok[1] || !ok[2] || !ok[3]) {
+            continue;
+        }
+
+        windows++;
+
+        for (l = 0; l < 2; l++) {
+            ps3_ladder_window(img, o, l == 1, cand);
+
+            if (verify(cand, opaque)) {
+                memcpy(seeds, cand, sizeof(cand));
+                if (off) {
+                    *off = o;
+                }
+                if (tried) {
+                    *tried = windows;
+                }
+                return true;
+            }
+        }
+    }
+
+    if (tried) {
+        *tried = windows;
+    }
+
+    snprintf(why, why_len, "no window in the image derives keys that open "
+             "the console's own storage (%u candidate%s tried)",
+             windows, windows == 1 ? "" : "s");
+    return false;
+}
+
 void ps3_ata_keys_seeds(const uint8_t erk[48], const uint8_t seeds[128],
                         uint8_t data_key[32], uint8_t tweak_key[32])
 {
@@ -307,6 +417,12 @@ void ps3_encdec_keys(const uint8_t erk[48], uint8_t data_key[32],
 
 /* ---------------------------------------------------------------------- */
 /* Known answers, so a broken AES-256 or XTS path fails at boot, not later. */
+
+/* The scan's selftest verifier: accepts exactly the block it was given. */
+static bool ps3_ladder_selftest_accept(const uint8_t seeds[128], void *opaque)
+{
+    return !memcmp(seeds, opaque, 128);
+}
 
 bool ps3_aes_selftest(char *why, size_t why_len)
 {
@@ -401,6 +517,59 @@ bool ps3_aes_selftest(char *why, size_t why_len)
         if (ps3_ladder_seeds(image, sizeof(image), seeds, &off, sub,
                              sizeof(sub))) {
             snprintf(why, why_len, "a corrupted seed block was accepted");
+            return false;
+        }
+    }
+
+    /*
+     * The structural locator: an image whose block is not the published one
+     * has to be found by shape and confirmed by the caller, at the right
+     * offset, in either interleave - and a block nothing confirms is refused.
+     */
+    {
+        uint8_t image[768], block[128], seeds[128], other[128];
+        size_t off = 0;
+        unsigned tried = 0;
+        char sub[160];
+
+        for (i = 0; i < sizeof(block); i++) {
+            block[i] = (uint8_t)(i * 37 + 11);
+        }
+        memset(image, 0x5A, sizeof(image));
+        memcpy(image + 0x120, block, sizeof(block));
+
+        if (!ps3_ladder_seeds_scan(image, sizeof(image),
+                                   ps3_ladder_selftest_accept, block, seeds,
+                                   &off, &tried, sub, sizeof(sub)) ||
+            off != 0x120 || memcmp(seeds, block, sizeof(block))) {
+            snprintf(why, why_len, "a block that is not a published constant "
+                     "was not found by structure");
+            return false;
+        }
+
+        /* The loaders' other interleave: pairs 2/3 first, found canonical. */
+        memcpy(other + 0x00, block + 0x20, 32);
+        memcpy(other + 0x20, block + 0x00, 32);
+        memcpy(other + 0x40, block + 0x60, 32);
+        memcpy(other + 0x60, block + 0x40, 32);
+        memset(image, 0x5A, sizeof(image));
+        memcpy(image + 0x240, other, sizeof(other));
+
+        if (!ps3_ladder_seeds_scan(image, sizeof(image),
+                                   ps3_ladder_selftest_accept, block, seeds,
+                                   &off, &tried, sub, sizeof(sub)) ||
+            off != 0x240 || memcmp(seeds, block, sizeof(block))) {
+            snprintf(why, why_len, "the swapped interleave was not read back "
+                     "in the canonical order");
+            return false;
+        }
+
+        memset(other, 0x00, sizeof(other));
+        if (ps3_ladder_seeds_scan(image, sizeof(image),
+                                  ps3_ladder_selftest_accept, other, seeds,
+                                  &off, &tried, sub, sizeof(sub))) {
+            snprintf(why, why_len, "the scan accepted a window nothing "
+                     "confirmed");
             return false;
         }
     }

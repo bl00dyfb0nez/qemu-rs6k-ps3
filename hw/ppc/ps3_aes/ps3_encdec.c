@@ -31,6 +31,34 @@
 #define SECTOR 512u
 #define CHUNK  (1024u * 1024u)          /* 2048 sectors per pass */
 
+/*
+ * Seek to a byte offset that can pass 2 GiB - the storage area does on every
+ * 12 GB image.
+ *
+ * `off_t' is 32 bits unless the build asks for more, so the caller's cast to
+ * it can wrap before fseeko() ever sees the number, and a seal then rewrites
+ * the wrong megabyte instead of failing.  The build passes
+ * -D_FILE_OFFSET_BITS=64 and this seeks through the platform's 64-bit entry
+ * point where it has one; either way the position is read back and compared,
+ * so a truncated offset stops the run rather than corrupting an image.
+ */
+static int seek_to(FILE *f, uint64_t off)
+{
+#ifdef _WIN32
+    if (_fseeki64(f, (__int64)off, SEEK_SET) != 0) {
+        return -1;
+    }
+    return _ftelli64(f) == (__int64)off ? 0 : -1;
+#else
+    off_t want = (off_t)off;
+
+    if ((uint64_t)want != off || fseeko(f, want, SEEK_SET) != 0) {
+        return -1;
+    }
+    return (uint64_t)ftello(f) == off ? 0 : -1;
+#endif
+}
+
 static int read_key(const char *path, uint8_t erk[48])
 {
     FILE *f = !strcmp(path, "-") ? stdin : fopen(path, "rb");
@@ -115,8 +143,7 @@ int main(int argc, char **argv)
         size_t n = (len - done) < CHUNK ? (size_t)(len - done) : CHUNK;
         size_t i;
 
-        if (fseeko(f, (off_t)(off + done), SEEK_SET) != 0 ||
-            fread(buf, 1, n, f) != n) {
+        if (seek_to(f, off + done) != 0 || fread(buf, 1, n, f) != n) {
             fprintf(stderr, "ps3_encdec: cannot read 0x%llx bytes at 0x%llx\n",
                     (unsigned long long)n, (unsigned long long)(off + done));
             free(buf);
@@ -130,8 +157,7 @@ int main(int argc, char **argv)
                                  encrypt);
         }
 
-        if (fseeko(f, (off_t)(off + done), SEEK_SET) != 0 ||
-            fwrite(buf, 1, n, f) != n) {
+        if (seek_to(f, off + done) != 0 || fwrite(buf, 1, n, f) != n) {
             fprintf(stderr, "ps3_encdec: cannot write 0x%llx bytes at 0x%llx\n",
                     (unsigned long long)n, (unsigned long long)(off + done));
             free(buf);

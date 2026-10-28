@@ -100,17 +100,29 @@ PCK1, and the next stage's SELF carries the EID root key - but never ch66
 itself, which belongs to the ROM.
 
 The loader's seed block sits at a different offset on each medium, and it is
-found by its content rather than assumed (the four seeds are published
-constants, so a match identifies the block):
+never assumed: the model looks for the published constants first, and when an
+image does not carry them (a revision that changed the seeds, a loader out of
+this console) it locates the block **by structure** instead.  Every 0x20-aligned
+window of four 32-byte runs that read as key material is a candidate, both of
+the loaders' interleaves are tried, and what accepts one is the console's own
+storage: the keys the window derives have to turn the stored tree sector back
+into its `PS3HDFS1` superblock, through the ATA ladder for an HDD and the encdec
+ladder for an eMMC.  Nothing about the block's position or its values is baked
+in.  Every medium that can answer has to say yes, so with both media given the
+whole block is pinned; with one, the pair that medium uses is what is proved and
+the window is reported where the proof found it.
+
+The offsets each medium has been seen to use (reported, never required):
 
 | Medium | Where | Offset seen |
 | --- | --- | --- |
 | NOR | `lv1ldr.self` in the ros bank | 0x1BB20 in the 4.93 image (0x1B5A0 in its ELF carve; the ATA seed is cited at 0x1D1E0 for some 4.xx revisions) |
 | NAND/eMMC | the loader the ros1 standby bank (0xC0000, records at 0x40480 / 0x100490, `lv0` extent 0x1E948) carries | 0x2E0A0 in a decrypted stage carve |
 
-A revision that moves it is reported at its own offset, and when both media's
-loaders are given they must carry the same four seeds - that is a cross-check
-on the reading, not a requirement of the format.
+A revision that moves it is reported at its own offset (and the structural
+search says how many candidates it had to try), and when both media's loaders
+are given they must carry the same four seeds - that is a cross-check on the
+reading, not a requirement of the format.
 
 The model follows the same order: `readout` / `readout-file` supplies the 32
 channel-66 bytes exactly as the ROM reads them (K_lo, then K_hi) and is what
@@ -262,10 +274,24 @@ $Q -M rs6000-ps3 -display sdl \
 ```
 
 ```
-ps3-boot-rom: NOR lv1ldr: PCK1: ladder seed block at 0x1BB20 - the ATA and flash
-              ladders run on the console's own seeds; the ladder's ERK is the
-              key given for it (PCK1)
+ps3-boot-rom: NOR lv1ldr: PCK1: ladder seed block at 0x1BB20, found by the
+              published constants - the ATA and flash ladders run on the
+              console's own seeds; the ladder's ERK is the key given for it (PCK1)
 ```
+
+An image whose block is not the published one is read just the same, located by
+structure and confirmed against the storage it keys:
+
+```
+ps3-boot-rom: NOR lv1ldr: no published seed block; the window at 0x26000 was the
+              1410th candidate whose keys open the console's storage
+ps3-boot-rom: NOR lv1ldr: ...: ladder seed block at 0x26000, located by
+              structure, by the keys it derives - ...
+```
+
+The search needs a storage image it can prove the window against; with none,
+the line says so (`the block can be located by structure only against a storage
+image it keys`) instead of accepting a guess.
 
 A retail loader out of an update package carries the published keyset instead
 of a per-console key, and the line says so (`the ladder's ERK is the loader's
@@ -463,7 +489,7 @@ audiodev feed `sys_mic`'s rings.
 | `rom-file` / `drive` | - | set by `-bios` and `-drive if=pflash,...` |
 | `erk-file`, `pck1-file`, `readout-file` | - | the console's 48-byte ERK + RIV (the name `pck1` gives the same value), or the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi.  Optional: without it the ERK is the one the loader in `lv1ldr`/`nand-loader` carries |
 | `pck1`, `erk` | - | the same 48 bytes as hex (96 digits); `pck1` is the console's name for it |
-| `lv1ldr`, `nand-loader` | - | the console's loader image the ERK and the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  The key that opens it *is* the ladder's ERK, so a loader alone keys the storage ladder; the published loader keyset is accepted for a retail image and says so, and both images are read and must agree |
+| `lv1ldr`, `nand-loader` | - | the console's loader image the ERK and the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  The key that opens it *is* the ladder's ERK, so a loader alone keys the storage ladder; the published loader keyset is accepted for a retail image and says so, and both images are read and must agree.  The seed block is the published one when the image carries it, and otherwise located by structure and proved against the `hdd-file`/`emmc-file` it keys |
 | `pck2`, `pck2-file` | - | the console's eid_root_key (the ERK+RIV, 48 bytes; the property names are the old ones and are kept for scripts).  Only a `.2` loader needs it: that image carries its ERK wrapped, and eid_root_key is what unwraps it - the ERK the unwrap yields is then the ladder's key |
 | `container` | `lv0ldr.2` | container to look for in the flash image |
 | `hdd-file`, `emmc-file` | - | the drive, or the eMMC, the firmware trees and the application are mounted from |
@@ -488,7 +514,8 @@ window's pixels can be inspected without a display.
 | device selftest + mask ROM replay | any run with `-bios` | `selftest passed (AES-128 KAT, sealed container round trip, mask ROM replayed by the SPU interpreter)` |
 | container opener | `-drive if=pflash,...` with the readout | `container verified, 191152 bytes of payload` |
 | a `.2` loader, whose ERK is wrapped | `-global ps3-boot-rom.lv1ldr=lv1ldr.2.self -global ps3-boot-rom.pck2=<96 hex>` | `the value at 0x... unwraps under eid_root_key into the key this loader was sealed with`, then `NOR lv1ldr: eid_root_key: ladder seed block at 0x...` with `the ladder's ERK is the ERK the loader carries, unwrapped under eid_root_key`.  A wrong eid_root_key finds no window, and a `.2` loader with no eid_root_key given stops and says so |
-| ladder seeds and ERK from the console's own loader | `-global ps3-boot-rom.lv1ldr=lv1ldr.self` - no key on the command line | `NOR lv1ldr: ...: ladder seed block at 0x1BB20 - the ATA and flash ladders run on the console's own seeds; the ladder's ERK is <where it came from>`, and `the NOR and NAND loaders carry the same four seeds` when both are given.  A loader with no block (or a mismatched pair) stops the run with the reason.  `pck1=`/`erk-file=` still override the ERK, and a retail image cannot carry a per-console key, so a given ERK is kept and that is reported |
+| ladder seeds and ERK from the console's own loader | `-global ps3-boot-rom.lv1ldr=lv1ldr.self` - no key on the command line | `NOR lv1ldr: ...: ladder seed block at 0x1BB20, found by the published constants - the ATA and flash ladders run on the console's own seeds; the ladder's ERK is <where it came from>`, and `the NOR and NAND loaders carry the same four seeds` when both are given.  A loader with no block (or a mismatched pair) stops the run with the reason.  `pck1=`/`erk-file=` still override the ERK, and a retail image cannot carry a per-console key, so a given ERK is kept and that is reported |
+| a loader whose seeds are not the published ones | `lv1ldr` plus the `hdd-file`/`emmc-file` those seeds key | `no published seed block; the window at 0x... was the <n>th candidate whose keys open the console's storage`, then `ladder seed block at 0x..., located by structure, by the keys it derives`.  With no storage image to prove a window against, the run stops and says the block cannot be located |
 | a loader stage | `-global ps3-boot-rom.stage-elf=lv2ldr.self` | exit 0, `stop 48 at ...` (the loaders' signal) |
 | lv0 and above | `-global ps3-boot-rom.ppu-elf=lv0.self` | exit 0 at the next hand-off |
 | vsh.self | `-global ps3-boot-rom.vsh-run=on` | `ps3-vsh: ... entry=0x6D5AC8 ... PPU entering it`, then `sys_prx_load_module` and the module set |
