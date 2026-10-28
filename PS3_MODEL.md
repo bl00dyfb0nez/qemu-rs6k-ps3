@@ -215,15 +215,18 @@ Q=build-ps3-gui/qemu-system-ppc64.exe          # the SDL build
 ### Boot the chain, then vsh.self, in the window
 
 ```sh
-$Q -M rs6000-ps3 -display sdl -vga rsx,gl=on \
+$Q -M rs6000-ps3 -display sdl,gl=on -vga rsx,gl=on \
    -bios .tmp/rom/rom.bin \
    -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on \
+   -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img \
    -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin \
-   -global ps3-boot-rom.dev-flash=C:/Users/Thewoodsman/Documents/rs3/dev_flash \
-   -global ps3-boot-rom.dev-flash2=C:/Users/Thewoodsman/Documents/rs3/dev_flash2 \
-   -global ps3-boot-rom.dev-flash3=C:/Users/Thewoodsman/Documents/rs3/dev_flash3 \
    -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
 ```
+
+The application comes from the image's own tree: `hdd-file` (or `emmc-file`)
+carries `dev_flash`, `dev_flash2` and `dev_flash3`, and those are mounted from
+it.  There are no folder-backed properties any more - a run that has no image is
+a run with no `dev_flash`, which is exactly what recovery is for.
 
 `-vga rsx` is the RSX driver: it selects this machine's display device (the
 scanout the guest's `cellGcm` calls program) and reports `display: rsx (gl=on)`.
@@ -320,7 +323,7 @@ eMMC chip that is mapped like NAND (256 MiB flash region at device offset
 layout from a NAND dump, and the model boots from it with `boot-medium=emmc`:
 
 ```sh
-$Q -M rs6000-ps3 -display sdl -vga rsx,gl=on \
+$Q -M rs6000-ps3 -display sdl,gl=on -vga rsx,gl=on \
    -global ps3-boot-rom.emmc-file=.tmp/emmc_12g.img \
    -global ps3-boot-rom.boot-medium=emmc \
    -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin \
@@ -331,7 +334,7 @@ All three media stay supported, and each one is a boot target of its own:
 
 | medium | argument | chain comes from | file tree comes from |
 | --- | --- | --- | --- |
-| NOR flash | `-drive if=pflash,format=raw,file=...` | the NOR image | `dev-flash*` properties or an HDD |
+| NOR flash | `-drive if=pflash,format=raw,file=...` | the NOR image | an HDD or eMMC image, else the ROS banks |
 | HDD (raw) | `boot-medium=hdd` + `hdd-file` | the first 16 MiB of the disk | the disk's own `dev_flash*`/`dev_hdd0` |
 | NAND/eMMC | `boot-medium=emmc` + `emmc-file` | the eMMC's flash region | the eMMC's storage area |
 
@@ -412,7 +415,7 @@ audiodev feed `sys_mic`'s rings.
 | `lv1ldr`, `nand-loader` | - | the console's loader image the ERK and the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  The key that opens it *is* the ladder's ERK, so a loader alone keys the storage ladder; the published loader keyset is accepted for a retail image and says so, and both images are read and must agree |
 | `pck2`, `pck2-file` | - | the console's per-console root key 2, 48 bytes.  Only a `.2` loader needs it: that image carries its ERK wrapped, and PCK2 is what unwraps it - the ERK the unwrap yields is then the ladder's key |
 | `container` | `lv0ldr.2` | container to look for in the flash image |
-| `dev-flash`, `dev-flash2`, `dev-flash3` | - | firmware trees unpacked from the flash's ROS, as an alternative to an image |
+| `hdd-file`, `emmc-file` | - | the drive, or the eMMC, the firmware trees and the application are mounted from |
 | `hdd-file`, `hdd-size` | - / 20G | raw disk image, and the size the model gives a fresh one (1 TB max) |
 | `emmc-file`, `emmc-size` | - / 12G | eMMC image, and the size the model gives a fresh one |
 | `boot-medium` | `flash` | which medium the chain is read from: `flash` (NOR), `hdd`, `emmc` |
@@ -485,11 +488,34 @@ rasterizer), the display path (`cellVideoOut` -> EDID -> 720p/1080p -> the
 guest's scanout), the pads/keyboard/controller input, the microphone, the front
 LED and the sound rings.
 
+`mms_db` is the process's own library: `vsh.self` exports 563 functions of it,
+and every mms module on the flash imports it (`mms.sprx` 185, `mms_db_full.sprx`
+180, `mms_maintenance.sprx` 90).  Its entry carries the stub attribute, because
+lv2 asks the *process* that owns a stub library for it - and here that process
+is the VSH itself.  The process scan therefore registers stub-attribute entries
+whose function descriptors live in the VSH image, and refuses the ones whose
+descriptors are elsewhere (the kernel's `sys_io`/`sys_fs`); before that, every
+mms import was answered 0 by a planted stub and the first worker that used the
+answer as a pointer died on the 0x700 program-interrupt vector.
+
 Open: the real `vsh.self` boots, loads its module set (`paf_ext`, `qglbase`,
 `msmw1/2`, `libsre`, `libadec`, `libac3dec`, `sys_audio`, `libfs_utility2`, ...),
-completes `cellGcmInit` and reaches the RSX context, then sits in its own poll
-loop waiting on services it expects from the platform layer (the device/media
-event loop and the `system_plugin.rco` load are the two it reports).  The XMB
-frame therefore has not been drawn yet; `emer_init` is the application that
-comes up when the checks do not pass, and it draws its own screen through the
-same cellGcm path.
+completes `cellGcmInit` and reaches the RSX context, starts `mms.sprx` with its
+`mms_db` imports linked, and then reports two things of its own: its resource
+inflate fails (`incorrect header check`, `invalid distance too far back`, ...)
+and `CreateVmReserveArea: cellFsTruncate2 failed: 0x80010003` - the write side
+of `sys_fs` it wants for its VM reserve area is not implemented, and the data
+its resource loader inflates is not coming out of a plain read of
+`system_plugin.rco` (a read of that file is byte-faithful, checked at 0x47EE4).
+The XMB frame therefore has not been drawn yet; `emer_init` is the application
+that comes up when the checks do not pass, and it draws its own screen through
+the same cellGcm path.
+
+A worker that loops on a low-page exception vector is reported with the vector,
+`SRR0`/`SRR1` and the word it faulted on, then retired (an unresolved-import
+worker retires the same way), so the process that is waiting on its lock moves
+on instead of stopping there.  The recovery application's own loop is intact:
+`emer_init` prints `factory mode ON recover flag[ff]`, reports
+`ErrorPage[6] Code[-2147290383]` (0x8002F2F1, the update search it cannot
+complete), asks for `sys_sm_shutdown(0x100)` and is started again by the warm
+reset.
