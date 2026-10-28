@@ -359,7 +359,10 @@ The SuperSlim's 12 GB console has no HDD and no NOR: its firmware lives in an
 eMMC chip that is mapped like NAND (the 256 MiB flash area starts at device
 offset 0, the storage area straight after it at 0x10000000).
 `scripts/ps3_emmc_create.py` writes that layout from a NAND dump, and the model
-boots from it with `boot-medium=emmc`:
+boots from it with `boot-medium=emmc`.  Past the last byte the dump covers, the
+area is written out as erased flash - 0xFF, which is what a chip returns from
+blocks it has never written - so the tail from the dump's end (and always
+0xF000000..0xFFFFFFF) is padding rather than a hole in the file:
 
 ```sh
 $Q -M rs6000-ps3 -display sdl,gl=on -vga rsx,gl=on \
@@ -375,8 +378,11 @@ and tweak keys, and every 512-byte sector past 0x10000000 is XTS-AES-128 with
 its own sector number as the tweak.  That is the same `ps3_xts_crypt_sector`
 the HDD's data area uses - the tool is built from
 `hw/ppc/ps3_aes/{aes,ps3_aes,ps3_encdec}.c`, so an image it writes is one the
-model reads back - and the flash area stays plaintext NAND.  Without an ERK the
-tree is stored as it stands and the model says so and reads it unkeyed.
+model reads back - and the flash area stays plaintext NAND.  The seal runs past
+2 GiB, so the tool is compiled with 64-bit offsets and seeks through the
+platform's 64-bit call, checking where it landed; the build line is printed and
+is part of what makes it rebuild.  Without an ERK the tree is stored as it
+stands and the model says so and reads it unkeyed.
 
 All three media stay supported, and each one is a boot target of its own:
 

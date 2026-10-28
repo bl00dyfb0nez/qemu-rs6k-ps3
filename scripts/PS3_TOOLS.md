@@ -3,7 +3,10 @@
 Five self-contained Python tools for the `rs6000-ps3` model.  They need nothing
 but a Python 3 interpreter (`ps3_ram_dump.py --disasm` additionally wants
 `capstone`, and `ps3_emmc_create.py --erk-file` a C compiler, to build the seal
-tool from `hw/ppc/ps3_aes`); no key, no firmware dump and no Sony code is
+tool from `hw/ppc/ps3_aes`: it compiles with `-D_FILE_OFFSET_BITS=64` and seeks
+through the platform's 64-bit call, because the storage area starts past 2 GiB,
+and prints the compile line it used, rebuilding the tool whenever that line or
+one of the sources changes); no key, no firmware dump and no Sony code is
 carried in this tree, and no per-console key is ever printed, nor anything
 derived from one.
 
@@ -12,7 +15,7 @@ derived from one.
 | `ps3_flash_layout.py` | reads a NOR/NAND dump's layout: the flash TOC, the `asecure_loader` header, the stage containers, the `ros` banks and the documented region map.  Carves regions out of an image and rebuilds one byte for byte (TOC included). |
 | `ps3_hdd_create.py` | writes a raw HDD image the console would accept: sector 0 is the ATA key block (AES-256-CBC under PCK1), every other sector is XTS-AES under the pair it carries.  The data area is sparse and unformatted, which is what the guest formats on first boot. |
 | `ps3_hdd_tree.py` | puts the console's own file tree (`dev_flash`, `dev_flash2`, `dev_flash3`, `dev_hdd0`) inside such an image, and lists what is in one. |
-| `ps3_emmc_create.py` | builds the 12 GB eMMC image of a 40xxA from a NAND dump: the dump at its NAND position 0x40000, the `dev_flash*`/`dev_hdd0`/`dev_hdd1` tree at 0x10000000, and - given the console's ERK - that storage area sealed with the model's own XTS layer. |
+| `ps3_emmc_create.py` | builds the 12 GB eMMC image of a 40xxA from a NAND dump: the dump at its NAND position 0x40000, the erased tail of the NAND-mapped area written out as 0xFF up to 0x10000000, the `dev_flash*`/`dev_hdd0`/`dev_hdd1` tree there, and - given the console's ERK - that storage area sealed with the model's own XTS layer. |
 | `ps3_ram_dump.py` | dumps (or peeks at) guest RAM while the machine runs, over QMP - no debugger, no patched binary - and reads or disassembles a dump in place. |
 
 Every tool takes `--help`; the common sizes (`20G`, `512M`, `1MiB`, or bytes)

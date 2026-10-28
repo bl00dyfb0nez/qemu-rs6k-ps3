@@ -12,6 +12,11 @@ the ps3tools notes describes it and as this tool writes it:
                       asecure_loader at 0x40800 and metldr.2's container at
                       0x40840 - the NAND-mapped positions docs/lv1rev.txt and
                       docs/flash.txt list
+    past the dump's
+    own bytes        the rest of the NAND-mapped area, written as erased flash
+                      (0xFF) up to 0x10000000 - a chip returns 0xFF from every
+                      block it has not written, and 0xF000000..0xFFFFFFF is
+                      always part of that tail
     0x10000000..      the storage area, which is where the console keeps its
                       dev_flash / dev_flash2 / dev_flash3 / dev_hdd0 / dev_hdd1 files
 
