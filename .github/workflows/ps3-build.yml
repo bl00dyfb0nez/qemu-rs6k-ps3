@@ -6,7 +6,10 @@
 # actually carries the machine and the display backend: `-M help` must list
 # rs6000-ps3 and `-display help` must list sdl.  A build that links but registers
 # nothing would pass a bare compile, so the smoke test runs before the binary is
-# uploaded, and the artifact is the same file that passed it.
+# uploaded, and the artifact is the same file that passed it.  The sweep test is
+# the one PS3 script test that runs without a model binary, a dump or the
+# external SPU assembler, so it is the one wired in here; the loader-channel
+# test needs both the built binary and spuasm from the ps3tools tree.
 #
 # The action versions are the Node 24 runtime releases: GitHub removed the
 # Node 20 action runtime on 23 September 2026, so checkout is v5 (the first
@@ -68,6 +71,14 @@ jobs:
           ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
           ./build/qemu-system-ppc64 -display help | grep -qw sdl
           ./build/qemu-system-ppc64 --version
+
+      - name: Run the QEMU-free PS3 script tests
+        run: |
+          # pycryptodome is only for the sweep's key-match matrix, which
+          # checks a readout against a container's tag in the test.
+          python3 -m venv .venv-tests
+          .venv-tests/bin/pip install --quiet pycryptodome
+          .venv-tests/bin/python scripts/ps3_romexec_sweep_test.py
 
       - name: Upload the binary
         uses: actions/upload-artifact@v6
@@ -137,6 +148,12 @@ jobs:
           ./build/qemu-system-ppc64.exe -M help | grep -qw rs6000-ps3
           ./build/qemu-system-ppc64.exe -display help | grep -qw sdl
 
+      - name: Run the QEMU-free PS3 script tests
+        shell: msys2 {0}
+        run: |
+          python -m pip install --quiet pycryptodome
+          python scripts/ps3_romexec_sweep_test.py
+
       - name: Upload the binary
         uses: actions/upload-artifact@v6
         with:
@@ -163,7 +180,7 @@ jobs:
         run: |
           brew install ninja pkg-config glib pixman sdl2
           python3 -m venv .venv
-          .venv/bin/pip install --upgrade pip meson
+          .venv/bin/pip install --upgrade pip meson pycryptodome
 
       - name: Configure
         run: |
@@ -183,6 +200,10 @@ jobs:
           test -x build/qemu-system-ppc64
           ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
           ./build/qemu-system-ppc64 -display help | grep -qw sdl
+
+      - name: Run the QEMU-free PS3 script tests
+        run: |
+          .venv/bin/python scripts/ps3_romexec_sweep_test.py
 
       - name: Upload the binary
         uses: actions/upload-artifact@v6

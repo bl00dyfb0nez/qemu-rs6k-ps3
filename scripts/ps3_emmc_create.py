@@ -811,9 +811,9 @@ def main(argv=None):
                     help="a directory holding dev_flash, dev_flash2, "
                          "dev_flash3, dev_hdd0 and dev_hdd1 to store in the image")
     ap.add_argument("--erk",
-                    help="the console's 48-byte EID root key (PCK1) as 96 hex "
-                         "digits; seals the storage area the way the encdec "
-                         "block writes it")
+                    help="the console's 48-byte EID root key (PCK1, per-console "
+                         "key 1) as 96 hex digits; seals the storage area the "
+                         "way the encdec block writes it")
     ap.add_argument("--erk-file",
                     help="the same 48 bytes in a file")
     ap.add_argument("--identify", action="store_true",

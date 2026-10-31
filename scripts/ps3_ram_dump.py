@@ -38,6 +38,8 @@ import time
 
 EXE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "build-ps3", "qemu-system-ppc64.exe")
+VERIFY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "ps3_capture_verify.py")
 RAM_SIZE = 0x10000000            # 256 MiB of XDR
 
 
@@ -85,7 +87,48 @@ def find_free_port():
     return port
 
 
-def launch(args, port):
+def verify_capture(args, refuse=True):
+    """Run the capture verifier and return its JSON result, or abort.
+
+    This is the gate: a launch that opens a loader must show a capture that
+    authenticates the dump's own records.  The verifier prints no key material;
+    this function prints only its PASS/FAIL report.
+    """
+    if not args.nor or not args.capture:
+        raise SystemExit("--nor and --capture are required together")
+    cmd = [sys.executable, VERIFY, "--nor", args.nor,
+           "--capture", args.capture, "--json"]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    info = None
+    if res.stdout:
+        try:
+            info = json.loads(res.stdout)
+        except ValueError:
+            sys.stderr.write(res.stdout)
+    if info is None:
+        if res.stderr:
+            sys.stderr.write(res.stderr)
+        raise SystemExit(res.returncode if res.returncode in (2, 3, 4, 5, 6) else 1)
+    dump = info["dump"]
+    capture = info["capture"]
+    print("dump      %s (%d bytes, %s, sha256 %s)"
+          % (dump["name"], dump["size"], dump["medium"], dump["sha256"][:16]))
+    print("capture   %s (%d bytes, %s)"
+          % (capture["name"], capture["size"], capture["kind"]))
+    for rec in info["records"]:
+        print("%-9s 0x%06X  %s" % (rec["name"], rec["offset"], rec["status"]))
+    if info["eid0"]:
+        print("EID0      %s" % info["eid0"]["status"])
+    print("verdict   %s" % ("VERIFIED" if info["verified"] else "NOT VERIFIED"))
+    if res.returncode:
+        if refuse:
+            sys.stderr.write("capture did not verify against %s; refusing to start qemu\n"
+                             % os.path.basename(args.nor))
+        raise SystemExit(res.returncode if res.returncode in (2, 3, 4, 5, 6) else 1)
+    return info
+
+
+def launch(args, port, verified):
     cmd = [EXE, "-M", "rs6000-ps3", "-display", args.display,
            "-qmp", "tcp:127.0.0.1:%d,server=on,wait=off" % port]
     for opt, value in (("dev-flash", args.dev_flash),
@@ -94,6 +137,24 @@ def launch(args, port):
                        ("hdd-file", args.hdd_file)):
         if value:
             cmd += ["-global", "ps3-boot-rom.%s=%s" % (opt, value)]
+    if verified:
+        kind = verified["capture"]["kind"]
+        if kind == "readout":
+            if verified.get("readout_order") != "K_lo||K_hi":
+                print("note: the capture verifies only with its halves reversed; "
+                      "not passing it to the model as a readout")
+            else:
+                prop = ("nand-readout-file"
+                        if verified["dump"]["medium"] == "nand"
+                        else "readout-file")
+                cmd += ["-global", "ps3-boot-rom.%s=%s"
+                        % (prop, os.path.abspath(args.capture))]
+        elif kind == "erk":
+            cmd += ["-global", "ps3-boot-rom.erk-file=%s"
+                    % os.path.abspath(args.capture)]
+        else:
+            print("note: a round key verified, but the model needs a readout "
+                  "or ERK to open a container; not passing it to the model")
     if args.vsh_run:
         cmd += ["-global", "ps3-boot-rom.vsh-run=on",
                 "-global", "ps3-boot-rom.threads=on"]
@@ -171,6 +232,13 @@ def main(argv=None):
     ap.add_argument("--dev-flash2")
     ap.add_argument("--dev-flash3")
     ap.add_argument("--hdd-file")
+    ap.add_argument("--nor", help="NOR or NAND/eMMC dump with the loader records")
+    ap.add_argument("--capture", help="16/32/48-byte key capture to verify")
+    ap.add_argument("--verify-only", action="store_true",
+                    help="verify --nor/--capture and exit without starting qemu")
+    ap.add_argument("--allow-unverified", action="store_true",
+                    help="launch without requiring a verified --nor/--capture; "
+                         "only for runs that do not open a loader")
     ap.add_argument("--vsh-run", action="store_true", default=True)
     ap.add_argument("--no-vsh-run", dest="vsh_run", action="store_false")
     ap.add_argument("extra", nargs=argparse.REMAINDER,
@@ -179,6 +247,12 @@ def main(argv=None):
 
     if args.read:
         read_words(args.read, args.at, args.count, args.disasm)
+        return 0
+
+    if args.verify_only:
+        if not args.nor or not args.capture:
+            raise SystemExit("--verify-only needs --nor and --capture")
+        verify_capture(args, refuse=False)
         return 0
 
     if not args.output:
@@ -194,8 +268,22 @@ def main(argv=None):
     if not args.launch:
         raise SystemExit("pass --launch or --connect")
 
+    if args.launch and not args.allow_unverified:
+        if not args.nor or not args.capture:
+            raise SystemExit(
+                "--launch requires --nor and --capture: the model must open a "
+                "loader with a capture that authenticates that dump.  Use "
+                "--allow-unverified only for a run that does not open one.")
+        verified = verify_capture(args)
+    elif args.nor or args.capture:
+        if not (args.nor and args.capture):
+            raise SystemExit("pass both --nor and --capture, or neither")
+        verified = verify_capture(args)
+    else:
+        verified = None
+
     port = find_free_port()
-    proc = launch(args, port)
+    proc = launch(args, port, verified)
     try:
         qmp = wait_for_qmp(port, time.time() + 30)
         print("guest running; dumping after %.1f s" % args.after)

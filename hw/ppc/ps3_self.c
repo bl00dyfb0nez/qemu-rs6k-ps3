@@ -432,6 +432,15 @@ static bool self_sections_are_plaintext(const uint8_t *keys,
 }
 
 static const struct SelfKey self_app_keys[] = {
+    /*
+     * The 3.41 application key.  A few VSH modules were never re-signed and
+     * ship unchanged into the 4.xx tree: download_plugin.sprx,
+     * videorec.sprx and xai_plugin.sprx all open under this one and under
+     * none of the 4.xx app revisions, so without it lv2 refuses them and the
+     * VSH comes up with a partial module set.
+     */
+    { "838F5860CF97CDAD75B399CA44F4C214CDF951AC795298D71DF3C3B7E93AAEDA",
+      "7FDBB2E924D182BB0D69844ADC4ECA5B" },
     /* application key revision 0x1C, the VSH key for the 4.xx firmware tree */
     { "CFF025375BA0079226BE01F4A31F346D79F62CFB643CA910E16CF60BD9092752",
       "FD40664E2EBBA01BF359B0DCDF543DA4" },

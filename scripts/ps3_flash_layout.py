@@ -57,11 +57,12 @@ only so existing commands keep working: what sits there is the container the
 ROM opens, and its own name string says `lv0ldr.2`.
 
 ch66 is public (it is the container key), but the per-console key is one level
-in: decrypt that container with the channel-66 ladder and **PCK1** (the EID
-root key) is inside lv0ldr.2.  PCK1 is what the loaders run the ATA and flash
-ladders on, and what `ps3_hdd_create.py` wraps the key sector under.  So this
-script maps the container's slots; `ps3_emmc_create.py --identify` reads PCK1's
-carrier (`ros`, `lv0`, `lv0.2`) out of the flash it maps.
+in: **PCK1** (the EID root key, `per_console_root_key_1`) is derived from the
+channel-66 readout (PCK0) by `metldr` and carried in `metldr`; `lv0ldr.2` is
+metldr's next stage and may carry a copy.  PCK1 is what the loaders run the ATA
+and flash ladders on, and what `ps3_hdd_create.py` wraps the key sector under.
+So this script maps the container's slots; `ps3_emmc_create.py --identify` reads
+the loader carrier (`ros`, `lv0`, `lv0.2`) out of the flash it maps.
 """
 import argparse
 import hashlib

@@ -132,6 +132,85 @@ uint32_t ps3_spe_ls_limit(const PS3SPU *spu);
 
 /* Inbound mailbox: true when the four-entry queue had room. */
 bool ps3_spe_push_in_mbox(PS3SPU *spu, uint32_t value);
+
+/*
+ * The loader's private channel window, 0x40-0x44, which the ISA calls reserved
+ * and the boot chain uses as its own message block.  The ROM anchors 0x40: at
+ * 0x3C4 it writes 1 to it just before falling through to the payload at 0x400,
+ * so 0x40 is the stage-side command word out.  lv0ldr.2 writes 0 then 2 there
+ * and reads its data in on 0x43, so the block is: 0x40 command out, 0x41 status
+ * in, 0x42 the ROM's root-key readout, 0x43 data in, 0x44 data out.
+ *
+ * 0x41 and 0x44 are the reverse directions and both report a depth of zero
+ * until the host posts something: status words on 0x41, or room on 0x44 with
+ * ps3_spu_set_loader_sink().  A stage that writes 0x44 before a sink is posted
+ * blocks there, the same way it blocks reading 0x41 before status is posted.
+ */
+#define PS3_SPU_LOADER_CMD_MAX     32
+#define PS3_SPU_LOADER_STATUS_MAX  64
+#define PS3_SPU_LOADER_FEED_MAX   1024
+#define PS3_SPU_LOADER_SINK_MAX   256
+
+/* Words a producer posts on 0x41 (status in), and the finite feed on 0x43. */
+void ps3_spu_set_loader_status(PS3SPU *spu, const uint32_t *words, unsigned count);
+void ps3_spu_set_loader_feed(PS3SPU *spu, const uint32_t *words, unsigned count);
+/* Room the host posts on 0x44 (data out).  Zero means the stage blocks on its
+ * first data word; the words are never silently discarded. */
+void ps3_spu_set_loader_sink(PS3SPU *spu, unsigned depth);
+unsigned ps3_spu_loader_sink_left(const PS3SPU *spu);
+uint64_t ps3_spu_loader_cmd_total(const PS3SPU *spu);
+uint32_t ps3_spu_loader_cmd_last(const PS3SPU *spu);
+unsigned ps3_spu_loader_status_left(const PS3SPU *spu);
+unsigned ps3_spu_loader_feed_left(const PS3SPU *spu);
+uint64_t ps3_spu_loader_data_out(const PS3SPU *spu);
+/* which: 0 = 0x41 read with nothing posted, 1 = 0x43 feed drained, 2 = 0x44
+ * write with no sink room. */
+uint64_t ps3_spu_loader_starved(const PS3SPU *spu, unsigned which);
+
+/* ---- the 128-entry channel map ---------------------------------------- */
+
+/*
+ * The SPU channel space is 128 entries wide.  The ISA names 39 of them and
+ * calls the rest reserved; the boot chain then uses a few of the reserved ones
+ * (0x40-0x44, and 0x49 for the loader version), which is why a map that stops
+ * at the named channels cannot describe the firmware.  This model carries all
+ * 128 in one table: name, direction, and whether the behaviour is implemented.
+ *
+ * A channel that is not implemented - reserved, or named but outside what the
+ * boot path needs - behaves as a channel with no producer and no consumer: a
+ * depth of zero, a read that blocks, and a write that is dropped and counted.
+ * Nothing is handed back as a made-up zero word, so a stage waiting on a
+ * channel that does not exist stops where it is instead of continuing on data
+ * the console never sent.
+ */
+unsigned ps3_spu_channel_count(void);
+const char *ps3_spu_channel_name(unsigned ch);   /* "reserved" when unnamed */
+bool ps3_spu_channel_named(unsigned ch);         /* the ISA defines a name */
+bool ps3_spu_channel_modelled(unsigned ch);      /* this model implements it */
+bool ps3_spu_channel_readable(unsigned ch);
+bool ps3_spu_channel_writable(unsigned ch);
+
+/* Access accounting, one entry per channel.  `reads' counts rdch/rchcnt,
+ * `writes' counts wrch, `faults' counts accesses the map does not define:
+ * a reserved channel, or the wrong direction for a mapped one. */
+unsigned ps3_spu_channel_reads(const PS3SPU *spu, unsigned ch);
+unsigned ps3_spu_channel_writes(const PS3SPU *spu, unsigned ch);
+unsigned ps3_spu_channel_faults(const PS3SPU *spu, unsigned ch);
+bool ps3_spu_channel_touched(const PS3SPU *spu, unsigned ch);
+unsigned ps3_spu_channel_touched_count(const PS3SPU *spu);
+unsigned ps3_spu_channel_fault_count(const PS3SPU *spu);
+/* The channel a stalled read/write was on, or -1. */
+int ps3_spu_channel_stall(const PS3SPU *spu);
+bool ps3_spu_channel_stall_reserved(const PS3SPU *spu);
+
+/*
+ * The PPU side of the inbound mailbox, for a stage whose lv2 does not exist:
+ * the peer answers an empty ch29 read with this message, once per poll.  NULL
+ * or a zero count disarms it.  These are the words an lv2 writer would send;
+ * they are a model parameter, not a console constant.
+ */
+void ps3_spu_set_mbox_peer(PS3SPU *spu, const uint32_t *words, unsigned count);
+uint64_t ps3_spu_mbox_peer_posts(const PS3SPU *spu);
 /* Outbound (non-interrupt) mailbox: true when a word was available. */
 bool ps3_spe_pop_out_mbox(PS3SPU *spu, uint32_t *value);
 /* Outbound interrupt mailbox, the channel that raises a PPE interrupt. */
@@ -145,6 +224,14 @@ void ps3_spe_set_signal_overwrite(PS3SPU *spu, unsigned which, bool overwrite);
 
 /* The 32 bytes the ROM reads from channel 66, in read order. */
 void ps3_spu_set_ch66(PS3SPU *spu, const uint8_t key[32]);
+
+/*
+ * The reads the ROM has completed on channel 66 (0..8) and the value of one of
+ * them.  This is the capture: it records what `rdch $35,$ch66` returned while
+ * the ROM ran, not what the caller put in the buffer.
+ */
+unsigned ps3_spu_ch66_read_count(const PS3SPU *spu);
+uint32_t ps3_spu_ch66_read(const PS3SPU *spu, unsigned index);
 
 /*
  * Channel 73: the loader version is handed over in two rounds.  isoldr reads

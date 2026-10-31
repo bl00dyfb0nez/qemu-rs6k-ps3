@@ -20,7 +20,7 @@ project's policy in `docs/devel/code-provenance.rst`.
 # Extra Guidelines
 
 You are permitted to use this repo for freebuff and other agents too however,
-Following both QEMU and GPLv2 license as per restriction you may not use this repository for DRM circumvention for low level emulation. It is from RPCS3 so same rules apply here.
+Following both QEMU and GPLv2 license as per restriction you may not use this repository for DRM circumvention for low level emulation (this includes redistrubition of your own roms a.k.a dumps). It is from RPCS3 so same rules apply here.
 
 ## Security Policy
 

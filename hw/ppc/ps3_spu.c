@@ -21,6 +21,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/units.h"
 
 #include <math.h>
@@ -30,6 +31,9 @@
 
 #define SPU_LS_MASK 0x3FFFFu
 #define SPU_MAX_GPR 128
+
+/* The architecture's channel space: 7-bit channel numbers, 0..127. */
+#define PS3_SPU_CHANNELS 128
 
 /*
  * Slots are numbered in memory order: gpr[reg][0] holds the four bytes at the
@@ -58,6 +62,11 @@ struct PS3SPU {
     uint8_t ch66[32];
     bool has_ch66;
     unsigned ch66_pos;
+    /* The eight 32-bit words the ROM actually read, in read order.  A capture
+     * taken here is the channel's answer as the ROM consumed it, not a copy of
+     * the buffer the caller installed. */
+    uint32_t ch66_reads[8];
+    unsigned ch66_read_count;
 
     /* Channel 73: two 32-bit version words, drained in order by isoldr. */
     uint32_t ch73[2];
@@ -102,6 +111,68 @@ struct PS3SPU {
     uint32_t out_intr[4];
     unsigned out_intr_head;
     unsigned out_intr_count;
+
+    /*
+     * The PPU side of the inbound mailbox.  On a console ch29 is written by
+     * lv2 (sys_spu_thread_write_spu_mb), and this model only has that writer
+     * when a running lv2 calls it - which a stage started straight out of the
+     * mask ROM has no way to reach.  Armed, the peer stands in for that
+     * writer: it answers an empty read with its message, and stays quiet until
+     * the stage asks again.  `ps3_spe_push_in_mbox' remains the explicit,
+     * unconditional route. */
+    struct {
+        bool armed;
+        uint32_t words[4];
+        unsigned count;
+        uint64_t posts;          /* polls answered */
+        uint64_t words_posted;
+    } peer;
+
+    /*
+     * The loader's private window, 0x40-0x44.  The ROM's own use fixes 0x40:
+     * 0x3C4 writes 1 there and the next instruction is the hand-off, so the
+     * stage side sends command words out on it.  lv0ldr.2 sends 0 then 2 and
+     * drains its data in on 0x43; 0x41 and 0x44 are the opposite directions and
+     * are modelled as such.  Both inbound directions start empty - a read or a
+     * count with nothing there is what a stage sees before the PPU writes - and
+     * the 0x43 feed is finite, so a stage that drains it runs out. */
+    struct {
+        uint32_t cmd[PS3_SPU_LOADER_CMD_MAX];   /* 0x40: stage -> PPU */
+        unsigned cmd_next;
+        unsigned cmd_stored;
+        uint64_t cmd_total;
+
+        uint32_t status[PS3_SPU_LOADER_STATUS_MAX];  /* 0x41: PPU -> stage */
+        unsigned status_head;
+        unsigned status_count;
+
+        uint32_t feed[PS3_SPU_LOADER_FEED_MAX];      /* 0x43: PPU -> stage */
+        unsigned feed_len;
+        unsigned feed_pos;
+
+        uint64_t data_out;                      /* 0x44: stage -> PPU */
+        uint32_t data_out_last;
+        unsigned sink_depth;    /* 0x44: room the host has posted, 0 = none */
+        unsigned sink_left;
+
+        uint64_t starved[3];    /* 0x41/0x43 reads, 0x44 writes with no room */
+        uint64_t dropped;       /* writes aimed at a read-only direction */
+    } loader;
+
+    /*
+     * Channel accounting over the whole 128-entry space.  Every channel access
+     * lands here, so a run can name the channels an image touched and any
+     * access the map does not define instead of inferring them from a listing.
+     * `ch_stall' is the channel the last blocking access was on (-1 when none),
+     * and `ch_stall_reserved' says whether that block was an undefined access
+     * rather than a mapped channel with nothing behind it.
+     */
+    uint32_t ch_reads[PS3_SPU_CHANNELS];
+    uint32_t ch_writes[PS3_SPU_CHANNELS];
+    uint32_t ch_faults[PS3_SPU_CHANNELS];
+    int ch_stall;
+    bool ch_stall_reserved;
+    uint64_t ch_bad_operand;    /* channel number outside 0..127 */
 
     /* SPU_RdSigNotify1/2: overwrite mode is the default, OR mode is optional. */
     uint32_t signal[2];
@@ -961,12 +1032,186 @@ static void mfc_command(PS3SPU *spu)
     }
 }
 
+/* ---- the channel map -------------------------------------------------- */
+
+/*
+ * All 128 channels in one table.  The names and directions are the ISA's own
+ * channel table; the entries the ISA calls reserved are named only where this
+ * project's disassembly shows the boot chain using them, and those names say
+ * which image and what it does:
+ *
+ *   0x40-0x44  the loader's message block, anchored by the mask ROM itself:
+ *              at 0x3C4 it does `wrch $ch64,$1` and falls through to 0x400.
+ *              lv0ldr.2 sends 0/2/8 on 0x40 and drains 23 + 338 words on 0x43.
+ *   0x49       the loader version, two words, read by isoldr and metldr
+ *              (`rchcnt $65,$ch73` at metldr 0xF4FC).
+ *
+ * Everything else is reserved and unimplemented, which the model treats as a
+ * channel with no producer and no consumer rather than as a register that
+ * reads back zero.
+ */
+enum {
+    SPU_CH_NONE = 0,
+    SPU_CH_READ = 1,
+    SPU_CH_WRITE = 2,
+    SPU_CH_BOTH = SPU_CH_READ | SPU_CH_WRITE,
+};
+
+typedef struct SpuChannelInfo {
+    const char *name;   /* NULL: the ISA reserves this number */
+    uint8_t dir;
+    bool impl;          /* the behaviour below is implemented */
+} SpuChannelInfo;
+
+static const SpuChannelInfo spu_channel_map[PS3_SPU_CHANNELS] = {
+    [0x00] = { "SPU_RdEventStat", SPU_CH_READ, true },
+    [0x01] = { "SPU_WrEventMask", SPU_CH_WRITE, true },
+    [0x02] = { "SPU_WrEventAck", SPU_CH_WRITE, true },
+    [0x03] = { "SPU_RdSigNotify1", SPU_CH_READ, true },
+    [0x04] = { "SPU_RdSigNotify2", SPU_CH_READ, true },
+    [0x07] = { "SPU_WrDec", SPU_CH_WRITE, true },
+    [0x08] = { "SPU_RdDec", SPU_CH_READ, true },
+    [0x09] = { "MFC_WrMSSyncReq", SPU_CH_WRITE, true },
+    [0x0B] = { "SPU_RdEventMask", SPU_CH_READ, true },
+    [0x0C] = { "MFC_RdTagMask", SPU_CH_READ, true },
+    [0x0D] = { "SPU_RdMachStat", SPU_CH_READ, true },
+    [0x0E] = { "SPU_WrSRR0", SPU_CH_WRITE, true },
+    [0x0F] = { "SPU_RdSRR0", SPU_CH_READ, true },
+    [0x10] = { "MFC_LSA", SPU_CH_WRITE, true },
+    [0x11] = { "MFC_EAH", SPU_CH_WRITE, true },
+    [0x12] = { "MFC_EAL", SPU_CH_WRITE, true },
+    [0x13] = { "MFC_Size", SPU_CH_WRITE, true },
+    [0x14] = { "MFC_TagID", SPU_CH_WRITE, true },
+    [0x15] = { "MFC_Cmd", SPU_CH_WRITE, true },
+    [0x16] = { "MFC_WrTagMask", SPU_CH_WRITE, true },
+    [0x17] = { "MFC_WrTagUpdate", SPU_CH_WRITE, true },
+    [0x18] = { "MFC_RdTagStat", SPU_CH_READ, true },
+    [0x19] = { "MFC_RdListStallStat", SPU_CH_READ, true },
+    [0x1A] = { "MFC_WrListStallAck", SPU_CH_WRITE, true },
+    [0x1B] = { "MFC_RdAtomicStat", SPU_CH_READ, true },
+    [0x1C] = { "SPU_WrOutMbox", SPU_CH_WRITE, true },
+    [0x1D] = { "SPU_RdInMbox", SPU_CH_READ, true },
+    [0x1E] = { "SPU_WrOutIntrMbox", SPU_CH_WRITE, true },
+
+    [0x40] = { "loader command out", SPU_CH_WRITE, true },
+    [0x41] = { "loader status in", SPU_CH_READ, true },
+    [0x42] = { "loader root key readout", SPU_CH_READ, true },
+    [0x43] = { "loader data feed in", SPU_CH_READ, true },
+    [0x44] = { "loader data out", SPU_CH_WRITE, true },
+
+    [0x45] = { "SetBookmarkTag", SPU_CH_WRITE, false },
+    [0x46] = { "PerfMonStartEvent", SPU_CH_WRITE, false },
+    [0x47] = { "PerfMonStopEvent", SPU_CH_WRITE, false },
+
+    [0x49] = { "loader version", SPU_CH_READ, true },
+};
+
+QEMU_BUILD_BUG_ON(ARRAY_SIZE(spu_channel_map) != PS3_SPU_CHANNELS);
+
+static const SpuChannelInfo *ch_info(unsigned ch)
+{
+    return ch < PS3_SPU_CHANNELS ? &spu_channel_map[ch] : NULL;
+}
+
+const char *ps3_spu_channel_name(unsigned ch)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    return info && info->name ? info->name : "reserved";
+}
+
+bool ps3_spu_channel_named(unsigned ch)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    return info && info->name;
+}
+
+bool ps3_spu_channel_modelled(unsigned ch)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    return info && info->impl;
+}
+
+bool ps3_spu_channel_readable(unsigned ch)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    return info && (info->dir & SPU_CH_READ);
+}
+
+bool ps3_spu_channel_writable(unsigned ch)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    return info && (info->dir & SPU_CH_WRITE);
+}
+
+unsigned ps3_spu_channel_count(void)
+{
+    return PS3_SPU_CHANNELS;
+}
+
+unsigned ps3_spu_channel_reads(const PS3SPU *spu, unsigned ch)
+{
+    return spu && ch < PS3_SPU_CHANNELS ? spu->ch_reads[ch] : 0;
+}
+
+unsigned ps3_spu_channel_writes(const PS3SPU *spu, unsigned ch)
+{
+    return spu && ch < PS3_SPU_CHANNELS ? spu->ch_writes[ch] : 0;
+}
+
+unsigned ps3_spu_channel_faults(const PS3SPU *spu, unsigned ch)
+{
+    return spu && ch < PS3_SPU_CHANNELS ? spu->ch_faults[ch] : 0;
+}
+
+bool ps3_spu_channel_touched(const PS3SPU *spu, unsigned ch)
+{
+    return ps3_spu_channel_reads(spu, ch) || ps3_spu_channel_writes(spu, ch);
+}
+
+unsigned ps3_spu_channel_touched_count(const PS3SPU *spu)
+{
+    unsigned n = 0;
+
+    for (unsigned ch = 0; spu && ch < PS3_SPU_CHANNELS; ch++) {
+        n += ps3_spu_channel_touched(spu, ch) ? 1 : 0;
+    }
+    return n;
+}
+
+unsigned ps3_spu_channel_fault_count(const PS3SPU *spu)
+{
+    unsigned n = 0;
+
+    for (unsigned ch = 0; spu && ch < PS3_SPU_CHANNELS; ch++) {
+        n += spu->ch_faults[ch] ? 1 : 0;
+    }
+    return n;
+}
+
+int ps3_spu_channel_stall(const PS3SPU *spu)
+{
+    return spu ? spu->ch_stall : -1;
+}
+
+bool ps3_spu_channel_stall_reserved(const PS3SPU *spu)
+{
+    return spu && spu->ch_stall_reserved;
+}
+
 /*
  * Channel reads.  `false' means the channel count was zero and the SPU would
  * stall: the caller leaves the PC where it is so the next scheduling slot can
  * retry, which is what makes mailbox and signal handshakes work between SPEs.
  */
-static bool ch_read(PS3SPU *spu, unsigned ch, uint32_t *value)
+static bool mbox_peer_fill(PS3SPU *spu);
+static void ch_stall_reason(const PS3SPU *spu, char *buf, size_t len);
+
+static bool ch_read_mapped(PS3SPU *spu, unsigned ch, uint32_t *value)
 {
     switch (ch) {
     case 0x00:                                  /* SPU_RdEventStat */
@@ -1035,6 +1280,7 @@ static bool ch_read(PS3SPU *spu, unsigned ch, uint32_t *value)
         return true;
 
     case 0x1D:                                  /* SPU_RdInMbox */
+        mbox_peer_fill(spu);
         if (!spu->in_mbox_count) {
             return false;
         }
@@ -1043,7 +1289,12 @@ static bool ch_read(PS3SPU *spu, unsigned ch, uint32_t *value)
 
     case 0x42:                                  /* channel 66: root key */
         if (spu->has_ch66 && spu->ch66_pos < 8) {
-            *value = be32(spu->ch66 + 4 * spu->ch66_pos++);
+            *value = be32(spu->ch66 + 4 * spu->ch66_pos);
+            if (spu->ch66_read_count < 8) {
+                spu->ch66_reads[spu->ch66_read_count] = *value;
+            }
+            spu->ch66_read_count++;
+            spu->ch66_pos++;
         } else {
             *value = 0;
         }
@@ -1057,13 +1308,66 @@ static bool ch_read(PS3SPU *spu, unsigned ch, uint32_t *value)
         }
         return true;
 
-    default:
-        *value = 0;
+    case 0x41:                                  /* loader: status in */
+        if (!spu->loader.status_count) {
+            spu->loader.starved[0]++;
+            return false;
+        }
+        *value = spu->loader.status[spu->loader.status_head];
+        spu->loader.status_head = (spu->loader.status_head + 1) %
+                                  PS3_SPU_LOADER_STATUS_MAX;
+        spu->loader.status_count--;
         return true;
+
+    case 0x43:                                  /* loader: data feed in */
+        if (spu->loader.feed_pos >= spu->loader.feed_len) {
+            spu->loader.starved[1]++;
+            return false;
+        }
+        *value = spu->loader.feed[spu->loader.feed_pos++];
+        return true;
+
+    default:
+        /* The map says this channel is modelled but no arm above handles it:
+         * a table/switch mismatch, counted as a fault rather than answered
+         * with a zero word the console never sent. */
+        spu->ch_faults[ch]++;
+        return false;
     }
 }
 
-static uint32_t ch_read_count(PS3SPU *spu, unsigned ch)
+static bool ch_read(PS3SPU *spu, unsigned ch, uint32_t *value)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    if (!info) {
+        spu->ch_bad_operand++;
+        spu->ch_stall = (int)ch;
+        spu->ch_stall_reserved = true;
+        return false;
+    }
+
+    spu->ch_reads[ch]++;
+
+    if (!info->impl || !(info->dir & SPU_CH_READ)) {
+        /* Not an access the map defines: no producer at all, or the wrong
+         * direction for a mapped channel.  A read with nothing behind it
+         * blocks - it is never answered with a zero word. */
+        spu->ch_faults[ch]++;
+        spu->ch_stall = (int)ch;
+        spu->ch_stall_reserved = true;
+        return false;
+    }
+
+    if (!ch_read_mapped(spu, ch, value)) {
+        spu->ch_stall = (int)ch;
+        spu->ch_stall_reserved = false;
+        return false;
+    }
+    return true;
+}
+
+static uint32_t ch_read_count_mapped(PS3SPU *spu, unsigned ch)
 {
     switch (ch) {
     case 0x00:                                  /* SPU_RdEventStat */
@@ -1090,20 +1394,60 @@ static uint32_t ch_read_count(PS3SPU *spu, unsigned ch)
     case 0x1C:                                  /* SPU_WrOutMbox */
         return 4 - spu->out_mbox_count;
     case 0x1D:                                  /* SPU_RdInMbox */
+        mbox_peer_fill(spu);
         return spu->in_mbox_count;
     case 0x1E:                                  /* SPU_WrOutIntrMbox */
         return 4 - spu->out_intr_count;
+    case 0x40:
+        return 0;                               /* nothing comes back */
+    case 0x41:
+        return spu->loader.status_count;
+    case 0x43:
+        return spu->loader.feed_len - spu->loader.feed_pos;
+    case 0x44:
+        return spu->loader.sink_left;           /* room the host has posted */
     case 0x42:
         return (spu->has_ch66 && spu->ch66_pos < 8) ? 1 : 0;
     case 0x49:
         return (spu->has_ch73 && spu->ch73_pos < 2) ? 2 - spu->ch73_pos : 0;
     default:
+        /* Only reachable for a channel the map implements: every modelled read
+         * channel has an arm above, so this is a write-only register, whose
+         * single slot is free until the next write. */
         return 1;
     }
 }
 
+/*
+ * rchcnt.  It never blocks, but it still has to be an access the map defines:
+ * a channel the model does not implement reports a depth of zero and is
+ * counted as a fault.  A depth of zero is the truthful answer - nothing is
+ * posted - rather than the legacy default of one.
+ */
+static uint32_t ch_read_count(PS3SPU *spu, unsigned ch)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    if (!info) {
+        spu->ch_bad_operand++;
+        return 0;
+    }
+
+    spu->ch_reads[ch]++;
+
+    if (!info->impl) {
+        spu->ch_faults[ch]++;
+        return 0;
+    }
+
+    /* rchcnt is legal on an outbound channel too: on 0x44 it is how much room
+     * the host has posted, on 0x40 how much room the command latch has.  Only
+     * rdch needs a readable channel. */
+    return ch_read_count_mapped(spu, ch);
+}
+
 /* `false' means the write channel was full and the SPU would stall. */
-static bool ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
+static bool ch_write_mapped(PS3SPU *spu, unsigned ch, uint32_t value)
 {
     switch (ch) {
     case 0x01:                                  /* SPU_WrEventMask */
@@ -1182,9 +1526,72 @@ static bool ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
                   value);
         return true;
 
+    case 0x40:                                  /* loader: command out */
+        spu->loader.cmd[spu->loader.cmd_next] = value;
+        spu->loader.cmd_next = (spu->loader.cmd_next + 1) %
+                               PS3_SPU_LOADER_CMD_MAX;
+        if (spu->loader.cmd_stored < PS3_SPU_LOADER_CMD_MAX) {
+            spu->loader.cmd_stored++;
+        }
+        spu->loader.cmd_total++;
+        if (spu->trace) {
+            fprintf(stderr, "[spu] loader command 0x%X at 0x%X\n", value,
+                    spu->pc);
+        }
+        return true;
+
+    case 0x44:                                  /* loader: data out */
+        /* The host has to have posted room first.  With no sink the stage
+         * waits here instead of the word disappearing: 0x44's depth is zero
+         * until it is posted, and this is that zero doing its job. */
+        if (!spu->loader.sink_left) {
+            spu->loader.starved[2]++;
+            return false;
+        }
+        spu->loader.sink_left--;
+        spu->loader.data_out++;
+        spu->loader.data_out_last = value;
+        if (spu->trace) {
+            fprintf(stderr, "[spu] loader data 0x%X at 0x%X\n", value,
+                    spu->pc);
+        }
+        return true;
+
     default:
+        /* Table/switch mismatch: the map claims this channel but there is no
+         * behaviour for it.  Counted, and the write is dropped. */
+        spu->ch_faults[ch]++;
         return true;
     }
+}
+
+static bool ch_write(PS3SPU *spu, unsigned ch, uint32_t value)
+{
+    const SpuChannelInfo *info = ch_info(ch);
+
+    if (!info) {
+        spu->ch_bad_operand++;
+        return true;
+    }
+
+    spu->ch_writes[ch]++;
+
+    if (!info->impl || !(info->dir & SPU_CH_WRITE)) {
+        /* Writing a read channel is illegal on hardware, and a reserved
+         * channel has no consumer at all.  There is no channel-fault stop in
+         * this model and stalling forever would be worse than the fault, so
+         * the word is dropped and the access is counted. */
+        spu->ch_faults[ch]++;
+        spu->loader.dropped++;
+        return true;
+    }
+
+    if (!ch_write_mapped(spu, ch, value)) {
+        spu->ch_stall = (int)ch;
+        spu->ch_stall_reserved = false;
+        return false;
+    }
+    return true;
 }
 
 
@@ -1245,6 +1652,7 @@ PS3SPU *ps3_spu_new(uint8_t *ls, size_t ls_size,
     spu->runnable = true;
     spu->signal_overwrite[0] = true;
     spu->signal_overwrite[1] = true;
+    spu->ch_stall = -1;
 
     if (flash) {
         memcpy(spu->ext, flash, flash_size);
@@ -1283,6 +1691,7 @@ static void spe_init(PS3SPU *spu, unsigned id, PS3SPEGroup *group,
     spu->signal_overwrite[0] = true;
     spu->signal_overwrite[1] = true;
     spu->log_events = true;
+    spu->ch_stall = -1;
 }
 
 PS3SPEGroup *ps3_spes_new(unsigned count, uint8_t *ls_block, size_t block_size,
@@ -1498,8 +1907,11 @@ int ps3_spes_run_quantum(PS3SPEGroup *g, uint64_t slice,
         PS3SPU *spu = g->spe[i];
 
         if (spu && spu->stalled && !spu->halted) {
-            snprintf(why, why_len, "SPE %u blocked on a channel at 0x%X",
-                     i, spu->pc);
+            char reason[96];
+
+            ch_stall_reason(spu, reason, sizeof(reason));
+            snprintf(why, why_len, "SPE %u blocked on a channel at 0x%X%s",
+                     i, spu->pc, reason);
             return PS3_SPU_BLOCKED;
         }
     }
@@ -1610,6 +2022,142 @@ uint32_t ps3_spe_ls_limit(const PS3SPU *spu)
     return spu ? spu->lslr : 0;
 }
 
+/*
+ * What a PPU-side writer looks like from the SPE.  Called whenever the stage
+ * asks ch29 for a word or for its depth: with the queue empty and a peer
+ * attached, the peer posts its whole message at once.  That is the same effect
+ * as lv2 writing the mailbox, except that the model only does it when the stage
+ * polls, so a stage that never asks never gets a word (and a stage that asks
+ * twice gets an answer twice - each poll is a request).
+ */
+static bool mbox_peer_fill(PS3SPU *spu)
+{
+    unsigned i;
+
+    if (!spu->peer.armed || !spu->peer.count || spu->in_mbox_count) {
+        return false;
+    }
+
+    for (i = 0; i < spu->peer.count; i++) {
+        mbox_push(spu->in_mbox, &spu->in_mbox_head, &spu->in_mbox_count,
+                  spu->peer.words[i]);
+    }
+    spu->peer.posts++;
+    spu->peer.words_posted += i;
+    spe_event(spu, SPU_EV_MBOX_IN);
+
+    if (spu->log_events) {
+        info_report("ps3-spu: mailbox peer posted %u word(s) to ch29 at 0x%X",
+                    i, spu->pc);
+    }
+    return true;
+}
+
+void ps3_spu_set_mbox_peer(PS3SPU *spu, const uint32_t *words, unsigned count)
+{
+    unsigned i;
+
+    if (!spu) {
+        return;
+    }
+
+    spu->peer.armed = words != NULL;
+    spu->peer.count = 0;
+    spu->peer.posts = 0;
+    spu->peer.words_posted = 0;
+    for (i = 0; words && i < count && i < 4; i++) {
+        spu->peer.words[i] = words[i];
+    }
+    spu->peer.count = i;
+    spu->peer.armed = i != 0;
+}
+
+uint64_t ps3_spu_mbox_peer_posts(const PS3SPU *spu)
+{
+    return spu ? spu->peer.posts : 0;
+}
+
+void ps3_spu_set_loader_status(PS3SPU *spu, const uint32_t *words, unsigned count)
+{
+    unsigned i;
+
+    if (!spu) {
+        return;
+    }
+
+    spu->loader.status_head = 0;
+    spu->loader.status_count = 0;
+    for (i = 0; words && i < count && i < PS3_SPU_LOADER_STATUS_MAX; i++) {
+        spu->loader.status[i] = words[i];
+    }
+    spu->loader.status_count = i;
+}
+
+void ps3_spu_set_loader_feed(PS3SPU *spu, const uint32_t *words, unsigned count)
+{
+    unsigned i;
+
+    if (!spu) {
+        return;
+    }
+
+    for (i = 0; words && i < count && i < PS3_SPU_LOADER_FEED_MAX; i++) {
+        spu->loader.feed[i] = words[i];
+    }
+    spu->loader.feed_len = i;
+    spu->loader.feed_pos = 0;
+}
+
+uint64_t ps3_spu_loader_cmd_total(const PS3SPU *spu)
+{
+    return spu ? spu->loader.cmd_total : 0;
+}
+
+uint32_t ps3_spu_loader_cmd_last(const PS3SPU *spu)
+{
+    if (!spu || !spu->loader.cmd_stored) {
+        return 0;
+    }
+
+    return spu->loader.cmd[(spu->loader.cmd_next + PS3_SPU_LOADER_CMD_MAX - 1) %
+                           PS3_SPU_LOADER_CMD_MAX];
+}
+
+unsigned ps3_spu_loader_status_left(const PS3SPU *spu)
+{
+    return spu ? spu->loader.status_count : 0;
+}
+
+unsigned ps3_spu_loader_feed_left(const PS3SPU *spu)
+{
+    return spu ? spu->loader.feed_len - spu->loader.feed_pos : 0;
+}
+
+void ps3_spu_set_loader_sink(PS3SPU *spu, unsigned depth)
+{
+    if (!spu) {
+        return;
+    }
+
+    spu->loader.sink_depth = MIN(depth, PS3_SPU_LOADER_SINK_MAX);
+    spu->loader.sink_left = spu->loader.sink_depth;
+}
+
+unsigned ps3_spu_loader_sink_left(const PS3SPU *spu)
+{
+    return spu ? spu->loader.sink_left : 0;
+}
+
+uint64_t ps3_spu_loader_data_out(const PS3SPU *spu)
+{
+    return spu ? spu->loader.data_out : 0;
+}
+
+uint64_t ps3_spu_loader_starved(const PS3SPU *spu, unsigned which)
+{
+    return (spu && which < 3) ? spu->loader.starved[which] : 0;
+}
+
 bool ps3_spe_push_in_mbox(PS3SPU *spu, uint32_t value)
 {
     if (!spu || spu->in_mbox_count == 4) {
@@ -1699,6 +2247,27 @@ void ps3_spu_set_ch66(PS3SPU *spu, const uint8_t key[32])
     memcpy(spu->ch66, key, 32);
     spu->has_ch66 = true;
     spu->ch66_pos = 0;
+    spu->ch66_read_count = 0;
+    memset(spu->ch66_reads, 0, sizeof(spu->ch66_reads));
+}
+
+/*
+ * What the ROM's `rdch $35,$ch66` loop got, as the channel returns it: eight
+ * big-endian 32-bit words, first word first.  A caller that wants the 32-byte
+ * readout in the order the ladder uses writes those words back big-endian.
+ */
+unsigned ps3_spu_ch66_read_count(const PS3SPU *spu)
+{
+    return spu ? MIN(spu->ch66_read_count, 8) : 0;
+}
+
+uint32_t ps3_spu_ch66_read(const PS3SPU *spu, unsigned index)
+{
+    if (!spu || index >= MIN(spu->ch66_read_count, 8)) {
+        return 0;
+    }
+
+    return spu->ch66_reads[index];
 }
 
 void ps3_spu_set_ch73(PS3SPU *spu, uint32_t hi, uint32_t lo)
@@ -3931,6 +4500,7 @@ static void report_hot(PS3SPU *spu, const char *what, char *why, size_t why_len)
 {
     uint32_t best = 0, second = 0;
     uint32_t best_pc = 0, second_pc = 0;
+    int len;
 
     for (unsigned i = 0; i < ARRAY_SIZE(spu->hot); i++) {
         if (spu->hot[i].count > best) {
@@ -3944,11 +4514,15 @@ static void report_hot(PS3SPU *spu, const char *what, char *why, size_t why_len)
         }
     }
 
-    snprintf(why, why_len,
+    len = snprintf(why, why_len,
              "%s at 0x%X; hottest 0x%X (%u hits), next 0x%X (%u), "
              "%" PRIu64 " MFC gets/%" PRIu64 " puts",
              what, spu->pc, best_pc, best, second_pc, second,
              spu->mfc_gets, spu->mfc_puts);
+    if (spu->peer.armed && len > 0 && (size_t)len < why_len) {
+        snprintf(why + len, why_len - (size_t)len,
+                 ", mailbox peer %" PRIu64 " post(s)", spu->peer.posts);
+    }
 }
 
 static void run_reset(PS3SPU *spu)
@@ -3967,6 +4541,26 @@ static void run_reset(PS3SPU *spu)
 
     for (unsigned i = 0; i < ARRAY_SIZE(spu->hist); i++) {
         spu->hist[i].pc = UINT32_MAX;
+    }
+}
+
+/* The channel a stall is on, appended to the blocked message so a run says
+ * which of the 128 it stopped on and whether the map even defines it. */
+static void ch_stall_reason(const PS3SPU *spu, char *buf, size_t len)
+{
+    const int ch = ps3_spu_channel_stall(spu);
+
+    if (ch < 0) {
+        buf[0] = 0;
+        return;
+    }
+
+    if (spu->ch_stall_reserved) {
+        snprintf(buf, len, " (ch 0x%02X %s: no producer in the model)", ch,
+                 ps3_spu_channel_name(ch));
+    } else {
+        snprintf(buf, len, " (ch 0x%02X %s: zero depth)", ch,
+                 ps3_spu_channel_name(ch));
     }
 }
 
@@ -3992,8 +4586,12 @@ int ps3_spu_run_to(PS3SPU *spu, uint32_t entry, uint32_t stop_pc,
             return PS3_SPU_FAULT;
         }
         if (rc == PS3_SPU_BLOCKED) {
+            char reason[96];
+
+            ch_stall_reason(spu, reason, sizeof(reason));
             snprintf(why, why_len, "blocked on a channel at 0x%X after "
-                     "%" PRIu64 " instructions", spu->pc, spu->insns);
+                     "%" PRIu64 " instructions%s", spu->pc, spu->insns,
+                     reason);
             return PS3_SPU_BLOCKED;
         }
         if (rc == PS3_SPU_STOPPED) {
@@ -4026,8 +4624,12 @@ int ps3_spu_run(PS3SPU *spu, uint32_t entry, uint64_t limit,
             return PS3_SPU_FAULT;
         }
         if (rc == PS3_SPU_BLOCKED) {
+            char reason[96];
+
+            ch_stall_reason(spu, reason, sizeof(reason));
             snprintf(why, why_len, "blocked on a channel at 0x%X after "
-                     "%" PRIu64 " instructions", spu->pc, spu->insns);
+                     "%" PRIu64 " instructions%s", spu->pc, spu->insns,
+                     reason);
             return PS3_SPU_BLOCKED;
         }
         if (rc == PS3_SPU_STOPPED) {

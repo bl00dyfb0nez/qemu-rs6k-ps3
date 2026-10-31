@@ -701,6 +701,13 @@ typedef struct PS3EventPort {
 #define PS3_RSX_TILES         15
 #define PS3_RSX_ZCULLS        8
 #define PS3_RSX_VBLANK_NS     16683300ull   /* 59.94 Hz */
+/*
+ * How often the RSX reads `put` back for itself.  The console's GPU fetches
+ * commands as the library publishes them; the doorbell wakes it, it does not
+ * gate it, and a library that publishes put and then waits for get to reach it
+ * waits forever against a model that only consumes on the doorbell.
+ */
+#define PS3_RSX_PUMP_NS       1000000ull
 
 /* RsxDriverInfo: the page cellGcmSys reads and writes. */
 #define PS3_RSX_DI_VERSION    0x000
@@ -1017,6 +1024,8 @@ typedef struct PS3Thread {
     /* When it last had the CPU, and whether its current stall was reported. */
     uint64_t last_run;
     bool stall_reported;
+    /* The nip of the stall that was last described, for the loop dump. */
+    uint64_t stall_nip;
     /* The code page it kept returning to, and whether that was reported. */
     uint64_t spin_page;
     unsigned spin_ticks;
@@ -1067,6 +1076,18 @@ struct PS3BootROMState {
     char *container;
     char *readout;
     char *readout_file;
+    /* Where the eight channel-66 reads are written: 32 bytes, read order. */
+    char *ch66_capture;
+    /*
+     * Where the mask-ROM replay stops.  The hand-off to the loader is 0x400,
+     * which is the default; a developer probe can stop inside the ROM to see
+     * how far the readout and the key schedule reach.
+     */
+    uint32_t stop_pc;
+    /* End the run once the stop snapshot is written (probes, not boots). */
+    bool exit_on_stop;
+    /* Keep a mid-ROM probe from being overwritten by the chain fallback. */
+    bool no_chain_fallback;
     uint8_t readout_bytes[32];
     /* The same, for a NAND/eMMC medium whose first container is sealed
        differently from the NOR one. */
@@ -1080,6 +1101,22 @@ struct PS3BootROMState {
     bool pad_selftest;              /* one controller state through the pad */
     bool spu_run;
     bool spu_trace;
+    /* Run the mask ROM itself over the selected container, not just the C
+       opener, and take its verdict as the boot's. */
+    bool rom_exec;
+    /* Words to post to the stage's inbound mailbox (channel 0x1D). */
+    char *spu_inbox;
+    /* Model lv2's end of that mailbox, so the stage's poll is answered by a
+       peer instead of needing the words handed in up front. */
+    bool mbox_peer;
+    char *mbox_peer_msg;
+    /* The loader's private channel window: status words for 0x41, the finite
+       feed for 0x43.  Both are empty by default, which is what a stage sees
+       before the PPU side writes.  `loader_sink' is the room the host posts on
+       0x44; zero means a stage's first data word blocks instead of vanishing. */
+    char *loader_status;
+    char *loader_feed;
+    uint32_t loader_sink;
     char *ls_dump;
     char *prx_dump;                 /* decrypted module images, one per file */
     uint64_t flash_base;
@@ -1247,7 +1284,8 @@ struct PS3BootROMState {
     uint32_t rsx_local_size;
     uint32_t rsx_dma, rsx_driver, rsx_reports, rsx_device;
     uint32_t rsx_event_port, rsx_event_queue;
-    uint32_t rsx_get, rsx_put;      /* io offsets from the last doorbell */
+    uint32_t rsx_get, rsx_put;      /* io offsets: consumed, and published */
+    QEMUTimer *rsx_pump_timer;      /* the RSX's own fetch of `put` */
     uint32_t rsx_iomap_ea[PS3_RSX_IO_PAGES];
     uint8_t rsx_iomap_used[PS3_RSX_IO_PAGES];
     uint32_t rsx_db_offset[8], rsx_db_pitch[8], rsx_db_w[8], rsx_db_h[8];
@@ -1608,6 +1646,12 @@ struct PS3BootROMState {
     uint32_t bytes;
     uint32_t selftest_result; /* 1 passed, 2 failed, 0 not run */
     uint64_t container_offset;
+    /*
+     * An explicit container address, for a dump that holds more than one and
+     * for a sweep that must report each at its own offset.  UINT64_MAX is
+     * "unset", so flash offset 0 (a NAND slot) stays addressable.
+     */
+    uint64_t container_at;
 };
 
 static uint32_t ps3_be32(const uint8_t *p)
@@ -1815,21 +1859,40 @@ static bool ps3_container_find(const uint8_t *flash, size_t flash_len,
 
     /*
      * NOR dumps do not always carry the name: the console's own SPU ROM is
-     * handed the effective address of the container, not a string.  Fall
-     * back to the two slots the PS3 boot chain uses - lv0ldr at 0xFC0000 and
-     * metldr at 0x000840 - and accept a header that agrees with itself.
+     * handed the effective address of the container, not a string.  Fall back
+     * to the two slots the PS3 boot chain uses - lv0ldr at 0xFC0000 and metldr
+     * at 0x000840 - and accept a header that agrees with itself.
+     *
+     * The slot is chosen by the name that was asked for, never by trying both:
+     * a dump with no `lv1ldr.2` must not answer for the boot slot under that
+     * name, which is what a "try the fixed slots" loop does (the sweep found it
+     * reporting `lv1ldr.2 at flash 0xFC0000`).
      */
     {
-        static const size_t slots[] = { 0xFC0000, 0x000840 };
+        static const struct {
+            const char *name;
+            size_t slot;
+        } slots[] = {
+            { "lv0ldr",   0xFC0000 }, { "lv0ldr.2", 0xFC0000 },
+            { "bootldr",  0xFC0000 }, { "bootldr.2", 0xFC0000 },
+            { "metldr",   0x000840 }, { "metldr.2",  0x000840 },
+        };
         size_t i;
 
         for (i = 0; i < ARRAY_SIZE(slots); i++) {
-            size_t slot = slots[i];
+            size_t slot = slots[i].slot;
             const uint8_t *hdr;
             uint32_t blocks, total;
 
-            if (slot + PS3_CONTAINER_HDR > flash_len) {
+            if (strcmp(name, slots[i].name)) {
                 continue;
+            }
+
+            if (slot + PS3_CONTAINER_HDR > flash_len) {
+                snprintf(why, why_len,
+                         "the flash image is too short to hold %s at 0x%zX",
+                         name, slot);
+                return false;
             }
 
             hdr = flash + slot;
@@ -1839,7 +1902,10 @@ static bool ps3_container_find(const uint8_t *flash, size_t flash_len,
             if (blocks != total || blocks == 0 ||
                 blocks > PS3_ROM_MAX_BLOCKS ||
                 slot + PS3_CONTAINER_HDR + (size_t)blocks * 16 > flash_len) {
-                continue;
+                snprintf(why, why_len,
+                         "no container called %s in the flash image (the fixed "
+                         "slot at 0x%zX has no valid header)", name, slot);
+                return false;
             }
 
             *offset = slot;
@@ -2001,6 +2067,123 @@ static void ps3_rom_set_status(PS3BootROMState *s, uint32_t status,
  * stage built in place, so both the container path and the stage path write
  * it when `ls-dump` is set.
  */
+/*
+ * Channel 66, as the ROM read it.
+ *
+ * The capture is 32 bytes in read order (K_lo then K_hi), which is the format
+ * `readout-file` takes, so a capture can be fed straight back to a boot.  It is
+ * written from the eight words the SPU's `rdch $35,$ch66` loop returned; a
+ * caller's own buffer is never copied, and the count is reported so a short
+ * run (a stop before 0x148) is visible rather than looking like a full key.
+ */
+static void ps3_ch66_write_capture(PS3BootROMState *s, const uint32_t *reads,
+                                   unsigned count)
+{
+    g_autoptr(GError) err = NULL;
+    uint8_t blob[32] = { 0 };
+    unsigned i;
+
+    if (!s->ch66_capture || !*s->ch66_capture) {
+        return;
+    }
+
+    count = MIN(count, 8);
+    if (!count) {
+        info_report("ps3-boot-rom: no channel-66 read completed; no capture "
+                    "written");
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        blob[4 * i + 0] = reads[i] >> 24;
+        blob[4 * i + 1] = reads[i] >> 16;
+        blob[4 * i + 2] = reads[i] >> 8;
+        blob[4 * i + 3] = reads[i];
+    }
+
+    if (!g_file_set_contents(s->ch66_capture, (const char *)blob,
+                             count * 4, &err)) {
+        info_report("ps3-boot-rom: cannot write the channel-66 capture %s: %s",
+                    s->ch66_capture, err->message);
+        return;
+    }
+
+    info_report("ps3-boot-rom: channel-66 capture: %u read(s), %u bytes in "
+                "read order -> %s", count, count * 4, s->ch66_capture);
+
+    if (count != 8) {
+        info_report("ps3-boot-rom: the ROM stopped before finishing the "
+                    "channel-66 read; the capture is not a key");
+    }
+}
+
+/*
+ * The register file at the hand-off.
+ *
+ * The pwn window is the instruction after the ROM jumps to 0x400: the SPU is
+ * the same thread, so whatever the ROM left in $0..$127 is still readable
+ * there.  This writes the 128 quadwords next to the channel-66 capture, so a
+ * run can say whether the container key survives the hand-off instead of
+ * assuming it does.
+ */
+static void ps3_spu_write_handoff_regs(PS3BootROMState *s)
+{
+    g_autofree char *path = NULL;
+    g_autoptr(GError) err = NULL;
+    uint8_t blob[128 * 16];
+    unsigned r, lane;
+
+    if (!s->ch66_capture || !*s->ch66_capture || !s->spu) {
+        return;
+    }
+    path = g_strconcat(s->ch66_capture, ".regs", NULL);
+    for (r = 0; r < 128; r++) {
+        for (lane = 0; lane < 4; lane++) {
+            uint32_t v = ps3_spu_gpr_word(s->spu, r, lane);
+            unsigned o = r * 16 + lane * 4;
+
+            blob[o + 0] = v >> 24;
+            blob[o + 1] = v >> 16;
+            blob[o + 2] = v >> 8;
+            blob[o + 3] = v;
+        }
+    }
+    if (!g_file_set_contents(path, (const char *)blob, sizeof(blob), &err)) {
+        info_report("ps3-boot-rom: cannot write the register file %s: %s",
+                    path, err->message);
+        return;
+    }
+    info_report("ps3-boot-rom: register file at the hand-off -> %s", path);
+
+    /*
+     * The same instant in local store.  The end-of-run dump cannot answer
+     * this: the loader runs after the hand-off and clears 0x00 itself, so the
+     * key schedule the ROM left at 0x00..0xAF is only visible here.
+     */
+    g_free(path);
+    path = g_strconcat(s->ch66_capture, ".ls400", NULL);
+    if (!g_file_set_contents(path, (const char *)ps3_spu_ls_ptr(s->spu, 0),
+                             0x400, &err)) {
+        info_report("ps3-boot-rom: cannot write the local-store snapshot %s: "
+                    "%s", path, err->message);
+        return;
+    }
+    info_report("ps3-boot-rom: local store at the hand-off -> %s", path);
+
+    /* Where the replay actually stopped, so a probe can tell a requested stop
+     * from an earlier one (a tag rejection at 0x1E4, for instance). */
+    g_free(path);
+    path = g_strconcat(s->ch66_capture, ".pc", NULL);
+    {
+        uint32_t pc = ps3_spu_pc(s->spu);
+        uint8_t raw[4] = { pc >> 24, pc >> 16, pc >> 8, pc };
+
+        if (!g_file_set_contents(path, (const char *)raw, sizeof(raw), &err)) {
+            info_report("ps3-boot-rom: cannot write the stop PC %s: %s",
+                        path, err->message);
+        }
+    }
+}
+
 static void ps3_ls_write_dump(PS3BootROMState *s)
 {
     uint8_t *ram;
@@ -2341,6 +2524,23 @@ static bool ps3_chain_container(PS3BootROMState *s, const char **name_out,
     bool nand_medium = s->boot_medium && !strcmp(s->boot_medium, "emmc");
 
     /*
+     * An explicit address wins over every lookup: a NOR dump can carry two
+     * containers and a sweep has to be able to say which one it opened.  The
+     * caller owns the label; the header is still validated below.
+     */
+    if (s->container_at != UINT64_MAX) {
+        *name_out = s->container ?: "container";
+        if (!s->flash || s->container_at + PS3_CONTAINER_HDR > s->flash_len) {
+            snprintf(why, why_len,
+                     "container-offset 0x%" PRIX64 " is outside the flash "
+                     "(0x%zx bytes)", s->container_at, s->flash_len);
+            return false;
+        }
+        *offset = s->container_at;
+        return true;
+    }
+
+    /*
      * A NAND/eMMC medium is asked for its own first container: the mask ROM
      * is pointed at the asecure_loader region, and metldr.2 is what it opens
      * there.  The lv0ldr.2 the NOR chain opens is metldr's next stage, and a
@@ -2379,6 +2579,46 @@ static bool ps3_chain_container(PS3BootROMState *s, const char **name_out,
 }
 
 /*
+ * The NAND/eMMC medium's other way in, for a console whose key is not here.
+ *
+ * The mask ROM's first container on a NAND or eMMC medium is metldr.2, and it
+ * is sealed for the console's own channel-66 key - a key that lives in the
+ * console's boot ROM and is not in a flash dump.  With own-rom=on the model is
+ * not the mask ROM: it never runs metldr, and the chain it does run starts at
+ * the medium's own lv1ldr.self, out of the recovery bank the keyset opens.
+ * That loader is where the ATA and flash ladders come from, so when it is in
+ * hand the chain is exactly the medium's own - and the container's seal is
+ * reported as the one thing this image cannot show, not quietly skipped in a
+ * way that would also hide a wrong readout on a console that has one.
+ */
+static bool ps3_chain_loader_path(PS3BootROMState *s, const char *name,
+                                  uint64_t offset, char *why, size_t why_len)
+{
+    const bool nand_medium = s->boot_medium &&
+                             !strcmp(s->boot_medium, "emmc");
+    unsigned idx = s->ladder_medium[1] ? 1 : 0;
+
+    if (!nand_medium || !s->own_rom) {
+        return false;
+    }
+
+    if (!s->has_ladder_seeds || !s->has_erk) {
+        snprintf(why, why_len, "the %s container at flash 0x%" PRIX64
+                 " is sealed for the console's channel-66 key, and the medium "
+                 "carries no loader whose ladder could stand in for it",
+                 name, offset);
+        return false;
+    }
+
+    info_report("ps3-boot-rom: the %s container at flash 0x%" PRIX64 " is "
+                "sealed for the console's own channel-66 key, which a dump "
+                "does not carry; the chain is the medium's own loader "
+                "(ladder seed block at 0x%X), and its keys open the storage",
+                name, offset, s->ladder_off[idx]);
+    return true;
+}
+
+/*
  * The chain's own result, before anything is allowed to run: the container is
  * in the flash, the readout opens it and its tag checks.  lv2 asks the same
  * question of the vflash filesystem before it starts /dev_flash/vsh.self.
@@ -2406,6 +2646,9 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
      * the one its first container is checked with when the caller gave both.
      */
     if (!s->has_readout && !(nand_medium && s->has_nand_readout)) {
+        if (ps3_chain_loader_path(s, name, offset, why, why_len)) {
+            return true;
+        }
         snprintf(why, why_len, "no channel-66 readout");
         return false;
     }
@@ -2420,6 +2663,9 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
     g_free(plain);
 
     if (result != PS3_BOOT_OK) {
+        if (ps3_chain_loader_path(s, name, offset, why, why_len)) {
+            return true;
+        }
         snprintf(why, why_len, "the %s container at flash 0x%" PRIX64
                  " does not verify (stop 0x%X)", name, offset, result);
         return false;
@@ -2444,6 +2690,186 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
 static void ps3_rom_home_tick(void *opaque)
 {
     (void)opaque;
+}
+
+/*
+ * The mailbox is what a PPU-side producer writes.  The model's only writer is
+ * the lv2 syscall `sys_spu_thread_write_spu_mb`, which a boot-ROM-started stage
+ * has no peer for, so this is how a caller stands in for it.
+ */
+static void ps3_rom_feed_inbox(PS3BootROMState *s)
+{
+    gchar **parts;
+    unsigned i;
+
+    if (!s->spu_inbox || !s->spu) {
+        return;
+    }
+
+    parts = g_strsplit(s->spu_inbox, ",", 8);
+    for (i = 0; parts[i] && i < 8; i++) {
+        const char *text = g_strstrip(parts[i]);
+        uint64_t value = g_ascii_strtoull(text, NULL, 0);
+
+        if (*text && !ps3_spe_push_in_mbox(s->spu, (uint32_t)value)) {
+            info_report("ps3-boot-rom: inbox full, %s not posted", text);
+        }
+    }
+    g_strfreev(parts);
+
+    info_report("ps3-boot-rom: stage mailbox fed from spu-inbox");
+}
+
+/*
+ * The stage's mailbox peer: what lv2's sys_spu_thread_write_spu_mb() would put
+ * on channel 0x1D.  The message is a model parameter - the console's own words
+ * are not known here - so it defaults to a two-word zero message, which is the
+ * shape the metldr stage accepts (its consumer tests the low 7 bits), and it is
+ * overridable for a stage that wants something else.
+ */
+static unsigned ps3_rom_parse_words(const char *text, uint32_t *out, unsigned max)
+{
+    gchar **parts;
+    unsigned n = 0, i;
+
+    if (!text || !*text) {
+        return 0;
+    }
+
+    parts = g_strsplit(text, ",", max + 1);
+    for (i = 0; parts[i] && n < max; i++) {
+        const char *word = g_strstrip(parts[i]);
+
+        if (*word) {
+            out[n++] = (uint32_t)g_ascii_strtoull(word, NULL, 0);
+        }
+    }
+    g_strfreev(parts);
+    return n;
+}
+
+static void ps3_rom_attach_mbox_peer(PS3BootROMState *s)
+{
+    uint32_t words[4] = { 0, 0, 0, 0 };
+    unsigned count = 2;
+
+    if (!s->mbox_peer || !s->spu) {
+        return;
+    }
+
+    if (s->mbox_peer_msg && *s->mbox_peer_msg) {
+        count = ps3_rom_parse_words(s->mbox_peer_msg, words, 4);
+    }
+
+    ps3_spu_set_mbox_peer(s->spu, words, count);
+    if (count) {
+        info_report("ps3-boot-rom: stage mailbox peer attached on ch29: %u "
+                    "word(s) per poll (0x%X, 0x%X)", count, words[0], words[1]);
+    }
+}
+
+/*
+ * The loader's window, as the PPU side would leave it: status words waiting on
+ * 0x41 and a finite feed on 0x43.  Nothing is installed unless it is asked for,
+ * so a read of either channel with no producer blocks instead of returning a
+ * zero word that the stage would take for real data.
+ */
+static void ps3_rom_attach_loader_channels(PS3BootROMState *s)
+{
+    uint32_t words[PS3_SPU_LOADER_FEED_MAX];
+    unsigned n;
+
+    if (!s->spu) {
+        return;
+    }
+
+    n = ps3_rom_parse_words(s->loader_status, words, PS3_SPU_LOADER_STATUS_MAX);
+    if (n) {
+        ps3_spu_set_loader_status(s->spu, words, n);
+        info_report("ps3-boot-rom: loader status: %u word(s) posted on 0x41", n);
+    }
+
+    n = ps3_rom_parse_words(s->loader_feed, words, PS3_SPU_LOADER_FEED_MAX);
+    if (n) {
+        ps3_spu_set_loader_feed(s->spu, words, n);
+        info_report("ps3-boot-rom: loader feed: %u word(s) on 0x43, finite", n);
+    }
+
+    if (s->loader_sink) {
+        ps3_spu_set_loader_sink(s->spu, s->loader_sink);
+        info_report("ps3-boot-rom: loader sink: room for %u word(s) on 0x44",
+                    s->loader_sink);
+    }
+}
+
+static void ps3_rom_report_loader_channels(PS3SPU *spu)
+{
+    if (!ps3_spu_loader_cmd_total(spu) && !ps3_spu_loader_data_out(spu)) {
+        return;
+    }
+
+    info_report("ps3-spu: loader channels: %" PRIu64 " command(s) out on "
+                "0x40, last 0x%X; %u status, %u feed word(s) left; %u sink "
+                "word(s) left, %" PRIu64 " word(s) out on 0x44",
+                ps3_spu_loader_cmd_total(spu), ps3_spu_loader_cmd_last(spu),
+                ps3_spu_loader_status_left(spu),
+                ps3_spu_loader_feed_left(spu),
+                ps3_spu_loader_sink_left(spu),
+                ps3_spu_loader_data_out(spu));
+
+    if (ps3_spu_loader_starved(spu, 2)) {
+        info_report("ps3-spu: loader channels: 0x44 blocked %" PRIu64
+                    " time(s) with no sink room",
+                    ps3_spu_loader_starved(spu, 2));
+    }
+}
+
+/*
+ * The 128-entry channel map, as the run used it: how many channels the model
+ * implements, which ones this image touched, and any access the map does not
+ * define.  The last part is what a listing cannot give - a touched channel is
+ * one the code executed, not one the disassembler thought it saw.
+ */
+static void ps3_rom_report_channel_map(PS3SPU *spu)
+{
+    const unsigned touched = ps3_spu_channel_touched_count(spu);
+    const unsigned faulty = ps3_spu_channel_fault_count(spu);
+    GString *list;
+    unsigned modelled = 0;
+
+    if (!spu || !touched) {
+        return;
+    }
+
+    for (unsigned ch = 0; ch < ps3_spu_channel_count(); ch++) {
+        modelled += ps3_spu_channel_modelled(ch) ? 1 : 0;
+    }
+
+    list = g_string_new(NULL);
+    for (unsigned ch = 0; ch < ps3_spu_channel_count(); ch++) {
+        if (ps3_spu_channel_touched(spu, ch)) {
+            g_string_append_printf(list, "%s0x%02X", list->len ? "," : "", ch);
+        }
+    }
+    info_report("ps3-spu: channels: %u of %u modelled, %u touched (%s)",
+                modelled, ps3_spu_channel_count(), touched, list->str);
+    g_string_free(list, true);
+
+    if (faulty) {
+        list = g_string_new(NULL);
+        for (unsigned ch = 0; ch < ps3_spu_channel_count(); ch++) {
+            const unsigned n = ps3_spu_channel_faults(spu, ch);
+
+            if (n) {
+                g_string_append_printf(list, "%s0x%02X %s x%u",
+                                       list->len ? "; " : "", ch,
+                                       ps3_spu_channel_name(ch), n);
+            }
+        }
+        info_report("ps3-spu: channels: %u channel(s) with an access the "
+                    "model does not define: %s", faulty, list->str);
+        g_string_free(list, true);
+    }
 }
 
 static void ps3_rom_boot(PS3BootROMState *s)
@@ -2504,11 +2930,146 @@ static void ps3_rom_boot(PS3BootROMState *s)
     s->blocks = ps3_be32(s->flash + s->container_offset + 0x10);
     s->bytes = s->blocks * 16;
 
+    /*
+     * A container-at address is not checked by the finder, so its span is
+     * checked here: a header whose block count runs off the image is a bad
+     * header, not a multi-gigabyte allocation.
+     */
+    if (!s->blocks || s->blocks > PS3_ROM_MAX_BLOCKS ||
+        s->container_offset + PS3_CONTAINER_HDR + (uint64_t)s->bytes >
+            s->flash_len) {
+        snprintf(why, sizeof(why),
+                 "container at flash 0x%" PRIX64 " has an invalid block count "
+                 "(%u) for a 0x%zx-byte image",
+                 s->container_offset, s->blocks, s->flash_len);
+        ps3_rom_set_status(s, PS3_BOOT_BAD_HEADER, why);
+        return;
+    }
+
     plain = g_malloc0(s->bytes);
 
     result = ps3_rom_open(s->flash + s->container_offset,
                           s->flash + s->container_offset + PS3_CONTAINER_HDR,
                           s->bytes, ch66, plain, s->key);
+
+    /*
+     * A container that does not open on a NAND/eMMC medium may not be the
+     * chain at all: metldr.2 is sealed for a channel-66 key a dump does not
+     * carry, and the chain the model boots is the medium's own lv1ldr.self.
+     * ps3_chain_check makes that decision at power-on; a reset has to make it
+     * too, or the second boot reports `stop 2, MAC mismatch` for a chain that
+     * had just verified - which is what the VSH's start-up reset did.  A
+     * caller-supplied readout that opens the container still wins, because the
+     * fallback is only reached when the open failed.
+     */
+    if (result != PS3_BOOT_OK && !s->no_chain_fallback &&
+        ps3_chain_loader_path(s, name, s->container_offset, why, sizeof(why))) {
+        info_report("ps3-boot-rom: the chain is the medium's own loader; no "
+                    "container is opened on this medium");
+        g_free(plain);
+        return;
+    }
+
+    /*
+     * rom-exec: the mask ROM itself runs over the container, in the SPU
+     * interpreter, with the readout on channel 66 and the container's flash
+     * offset on the signal channels.  Its own tag check is then the verdict;
+     * the C opener above is kept only as a second opinion, and a disagreement
+     * between the two is an error in the model rather than a key problem.
+     */
+    if (s->rom_exec && s->spu && !s->own_rom) {
+        uint8_t *ls = memory_region_get_ram_ptr(&s->ls_mr);
+        const uint8_t *rom = memory_region_get_ram_ptr(&s->rom_mr);
+        char rom_why[192] = "did not report";
+        uint32_t reads[8];
+        unsigned count, i;
+        int rc;
+
+        memcpy(ls, rom, PS3_ROM_SIZE);
+        ps3_spu_set_ch66(s->spu, ch66);
+        ps3_spu_set_sig(s->spu, 0, (uint32_t)s->container_offset);
+        ps3_spu_set_reg(s->spu, 90, 0x450);   /* header hand-off, LS 0x410 */
+
+        /*
+         * The ROM's budget has to cover the whole container, because it
+         * decrypts and MACs every block before it checks the tag.  A fixed
+         * 4 million instructions was enough for metldr (63 KiB) and cut
+         * lv0ldr (197 KiB) off mid-body at 0x2FC, which reads as a stall but
+         * is only the limit; 64 instructions per byte of body leaves room for
+         * the loop and the 0x400 prologue without letting a wedged ROM spin
+         * for minutes.
+         */
+        rc = ps3_spu_run_to(s->spu, 0, s->stop_pc,
+                            4000000 + (uint64_t)s->bytes * 64, rom_why,
+                            sizeof(rom_why));
+        count = ps3_spu_ch66_read_count(s->spu);
+        for (i = 0; i < count; i++) {
+            reads[i] = ps3_spu_ch66_read(s->spu, i);
+        }
+        ps3_ch66_write_capture(s, reads, count);
+        ps3_spu_write_handoff_regs(s);
+
+        /*
+         * A probe that asked to stop inside the ROM has everything it wants
+         * once the snapshot is on disk.  What follows is the hand-off into a
+         * loader the probe is not asking about, so the caller would only get
+         * to kill the process afterwards; end the run here instead.
+         */
+        if (s->exit_on_stop) {
+            info_report("ps3-boot-rom: stop snapshot written at 0x%X; exiting",
+                        ps3_spu_pc(s->spu));
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        }
+
+        /*
+         * Reaching 0x400 is the pass.  Comparing plaintext is not enough on
+         * its own: the ROM decrypts the body before it checks the tag, so a
+         * failed container leaves the same wrong plaintext the C opener's
+         * forced decrypt produces.  A stop before 0x400 (1E4 is the tag
+         * check's stop, 3A0 the wipe path) is the ROM's own rejection.
+         */
+        if (rc == 0 && ps3_spu_pc(s->spu) == 0x400) {
+            if (memcmp(ls + 0x400, plain, s->bytes)) {
+                info_report("ps3-boot-rom: the mask ROM reached 0x400 but its "
+                            "plaintext differs from the C opener's; treating "
+                            "the container as not verified");
+                result = PS3_BOOT_BAD_MAC;
+            } else {
+                info_report("ps3-boot-rom: the mask ROM opened the container "
+                            "in the SPU interpreter (%s)", rom_why);
+                if (result != PS3_BOOT_OK) {
+                    info_report("ps3-boot-rom: warning: the C opener said "
+                                "stop 0x%X but the ROM reached 0x400 with the "
+                                "same plaintext; the ROM's verdict is used",
+                                result);
+                    result = PS3_BOOT_OK;
+                }
+            }
+        } else {
+            info_report("ps3-boot-rom: the mask ROM did not open the "
+                        "container (%s)", rom_why);
+            result = (result == PS3_BOOT_BAD_HEADER) ? PS3_BOOT_BAD_HEADER
+                                                     : PS3_BOOT_BAD_MAC;
+        }
+
+        /* The map the ROM's own run used, before any payload: a rejection has
+         * no payload, and its channel set is still evidence about the code. */
+        ps3_rom_report_channel_map(s->spu);
+    } else if (!s->selftest) {
+        /*
+         * No ROM run: the container path is the only consumer, so its readout
+         * is recorded.  With selftest=on the ROM has already run and written
+         * the capture; that one is kept.
+         */
+        uint32_t reads[8];
+        unsigned i;
+
+        for (i = 0; i < 8; i++) {
+            reads[i] = ps3_be32(ch66 + 4 * i);
+        }
+
+        ps3_ch66_write_capture(s, reads, 8);
+    }
 
     if (result == PS3_BOOT_OK) {
         uint8_t *ls = memory_region_get_ram_ptr(&s->ls_mr);
@@ -2516,22 +3077,34 @@ static void ps3_rom_boot(PS3BootROMState *s)
         memcpy(ls + 0x400, plain, s->bytes);
 
         /*
-         * The ROM falls through to 0x400.  Run what it left there on the SPU
-         * model, with the same channel-66 readout and the container's
-         * effective address on the signal channels.
+         * The opener falls through to 0x400.  The payload at that address is
+         * the container's own stage, not the mask ROM, so it runs whichever
+         * code verified the container: own-rom only decides whether the ROM
+         * image or the model's built-in opener did the open and the tag
+         * check, and it must not also mean the chain stops there.  Gating the
+         * hand-off on !own_rom left every built-in run with a verdict and no
+         * payload - no stage, no channel map, no local store.
          */
-        if (s->spu_run && s->spu && !s->own_rom) {
+        if (s->spu_run && s->spu) {
             ps3_spu_set_ch66(s->spu, ch66);
             ps3_spu_set_sig(s->spu, 0, s->container_offset);
             ps3_spu_set_trace(s->spu, s->spu_trace);
+            ps3_rom_feed_inbox(s);
+            ps3_rom_attach_mbox_peer(s);
+            ps3_rom_attach_loader_channels(s);
             s->spu_status = ps3_spu_run(s->spu, 0x400, 1 << 26,
                                         s->spu_why, sizeof(s->spu_why));
             s->spu_insns = ps3_spu_insns(s->spu);
 
             info_report("ps3-spu: %s (%" PRIu64 " instructions, %" PRIu64
-                        " MFC gets, %" PRIu64 " puts)",
+                        " MFC gets, %" PRIu64 " puts%s)",
                         s->spu_why, s->spu_insns, ps3_spu_mfc_gets(s->spu),
-                        ps3_spu_mfc_puts(s->spu));
+                        ps3_spu_mfc_puts(s->spu),
+                        ps3_spu_mbox_peer_posts(s->spu)
+                        ? ", mailbox peer answered" : "");
+
+            ps3_rom_report_loader_channels(s->spu);
+            ps3_rom_report_channel_map(s->spu);
 
             ps3_vga_printf("SPU PAYLOAD: %" PRIu64 " INSTRUCTIONS",
                            s->spu_insns);
@@ -2725,6 +3298,21 @@ static void ps3_rom_selftest(PS3BootROMState *s)
 
         status = ps3_spu_run_to(spu, 0, 0x400, 4000000, why, sizeof(why));
 
+        /* The ROM has now performed the rdch $35,$ch66 loop for real: these
+         * eight words are its capture, independent of the buffer installed. */
+        {
+            unsigned count = ps3_spu_ch66_read_count(spu);
+            uint32_t reads[8];
+            unsigned k;
+
+            for (k = 0; k < count; k++) {
+                reads[k] = ps3_spu_ch66_read(spu, k);
+            }
+
+            ps3_ch66_write_capture(s, reads, count);
+            ps3_spu_write_handoff_regs(s);
+        }
+
         if (status != 0) {
             s->selftest_result = 2;
             info_report("ps3-boot-rom: selftest FAILED (mask ROM in the "
@@ -2858,18 +3446,30 @@ static void ps3_rom_reset(DeviceState *dev)
     s->mic_head = 0;
     s->mic_used = 0;
 
-    /* Power-on: the model runs the ROM once the image it opens is in place. */
+    /*
+     * Power-on: the image is in place, so the chain is opened.  With no -bios
+     * that is the model's own opener; with own-rom=off the supplied mask ROM
+     * is replayed instead.  The built-in path booting without a ROM file is
+     * what makes the ROM optional rather than a required input.
+     */
     if (s->rom_file) {
         if (s->selftest) {
             ps3_rom_selftest(s);
         }
 
         ps3_rom_boot(s);
+    } else if (s->own_rom) {
+        ps3_rom_boot(s);
     }
 
 }
 
 static int ps3_spu_stage(PS3BootROMState *s);
+/* The loader's window and the mailbox peer are machine-level producers, so a
+ * stage run on its own gets them too; both are defined further down. */
+static void ps3_rom_attach_loader_channels(PS3BootROMState *s);
+static void ps3_rom_report_loader_channels(PS3SPU *spu);
+static void ps3_rom_report_channel_map(PS3SPU *spu);
 static int ps3_ppu_dump(PS3BootROMState *s);
 static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp);
 static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp);
@@ -3170,6 +3770,16 @@ static int32_t ps3_lv2_alloc(PS3BootROMState *s, uint8_t *ram,
                     s->lv2_heap, ram_size);
         return PS3_LV2_ENOMEM;
     }
+
+    /*
+     * lv2 hands out zeroed pages.  The container's band is only clear at
+     * reset: modules are placed and unloaded in it, so without this a fresh
+     * block arrives holding whatever the last module or stub left behind, and
+     * a guest that leaves a field unset because it expects zero reads garbage
+     * instead (qglbase's context carries its callback at +0x10 and takes the
+     * "no callback" branch only when that word is zero).
+     */
+    memset(ram + heap, 0, page_size);
 
     ps3_put_be32(ram + out, heap);
     s->lv2_heap = end;
@@ -6638,6 +7248,16 @@ static void ps3_thread_finish_call(PS3BootROMState *s, PS3Thread *t,
         }
         t->wait_lwmutex_id = 0;
     }
+
+    /*
+     * A call that has been finished for a parked thread leaves the running
+     * CPU where that thread parked - at the trampoline's halt loop - so the
+     * scheduler has to be asked for the context it just made runnable.  The
+     * wake paths that call this run from the model (a vblank, an lv2 event, a
+     * lock hand-off), not from the guest, so nothing else would set this and
+     * the thread would spin at 0xC58 until the stall detector retired it.
+     */
+    s->sched_pending = true;
 }
 
 /*
@@ -7226,6 +7846,18 @@ static void ps3_mutex_handoff(PS3BootROMState *s, uint8_t *ram,
             t->wait_mutex_id != s->mtx[m].id) {
             continue;
         }
+        /*
+         * A thread inside sys_cond_wait also records the condition's mutex -
+         * that is the lock lv2 releases for it - but it must only complete
+         * when the condition is signalled (ps3_cond_wake), never because the
+         * mutex happened to come free.  Handing it the lock here is a spurious
+         * wake: the guest rechecks its predicate, finds nothing, and waits
+         * again, which is the ping-pong the VSH was left in (1301 cond_wait
+         * calls in a 100-second run, and not one sys_cond_signal).
+         */
+        if (t->wait_cond_id) {
+            continue;
+        }
         s->mtx[m].owner = t->id;
         t->wait_mutex_id = 0;
         ps3_thread_finish_call(s, t, ram, ram_size, 0);
@@ -7541,13 +8173,40 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
         }
     }
 
+    {
+        /* The whole table, once: which slots exist is the first question. */
+        static bool table_shown;
+        unsigned k;
+
+        if (!table_shown) {
+            table_shown = true;
+            for (k = 0; k < PS3_THREAD_MAX; k++) {
+                PS3Thread *t = &s->thr[k];
+
+                if (!t->used) {
+                    continue;
+                }
+                info_report("ps3-ppu: slot %u: id 0x%X%s%s%s nip 0x%" PRIX64
+                            " sp 0x%X stack 0x%X+0x%X",
+                            k, t->id, t->main ? " main" : "",
+                            t->dead ? " dead" : "",
+                            t->parked ? " parked" : "", t->nip,
+                            (uint32_t)t->gpr[1], t->stack_base, t->stack_size);
+            }
+        }
+    }
+
     for (i = 0; i < PS3_THREAD_MAX; i++) {
         PS3Thread *t = &s->thr[i];
 
-        if (!t->used || t->dead || t->stall_reported) {
+        /*
+         * The main thread is reported on every pass: a boot that stops is
+         * stopped in one wait, and the wait it is in now is what says where.
+         */
+        if (!t->used || t->dead || (t->stall_reported && t->id != 0)) {
             continue;
         }
-        if (s->sched_ticks - t->last_run < 512) {
+        if (t->id != 0 && s->sched_ticks - t->last_run < 512) {
             continue;
         }
         t->stall_reported = true;
@@ -7558,6 +8217,60 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
                     t->blocked, t->parked, t->wait_eq, t->wait_mutex_id,
                     t->wait_cond_id, t->wait_sem_id, t->wait_ticks);
 
+        /*
+         * A thread that stalls with nothing blocking it is polling guest
+         * memory, and neither the nip nor the wait state says which word.
+         * Print the instructions around the nip and the registers they work
+         * from, once per stall site: an lwz off a gpr names the address the
+         * wait is really on, which is what a missing device or completion
+         * flag has to be read against.
+         */
+        if (t->stall_nip != t->nip) {
+            uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+            uint64_t ram_size = memory_region_size(s->ram);
+            char words[8 * 9 + 1];
+            unsigned j, n = 0;
+
+            t->stall_nip = t->nip;
+            info_report("ps3-ppu: sched:   at nip 0x%" PRIX64 ": r0 0x%" PRIX64
+                        " r1 0x%" PRIX64 " r2 0x%" PRIX64 " r3 0x%" PRIX64
+                        " r4 0x%" PRIX64 " r5 0x%" PRIX64,
+                        t->nip, t->gpr[0], t->gpr[1], t->gpr[2], t->gpr[3],
+                        t->gpr[4], t->gpr[5]);
+            info_report("ps3-ppu: sched:   r6 0x%" PRIX64 " r7 0x%" PRIX64
+                        " r8 0x%" PRIX64 " r9 0x%" PRIX64 " r10 0x%" PRIX64
+                        " r11 0x%" PRIX64 " r12 0x%" PRIX64,
+                        t->gpr[6], t->gpr[7], t->gpr[8], t->gpr[9],
+                        t->gpr[10], t->gpr[11], t->gpr[12]);
+            info_report("ps3-ppu: sched:   r26 0x%" PRIX64 " r27 0x%" PRIX64
+                        " r28 0x%" PRIX64 " r29 0x%" PRIX64 " r30 0x%" PRIX64
+                        " r31 0x%" PRIX64,
+                        t->gpr[26], t->gpr[27], t->gpr[28], t->gpr[29],
+                        t->gpr[30], t->gpr[31]);
+            /* The word a poll of [rN+off] reads is usually just past a gpr. */
+            if (t->gpr[30] + 0x40 <= ram_size) {
+                uint32_t base = (uint32_t)t->gpr[30];
+
+                info_report("ps3-ppu: sched:   [r30] %08X %08X %08X %08X "
+                            "%08X %08X %08X %08X",
+                            ps3_be32(ram + base), ps3_be32(ram + base + 4),
+                            ps3_be32(ram + base + 8), ps3_be32(ram + base + 12),
+                            ps3_be32(ram + base + 16), ps3_be32(ram + base + 20),
+                            ps3_be32(ram + base + 24), ps3_be32(ram + base + 28));
+            }
+            for (j = 0; j < 8; j++) {
+                uint64_t at = t->nip - 8 + 4 * j;
+
+                if ((at + 4) > ram_size) {
+                    continue;
+                }
+                n += snprintf(words + n, sizeof(words) - n, " %08X",
+                              ps3_be32(ram + at));
+            }
+            info_report("ps3-ppu: sched:   words from 0x%" PRIX64 ":%s",
+                        t->nip - 8, words);
+        }
+
 
         /*
          * A thread queued for a lock names the lock; who holds it is the
@@ -7566,6 +8279,36 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
          * held by a thread that is itself blocked is visible as the deadlock
          * it is.
          */
+        if (t->id == 0) {
+            /*
+             * The chain the main thread sits in, once: a wait in lv2 says
+             * nothing about which vsh function is polling, and the saved
+             * return addresses are the only thing that names it.
+             */
+            static bool chain_shown;
+
+            if (!chain_shown) {
+                uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+                uint64_t ram_size = memory_region_size(s->ram);
+                uint32_t sp = (uint32_t)t->gpr[1];
+                unsigned depth;
+
+                chain_shown = true;
+                info_report("ps3-ppu: sched:   main chain: nip 0x%" PRIX64
+                            " lr 0x%" PRIX64 " sp 0x%X", t->nip, t->lr, sp);
+                for (depth = 0; depth < 6 && (uint64_t)sp + 0x20 <= ram_size;
+                     depth++) {
+                    info_report("ps3-ppu: sched:     frame %u sp 0x%X "
+                                "return 0x%" PRIX64, depth, sp,
+                                ps3_be64(ram + sp + 0x10));
+                    if (!ps3_be32(ram + sp) || ps3_be32(ram + sp) <= sp) {
+                        break;
+                    }
+                    sp = ps3_be32(ram + sp);
+                }
+            }
+        }
+
         if (t->wait_mutex_id) {
             int m = ps3_mutex_index(s, t->wait_mutex_id);
             unsigned o;
@@ -7830,6 +8573,26 @@ static uint32_t ps3_lv2_thread_created(PS3BootROMState *s, uint8_t *ram,
     }
     if (!t || !entry) {
         return 0;
+    }
+    {
+        /*
+         * Which slot a create lands in, and where the running thread is
+         * registered, is what says whether the main thread's context has a
+         * slot of its own: a create that takes the running thread's slot
+         * overwrites its id, and the boot thread then has none to report on.
+         */
+        static bool shown;
+
+        if (!shown) {
+            shown = true;
+            info_report("ps3-ppu: first create: slot %u, thr_cur %d "
+                        "(used %d id 0x%X, stack 0x%X+0x%X)",
+                        (unsigned)(t - s->thr), s->thr_cur,
+                        s->thr_cur >= 0 ? s->thr[s->thr_cur].used : -1,
+                        s->thr_cur >= 0 ? s->thr[s->thr_cur].id : 0,
+                        s->thr_cur >= 0 ? s->thr[s->thr_cur].stack_base : 0,
+                        s->thr_cur >= 0 ? s->thr[s->thr_cur].stack_size : 0);
+        }
     }
 
     if (!s->threads_enabled) {
@@ -13396,6 +14159,42 @@ static void ps3_rsx_fifo(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size)
 }
 
 /*
+ * The RSX's own fetch of the ring.
+ *
+ * `put` in the DMA control block is the library's publication of how far it
+ * has written; on the console the GPU reads it continuously, and the doorbell
+ * (context attribute 0x001) only wakes it.  vsh.self's graphics library
+ * publishes put and then waits for `get` to reach it, so a model that consumes
+ * only on the doorbell leaves that wait - and the whole boot - parked.  This
+ * timer is that fetch: it reads put back and consumes everything up to it, the
+ * same thing ps3_rsx_fifo does from the doorbell, so both paths stay one code
+ * path.
+ */
+static void ps3_rsx_pump(void *opaque)
+{
+    PS3BootROMState *s = opaque;
+
+    if (s->ram && s->rsx_context && s->rsx_dma) {
+        uint8_t *ram = memory_region_get_ram_ptr(s->ram);
+        uint64_t ram_size = memory_region_size(s->ram);
+
+        if ((uint64_t)s->rsx_dma + PS3_RSX_DMA_REF + 4 <= ram_size) {
+            uint32_t put = ps3_be32(ram + s->rsx_dma + PS3_RSX_DMA_PUT);
+
+            if (put != s->rsx_put) {
+                s->rsx_put = put;
+                ps3_rsx_fifo(s, ram, ram_size);
+            }
+        }
+    }
+
+    if (s->rsx_pump_timer) {
+        timer_mod(s->rsx_pump_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PS3_RSX_PUMP_NS);
+    }
+}
+
+/*
  * One handler event.
  *
  * The driver info page carries the mask of handlers the library installed and
@@ -13406,6 +14205,7 @@ static void ps3_rsx_event(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
                           uint64_t data1, uint64_t flags, uint64_t data3)
 {
     uint32_t drv = s->rsx_driver;
+    uint32_t installed;
     PS3Event ev;
     int q;
 
@@ -13413,9 +14213,31 @@ static void ps3_rsx_event(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
         return;
     }
 
-    flags &= ps3_be32(ram + drv + PS3_RSX_DI_HANDLERS) | (0xFFFFFFFFull << 32);
-    if (!flags) {
-        return;
+    /*
+     * The mask is filtered the way RPCS3's send_event filters it, with one
+     * exception: the display's own event.
+     *
+     * The real library publishes a mask that does not use the bit RPCS3's HLE
+     * enum assigns to a vblank (it sets 0x10 where that enum says 1<<1), so a
+     * strict mask test drops every vblank and the guest's gcm interrupt thread
+     * never runs at all - no flip, no frame.  A context that installed any
+     * handler asked to be told about its display, so the vblank event is
+     * delivered whenever the mask is non-zero; the library's own callback
+     * table decides what to do with it.
+     */
+    installed = ps3_be32(ram + drv + PS3_RSX_DI_HANDLERS);
+    if (flags & PS3_RSX_EVENT_VBLANK) {
+        if (!installed) {
+            return;
+        }
+        flags = PS3_RSX_EVENT_VBLANK |
+                (flags & ~PS3_RSX_EVENT_VBLANK &
+                 (installed | (0xFFFFFFFFull << 32)));
+    } else {
+        flags &= installed | (0xFFFFFFFFull << 32);
+        if (!flags) {
+            return;
+        }
     }
 
     q = ps3_eq_index(s, ps3_be32(ram + drv + PS3_RSX_DI_QUEUE));
@@ -13864,7 +14686,14 @@ static void ps3_rsx_init_driver(PS3BootROMState *s, uint8_t *ram,
 
     ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_PUT, 0);
     ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_GET, 0);
-    ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_REF, 0);
+    /*
+     * `ref` is the GPU's reference on the ring: -1 means nothing is in flight.
+     * RPCS3's context setup leaves it zero and notes that -1 is the value the
+     * graphics library expects; that library's own bring-up publishes put and
+     * then waits for ref to read back -1, so the sentinel has to be here before
+     * the guest gets that far or vsh.self waits for a value nothing writes.
+     */
+    ps3_put_be32(ram + s->rsx_dma + PS3_RSX_DMA_REF, 0xFFFFFFFFu);
 }
 
 static bool ps3_lv2_rsx(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
@@ -13999,6 +14828,14 @@ static bool ps3_lv2_rsx(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
         timer_mod(s->rsx_vblank_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PS3_RSX_VBLANK_NS);
 
+        /* The GPU fetches the ring on its own clock from here on. */
+        if (!s->rsx_pump_timer) {
+            s->rsx_pump_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                             ps3_rsx_pump, s);
+        }
+        timer_mod(s->rsx_pump_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PS3_RSX_PUMP_NS);
+
         info_report("ps3-rsx: context 0x%X: dma 0x%X, driver info 0x%X, "
                     "reports 0x%X; handler queue 0x%X",
                     PS3_RSX_CONTEXT_ID, s->rsx_dma, s->rsx_driver,
@@ -14026,6 +14863,9 @@ static bool ps3_lv2_rsx(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size,
 
         if (s->rsx_vblank_timer) {
             timer_del(s->rsx_vblank_timer);
+        }
+        if (s->rsx_pump_timer) {
+            timer_del(s->rsx_pump_timer);
         }
         s->rsx_context = 0;
         s->rsx_event_port = 0;
@@ -14772,10 +15612,13 @@ static void ps3_av_reply(PS3BootROMState *s, uint32_t cid, uint32_t status,
     }
     s->av_rx_len += total;
 
-    if (s->ppu_trace) {
-        info_report("ps3-av: reply cid 0x%08X status 0x%02X (%u byte(s))",
-                    cid, status, size);
-    }
+    /*
+     * Always: the AV handshake is what vsh.self spends its first seconds on,
+     * and a device that answers is indistinguishable from one that was never
+     * asked unless the exchange is visible without the whole PPU trace on.
+     */
+    info_report("ps3-av: reply cid 0x%08X status 0x%02X (%u byte(s))",
+                cid, status, size);
 }
 
 /* An event the device raises on its own: the reply bit stays clear. */
@@ -14798,9 +15641,7 @@ static void ps3_av_event(PS3BootROMState *s, uint32_t cid, const void *data,
     }
     s->av_rx_len += total;
 
-    if (s->ppu_trace) {
-        info_report("ps3-av: event 0x%08X (%u byte(s))", cid, size);
-    }
+    info_report("ps3-av: event 0x%08X (%u byte(s))", cid, size);
 }
 
 /*
@@ -15230,9 +16071,7 @@ static bool ps3_av_wake(PS3BootROMState *s, uint8_t *ram, uint64_t ram_size)
         if (!n) {
             return false;
         }
-        if (s->ppu_trace) {
-            info_report("ps3-av: %u byte(s) wake thread 0x%X", n, t->id);
-        }
+        info_report("ps3-av: %u byte(s) wake thread 0x%X", n, t->id);
         ps3_thread_finish_call(s, t, ram, ram_size, n);
         return true;
     }
@@ -15266,10 +16105,8 @@ static void ps3_av_parse(PS3BootROMState *s)
             at = s->av_tx_len;
             break;
         }
-        if (s->ppu_trace) {
-            info_report("ps3-av: command 0x%08X, %u byte(s)",
-                        ps3_be32(pkt + 4), size);
-        }
+        info_report("ps3-av: command 0x%08X, %u byte(s)",
+                    ps3_be32(pkt + 4), size);
         ps3_av_command(s, pkt);
         at += size;
     }
@@ -15592,6 +16429,145 @@ static void ps3_lv2_dump_range(uint8_t *ram, uint64_t ram_size,
 }
 
 /*
+ * The QGL containers: dev_flash/vsh/resource/qgl/*.qrc.  The XMB's own drawing
+ * modules (qglbase, raf, qgl_gaia_app, qgl_canyon_app) read and inflate these
+ * themselves, so the model's part is to serve the file intact; this check runs
+ * once per container so a tree that is missing a file, or holds one from
+ * another firmware, is named at the moment the loader asks for it instead of
+ * showing up later as a module that draws nothing.
+ *
+ * A container is one of two wrappers around a QRCF image:
+ *
+ *     QRCC | u32 unpacked length | zlib stream of a whole QRCF file
+ *     QRCF | u32 0x110           | the image itself (stored)
+ *
+ * and the image carries the tree at 0x40, a name pool at 0x10 (a repeated
+ * u32 followed by a NUL-terminated path), an attribute pool at 0x18 (plain
+ * NUL-separated names), and the resources' bytes from 0x30, length at 0x34.
+ */
+#define PS3_QRC_MAX  (16 << 20)
+
+static GHashTable *ps3_qgl_seen;
+
+static unsigned ps3_qrc_names(const uint8_t *img, size_t len,
+                              uint32_t start, uint32_t end)
+{
+    unsigned n = 0;
+    uint32_t at = start;
+
+    while (at + 5 < end && at + 5 < len) {
+        const uint8_t *nul = memchr(img + at + 4, 0, MIN(end, len) - at - 4);
+
+        if (!nul) {
+            break;
+        }
+        n++;
+        at = (uint32_t)(nul - img) + 1;
+    }
+    return n;
+}
+
+static void ps3_qgl_probe(PS3BootROMState *s, const char *host,
+                          const char *guest)
+{
+    g_autofree uint8_t *raw = NULL;
+    g_autofree uint8_t *img = NULL;
+    uint64_t size;
+    int fd;
+    ssize_t got;
+    size_t len;
+    bool stored;
+    uint32_t unpacked, pool, attrs, data, data_len;
+    unsigned names;
+
+    if (!host || !guest || !g_str_has_suffix(guest, ".qrc")) {
+        return;
+    }
+    if (!ps3_qgl_seen) {
+        ps3_qgl_seen = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                             g_free, NULL);
+    }
+    if (g_hash_table_contains(ps3_qgl_seen, guest)) {
+        return;
+    }
+    g_hash_table_add(ps3_qgl_seen, g_strdup(guest));
+
+    fd = g_open(host, O_RDONLY | O_BINARY, 0);
+    if (fd < 0) {
+        return;
+    }
+    size = lseek(fd, 0, SEEK_END);
+    if (size < 8 || size > PS3_QRC_MAX) {
+        close(fd);
+        return;
+    }
+    raw = g_malloc(size);
+    lseek(fd, 0, SEEK_SET);
+    got = read(fd, raw, size);
+    close(fd);
+    if (got != (ssize_t)size) {
+        info_report("ps3-ppu: qgl: %s: short read (%zd of %" PRIu64 ")",
+                    guest, got, size);
+        return;
+    }
+
+    unpacked = ps3_be32(raw + 4);
+    stored = !memcmp(raw, "QRCF", 4);
+    if (!stored && memcmp(raw, "QRCC", 4)) {
+        info_report("ps3-ppu: qgl: %s: not a QRC (first bytes %02X %02X %02X "
+                    "%02X)", guest, raw[0], raw[1], raw[2], raw[3]);
+        return;
+    }
+    if (!stored) {
+        uLongf out = unpacked;
+
+        if (!unpacked || unpacked > PS3_QRC_MAX) {
+            info_report("ps3-ppu: qgl: %s: QRCC names 0x%X byte(s) unpacked",
+                        guest, unpacked);
+            return;
+        }
+        img = g_malloc(out);
+        if (uncompress(img, &out, raw + 8, size - 8) != Z_OK ||
+            out != unpacked) {
+            info_report("ps3-ppu: qgl: %s: the zlib stream does not inflate "
+                        "to the 0x%X byte(s) its wrapper names", guest,
+                        unpacked);
+            return;
+        }
+        len = out;
+    } else {
+        img = g_steal_pointer(&raw);
+        len = size;
+    }
+
+    if (len < 0x38 || memcmp(img, "QRCF", 4)) {
+        info_report("ps3-ppu: qgl: %s: the image is not a QRCF container",
+                    guest);
+        return;
+    }
+    pool = ps3_be32(img + 0x10);
+    attrs = ps3_be32(img + 0x18);
+    data = ps3_be32(img + 0x30);
+    data_len = ps3_be32(img + 0x34);
+    names = ps3_qrc_names(img, len, pool, attrs);
+
+    if (!names || attrs <= pool || attrs > len || data > len ||
+        (uint64_t)data + data_len != len) {
+        info_report("ps3-ppu: qgl: %s: the container does not add up (names "
+                    "0x%X, attributes 0x%X, data 0x%X+0x%X of 0x%zX), %u "
+                    "name(s) past the pool", guest, pool, attrs, data,
+                    data_len, len, names);
+        return;
+    }
+    if (s->ppu_trace || g_getenv("PS3_TRACE_RES")) {
+        info_report("ps3-ppu: qgl: %s %s %" PRIu64 " -> 0x%zX byte(s), "
+                    "%u name(s), data 0x%X+0x%X", guest,
+                    stored ? "QRCF" : "QRCC", size, len, names, data,
+                    data_len);
+    }
+}
+
+/*
  * Assemble the .rco the resource loader is reading.  It reads the file in 8 KiB
  * chunks into one scratch buffer and the file is dropped from RAM when the next
  * chunk lands, so a dump has to be built from the reads themselves.  When the
@@ -15686,6 +16662,68 @@ static void ps3_lv2_rco_collect(PS3BootROMState *s, uint8_t *p, uint32_t got,
 
 static PS3BootROMState *ps3_pc_hook_state;
 static unsigned ps3_rco_entry_reports;
+
+/*
+ * The qgl caller chain: raf's entry that instantiates a qgl_base descriptor,
+ * qgl_base's initialiser, and the core that walks the descriptor's id list and
+ * calls the callback it carries at +0x10.  A run with PS3_QGL_TRACE set says
+ * which module reached them (lr), with what, and where a call through the
+ * descriptor actually landed - including the 0x700 vector a bctrl through an
+ * unfilled descriptor ends on.
+ */
+#define PS3_QGL_RAF_ENTRY     0xE845428
+#define PS3_QGL_INIT_ENTRY    0xE4A51F4
+#define PS3_QGL_CORE_ENTRY    0xE4A47E0
+
+static void ps3_qgl_trace(CPUState *cs, uint64_t pc)
+{
+    PS3BootROMState *s = ps3_pc_hook_state;
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    CPUPPCState *env = &cpu->env;
+    static unsigned n;
+    uint8_t *ram;
+    uint64_t ram_size;
+    const char *what;
+
+    if (!s || n >= 512) {
+        return;
+    }
+
+    switch (pc) {
+    case PS3_QGL_RAF_ENTRY:  what = "raf-if";  break;
+    case PS3_QGL_INIT_ENTRY: what = "qgl-init"; break;
+    case PS3_QGL_CORE_ENTRY: what = "qgl-core"; break;
+    case 0x700:              what = "vector";  break;
+    default:                 return;
+    }
+
+    ram = memory_region_get_ram_ptr(s->ram);
+    ram_size = memory_region_size(s->ram);
+    n++;
+    info_report("ps3-qgl: %s pc=0x%" PRIX64 " lr=0x%" PRIX64
+                " r3=0x%" PRIX64 " r4=0x%" PRIX64 " r5=0x%" PRIX64
+                " r6=0x%" PRIX64 " r7=0x%" PRIX64 " r8=0x%" PRIX64
+                " r9=0x%" PRIX64 " ctr=0x%" PRIX64, what, pc, env->lr,
+                (uint64_t)env->gpr[3], (uint64_t)env->gpr[4],
+                (uint64_t)env->gpr[5], (uint64_t)env->gpr[6],
+                (uint64_t)env->gpr[7], (uint64_t)env->gpr[8],
+                (uint64_t)env->gpr[9], (uint64_t)env->ctr);
+
+    if ((pc == PS3_QGL_RAF_ENTRY || pc == PS3_QGL_CORE_ENTRY ||
+         pc == PS3_QGL_INIT_ENTRY) && (uint64_t)env->gpr[3] + 0x50 <= ram_size) {
+        uint32_t obj = (uint32_t)env->gpr[3];
+        uint32_t cb = ps3_be32(ram + obj + 0x10);
+        uint32_t ctx = ps3_be32(ram + obj + 0xC);
+        uint32_t code = 0, toc = 0;
+
+        if (cb && (uint64_t)cb + 8 <= ram_size) {
+            code = ps3_be32(ram + cb);
+            toc = ps3_be32(ram + cb + 4);
+        }
+        info_report("ps3-qgl:   obj 0x%X: ctx 0x%X cb 0x%X -> code 0x%X "
+                    "toc 0x%X", obj, ctx, cb, code, toc);
+    }
+}
 
 /*
  * Two calls with the same four ranges and the same first bytes are the loader
@@ -15854,6 +16892,10 @@ static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
 
     if (!s) {
         return;
+    }
+
+    if (unlikely(g_getenv("PS3_QGL_TRACE"))) {
+        ps3_qgl_trace(cs, pc);
     }
     if (ps3_rco_watch.on) {
         ram = memory_region_get_ram_ptr(s->ram);
@@ -16330,7 +17372,8 @@ static void ps3_lv2_service(PS3BootROMState *s)
      * With the private dump on, watch the resource loader's inflate wrapper
      * itself: its entry is where the ranges it is handed can still be read.
      */
-    if (!ps3_pc_hook_state && (s->ppu_trace || g_getenv("PS3_DUMP_RCO"))) {
+    if (!ps3_pc_hook_state && (s->ppu_trace || g_getenv("PS3_DUMP_RCO") ||
+                               g_getenv("PS3_QGL_TRACE"))) {
         ps3_pc_hook_state = s;
         ps3_pc_hook_fn = ps3_rco_inflate_hook;
         info_report("ps3-ppu: rco-inflate: watching the wrapper entry at "
@@ -16366,9 +17409,16 @@ static void ps3_lv2_service(PS3BootROMState *s)
     {
         static uint32_t last_nr, last_lr, last_tid, repeat;
         static unsigned main_calls, ctx_calls;
+        static uint32_t ctx_nr, ctx_lr;
         uint32_t lr32 = (uint32_t)cpu->env.lr;
 
-        if (g_getenv("PS3_TRACE_MAIN") && s->thr_cur == 0 &&
+        /*
+         * The VSH's main thread is the one lv2 started at the image's entry
+         * and it keeps id 0; its slot does not stay 0, because the pool that
+         * the VSH starts takes the low slots as it grows.  Select on the id.
+         */
+        if (s->thr_cur >= 0 &&
+            g_getenv("PS3_TRACE_MAIN") && s->thr[s->thr_cur].id == 0 &&
             main_calls < 400) {
             main_calls++;
             info_report("ps3-ppu: main: call 0x%X from 0x%X (r3 0x%X, "
@@ -16384,18 +17434,25 @@ static void ps3_lv2_service(PS3BootROMState *s)
          * RSX context exists: what the main thread does between cellGcmInit
          * and the first frame is what says why there is no frame.
          */
-        if (g_getenv("PS3_TRACE_MAIN_CTX") && s->thr_cur == 0 &&
-            s->rsx_context && ctx_calls < 800) {
+        if (s->thr_cur >= 0 && g_getenv("PS3_TRACE_MAIN_CTX") &&
+            s->thr[s->thr_cur].id == 0 && s->rsx_context && ctx_calls < 800 &&
+            (nr != ctx_nr || lr32 != ctx_lr)) {
             ctx_calls++;
-            info_report("ps3-ppu: ctxmain: call 0x%X from 0x%X nip 0x%"
-                        PRIX64 " (r3 0x%X, r4 0x%X, r5 0x%X, r6 0x%X) "
-                        "sp 0x%X",
-                        nr, lr32, (uint64_t)cpu->env.nip,
+            ctx_nr = nr;
+            ctx_lr = lr32;
+            info_report("ps3-ppu: ctxmain: slot %d id 0x%X, call "
+                        "0x%X from 0x%X nip 0x%" PRIX64 " (r3 0x%X, r4 0x%X, "
+                        "r5 0x%X, r6 0x%X) sp 0x%X (stack 0x%X+0x%X)",
+                        s->thr_cur, s->thr[s->thr_cur].id,
+                        nr, lr32,
+                        (uint64_t)cpu->env.nip,
                         (uint32_t)cpu->env.gpr[3],
                         (uint32_t)cpu->env.gpr[4],
                         (uint32_t)cpu->env.gpr[5],
                         (uint32_t)cpu->env.gpr[6],
-                        (uint32_t)cpu->env.gpr[1]);
+                        (uint32_t)cpu->env.gpr[1],
+                        s->thr[s->thr_cur].stack_base,
+                        s->thr[s->thr_cur].stack_size);
         }
 
         if (nr == last_nr && lr32 == last_lr && s->thr_cur == last_tid) {
@@ -16407,6 +17464,32 @@ static void ps3_lv2_service(PS3BootROMState *s)
                             (uint32_t)cpu->env.gpr[3],
                             (uint32_t)cpu->env.gpr[4],
                             (uint32_t)cpu->env.gpr[5]);
+                if (g_getenv("PS3_TRACE_WAIT") && repeat == 64) {
+                    /*
+                     * A wait loop that never completes is only readable with
+                     * the object it polls: name the registers the loop keeps
+                     * its target and its pointer in, and the words around it.
+                     */
+                    uint32_t obj = (uint32_t)cpu->env.gpr[30];
+
+                    info_report("ps3-ppu: wait at 0x%X: r29 0x%X r30 0x%X "
+                                "r31 0x%X sp 0x%X", lr32,
+                                (uint32_t)cpu->env.gpr[29], obj,
+                                (uint32_t)cpu->env.gpr[31],
+                                (uint32_t)cpu->env.gpr[1]);
+                    if ((uint64_t)obj + 0x20 <= ram_size) {
+                        info_report("ps3-ppu: wait: [0x%X] 0x%X 0x%X 0x%X "
+                                    "0x%X 0x%X 0x%X 0x%X 0x%X", obj,
+                                    ps3_be32(ram + obj),
+                                    ps3_be32(ram + obj + 4),
+                                    ps3_be32(ram + obj + 8),
+                                    ps3_be32(ram + obj + 12),
+                                    ps3_be32(ram + obj + 16),
+                                    ps3_be32(ram + obj + 20),
+                                    ps3_be32(ram + obj + 24),
+                                    ps3_be32(ram + obj + 28));
+                    }
+                }
                 if (g_getenv("PS3_DUMP_RCO") && repeat == 64) {
                     /* The loop's own code, the buffer it polls and the RSX's
                      * handshake areas, once, so the wait can be read. */
@@ -17113,6 +18196,45 @@ static void ps3_lv2_service(PS3BootROMState *s)
             }
             ret = PS3_LV2_ESRCH;
             break;
+        }
+        /*
+         * A cond hand-off that repeats forever is invisible in a trace that
+         * prints every wake: the same two threads answer each other and the
+         * log never says which guest code loops.  Count the waits per
+         * condition, name the caller that first used it, and report the count
+         * every few thousand waits, so the loop points at its own code without
+         * the log growing with it.
+         */
+        if (s->ppu_trace) {
+            static uint32_t wait_count[PS3_COND_MAX];
+            static struct {
+                uint32_t id;
+                uint64_t lr;
+            } seen[64];
+            static unsigned nseen;
+            unsigned slot = (unsigned)c, k;
+            uint64_t lr = (uint64_t)cpu->env.lr;
+            bool known = false;
+
+            wait_count[slot]++;
+            for (k = 0; k < nseen; k++) {
+                if (seen[k].id == s->cond[slot].id && seen[k].lr == lr) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known && nseen < ARRAY_SIZE(seen)) {
+                seen[nseen].id = s->cond[slot].id;
+                seen[nseen].lr = lr;
+                nseen++;
+                info_report("ps3-ppu: lv2: cond_wait 0x%X from lr 0x%" PRIX64
+                            " (thread %d, wait #%u)", s->cond[slot].id, lr,
+                            s->thr_cur, wait_count[slot]);
+            } else if (!(wait_count[slot] % 4096)) {
+                info_report("ps3-ppu: lv2: cond 0x%X: %u waits, last from "
+                            "lr 0x%" PRIX64 " (thread %d)",
+                            s->cond[slot].id, wait_count[slot], lr, s->thr_cur);
+            }
         }
         /* lv2 releases the mutex as part of the wait. */
         s->mtx[m].owner = 0;
@@ -19550,11 +20672,13 @@ static void ps3_lv2_service(PS3BootROMState *s)
         }
 
         {
-            char guest_path[160];
+            char guest_path[160] = "";
 
             if (ps3_lv2_guest_string(ram, ram_size, a0, guest_path,
-                                     sizeof(guest_path)) &&
-                gfd - 3 >= 0 && gfd - 3 < PS3_LV2_FD_MAX) {
+                                     sizeof(guest_path))) {
+                ps3_qgl_probe(s, host, guest_path);
+            }
+            if (gfd - 3 >= 0 && gfd - 3 < PS3_LV2_FD_MAX && guest_path[0]) {
                 g_free(s->lv2_fd_path[gfd - 3]);
                 s->lv2_fd_path[gfd - 3] = g_strdup(guest_path);
             }
@@ -22248,13 +23372,15 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
 
     if (s->rom_file && s->own_rom) {
         /*
-         * own-rom=on is the promise that no boot ROM is used.  Loading the
-         * image anyway would quietly put Sony's code back in the machine, so
-         * it is refused outright rather than ignored.
+         * The built-in opener is the default, and own-rom=on is the promise
+         * that no boot ROM is used.  Loading the image anyway would quietly
+         * put Sony's code back in the machine, so it is refused outright
+         * rather than ignored.  The ROM replay is still available, but only
+         * by asking for it: own-rom=off.
          */
-        error_setg(errp, "ps3-boot-rom: own-rom=on and -bios %s were both "
-                   "given; own-rom means the mask ROM is not used at all, so "
-                   "drop one of the two", s->rom_file);
+        error_setg(errp, "ps3-boot-rom: -bios %s given, but the model uses "
+                   "its built-in opener by default; pass own-rom=off to "
+                   "replay a mask ROM", s->rom_file);
         return;
     }
 
@@ -22736,9 +23862,13 @@ static int ps3_spu_stage(PS3BootROMState *s)
     }
 
     ps3_spu_set_trace(s->spu, s->spu_trace);
+    ps3_rom_attach_loader_channels(s);
 
     rc = ps3_spu_run(s->spu, entry, s->stage_limit ?: (1 << 22),
                      why, sizeof(why));
+
+    ps3_rom_report_loader_channels(s->spu);
+    ps3_rom_report_channel_map(s->spu);
 
     info_report("ps3-spu-stage: %s entry=0x%X segments=%u bytes=%" PRIu64
                 " steps=%" PRIu64 " result=%s stop=%u :: %s",
@@ -23156,6 +24286,17 @@ static const char *ps3_ppu_vector_name(uint64_t nip)
     }
 }
 
+/*
+ * The tick is the model's only window into a guest thread that has stopped
+ * making progress, so a threaded VSH run wants it whether or not the run is
+ * bounded: `ppu-ticks` says when to stop, not whether to watch.
+ */
+static bool ps3_ppu_tick_wanted(PS3BootROMState *s)
+{
+    return s->ppu_tick_ns &&
+           (s->ppu_ticks || (s->vsh_run && s->threads_enabled));
+}
+
 static void ps3_ppu_tick(void *opaque)
 {
     PS3BootROMState *s = opaque;
@@ -23223,13 +24364,29 @@ static void ps3_ppu_tick(void *opaque)
                         }
                     }
                     info_report("ps3-ppu:   r1=0x%X r2=0x%X r3=0x%" PRIX64
-                                " r11=0x%" PRIX64 " r12=0x%" PRIX64
+                                " r4=0x%" PRIX64 " r5=0x%" PRIX64
+                                " r6=0x%" PRIX64 " r7=0x%" PRIX64
+                                " r8=0x%" PRIX64 " r9=0x%" PRIX64
+                                " r10=0x%" PRIX64 " r11=0x%" PRIX64
+                                " r12=0x%" PRIX64
+                                " r26=0x%" PRIX64 " r27=0x%" PRIX64
+                                " r28=0x%" PRIX64
                                 " r29=0x%" PRIX64 " r30=0x%" PRIX64
                                 " r31=0x%" PRIX64 " ctr=0x%" PRIX64,
                                 sp, (uint32_t)cpu->env.gpr[2],
                                 (uint64_t)cpu->env.gpr[3],
+                                (uint64_t)cpu->env.gpr[4],
+                                (uint64_t)cpu->env.gpr[5],
+                                (uint64_t)cpu->env.gpr[6],
+                                (uint64_t)cpu->env.gpr[7],
+                                (uint64_t)cpu->env.gpr[8],
+                                (uint64_t)cpu->env.gpr[9],
+                                (uint64_t)cpu->env.gpr[10],
                                 (uint64_t)cpu->env.gpr[11],
                                 (uint64_t)cpu->env.gpr[12],
+                                (uint64_t)cpu->env.gpr[26],
+                                (uint64_t)cpu->env.gpr[27],
+                                (uint64_t)cpu->env.gpr[28],
                                 (uint64_t)cpu->env.gpr[29],
                                 (uint64_t)cpu->env.gpr[30],
                                 (uint64_t)cpu->env.gpr[31],
@@ -23255,16 +24412,22 @@ static void ps3_ppu_tick(void *opaque)
                         }
                         {
                             static const char *const what[] = {
-                                "r11", "r12", "ctr", "r0",
+                                "r9", "r11", "r12", "ctr", "r0",
                             };
-                            uint64_t ptr[4];
+                            uint64_t ptr[5];
                             unsigned r;
 
-                            ptr[0] = cpu->env.gpr[11];
-                            ptr[1] = cpu->env.gpr[12];
-                            ptr[2] = cpu->env.ctr;
-                            ptr[3] = cpu->env.gpr[0];
-                            for (r = 0; r < 4; r++) {
+                            /*
+                             * r9 is the callee's descriptor in every `bctrl`
+                             * the PPU ABI emits, so it is the slot that names
+                             * the registration the caller was looking for.
+                             */
+                            ptr[0] = cpu->env.gpr[9];
+                            ptr[1] = cpu->env.gpr[11];
+                            ptr[2] = cpu->env.gpr[12];
+                            ptr[3] = cpu->env.ctr;
+                            ptr[4] = cpu->env.gpr[0];
+                            for (r = 0; r < 5; r++) {
                                 uint32_t a = (uint32_t)ptr[r];
 
                                 if ((uint64_t)a + 0x10 > ram_size) {
@@ -23294,6 +24457,57 @@ static void ps3_ppu_tick(void *opaque)
                                            ps3_be32(ram + sp + 4 * n));
                         }
                         info_report("ps3-ppu:   frame%s", words);
+                    }
+                    /*
+                     * A call through an unfilled slot leaves its receiver in
+                     * the callee's r26, which that prologue saves at 0xB0(r1).
+                     * The object itself says whether it is a qglbase global or
+                     * a heap instance, and the frame chain above it names the
+                     * module that built it.
+                     */
+                    if ((uint64_t)sp + 0x100 <= ram_size) {
+                        uint32_t recv = ps3_be32(ram + sp + 0xB0);
+                        unsigned o;
+
+                        info_report("ps3-ppu:   receiver r26=0x%X", recv);
+                        {
+                            /*
+                             * qglbase's own import thunk loads its slot from
+                             * 0xE4FBC20 (allocator index 8); raf's copy of the
+                             * qgl_base import lives at 0xE88BCC8.  Reading both
+                             * at the fault says which table handed out the
+                             * callee, without another run.
+                             */
+                            static const uint32_t slots[] = {
+                                0xE4FBC20, 0xE4FBC24, 0xE88BCC8,
+                            };
+                            unsigned q;
+
+                            for (q = 0; q < 3; q++) {
+                                uint32_t slot = slots[q];
+                                uint32_t opd, code = 0;
+
+                                if ((uint64_t)slot + 4 > ram_size) {
+                                    continue;
+                                }
+                                opd = ps3_be32(ram + slot);
+                                if (opd && (uint64_t)opd + 8 <= ram_size) {
+                                    code = ps3_be32(ram + opd);
+                                }
+                                info_report("ps3-ppu:   slot 0x%X = 0x%X"
+                                            " (code 0x%X)", slot, opd, code);
+                            }
+                        }
+                        if (recv && (uint64_t)recv + 0x50 <= ram_size) {
+                            for (o = 0; o < 0x50; o += 0x10) {
+                                info_report("ps3-ppu:     +%02X:%08X %08X"
+                                            " %08X %08X", o,
+                                            ps3_be32(ram + recv + o),
+                                            ps3_be32(ram + recv + o + 4),
+                                            ps3_be32(ram + recv + o + 8),
+                                            ps3_be32(ram + recv + o + 12));
+                            }
+                        }
                     }
                     /*
                      * The ABI's registers are only half the picture when the
@@ -23488,6 +24702,56 @@ static void ps3_ppu_tick(void *opaque)
  * the normal case is a straight copy.  A high virtual address is reduced when
  * that is what makes it fit.
  */
+/*
+ * A SELF section table entry: where that section's bytes are in this file.
+ *
+ * The table is what the console's loader reads, and it is not always
+ * header_len + the ELF's p_offset: a container rebuilt with differently sized
+ * loaders inside packs its sections (a rebuilt lv0 comes back with its two
+ * segments at 0x500/0x1170 instead of 0x10500/0x20500) while the ELF header it
+ * carries keeps describing the layout it was built from.  Both forms are
+ * valid SELFs, so the table decides where a segment's bytes are and the ELF
+ * header supplies what to do with them.
+ */
+typedef struct {
+    uint64_t offset;
+    uint64_t size;
+    uint32_t type;              /* 2 = code/data, 1 = metadata */
+} PS3SelfSection;
+
+static bool ps3_self_sections(const uint8_t *img, size_t len,
+                              PS3SelfSection *out, unsigned *count)
+{
+    uint32_t meta = ps3_be32(img + 0x0C);
+    uint64_t metah = (uint64_t)meta + 0x60;   /* control info + the ERH */
+    uint32_t n;
+
+    if (len < 0x280 || memcmp(img, "SCE\0", 4)) {
+        return false;
+    }
+    if (metah + 0x20 > len) {
+        return false;
+    }
+    n = ps3_be32(img + metah + 0x0C);
+    if (!n || n > 16 || metah + 0x20 + (uint64_t)n * 0x30 > len) {
+        return false;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        const uint8_t *e = img + metah + 0x20 + (uint64_t)i * 0x30;
+        uint64_t off = ps3_be64(e);
+        uint64_t size = ps3_be64(e + 8);
+
+        if (off > len || size > len - off) {
+            return false;
+        }
+        out[i].offset = off;
+        out[i].size = size;
+        out[i].type = ps3_be32(e + 0x10);
+    }
+    *count = n;
+    return true;
+}
+
 static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
 {
     g_autoptr(GError) err = NULL;
@@ -23536,6 +24800,17 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
         return false;
     }
 
+    {
+    const bool is_self = len >= 4 && !memcmp(img, "SCE\0", 4);
+    PS3SelfSection sec[16];
+    unsigned nsec = 0, si = 0;
+    const bool use_sec = is_self && ps3_self_sections(img, len, sec, &nsec);
+
+    if (use_sec) {
+        info_report("ps3-ppu: %s: SELF section table, %u section(s)",
+                    s->ppu_elf, nsec);
+    }
+
     for (unsigned i = 0; i < phnum; i++) {
         const uint8_t *ph = elf + phoff + (size_t)i * phentsize;
         uint32_t type = ps3_be32(ph + 0x00);
@@ -23550,6 +24825,26 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
 
         if (type != 1) {
             continue;
+        }
+
+        /*
+         * In a SELF the section table, not the carried ELF header, says where
+         * the bytes are.  Pair the PT_LOAD entries with the code/data
+         * sections in order: a rebuilt container packs them, a stock one
+         * leaves them at header_len + p_offset, and both read correctly.
+         */
+        if (use_sec) {
+            while (si < nsec && sec[si].type != 2) {
+                si++;
+            }
+            if (si >= nsec) {
+                info_report("ps3-ppu: %s: segment %u has no SELF section",
+                            s->ppu_elf, i);
+                break;
+            }
+            file_off = sec[si].offset;
+            filesz = sec[si].size;
+            si++;
         }
 
         if (file_off > len || filesz > len - file_off || filesz > memsz) {
@@ -23579,6 +24874,7 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
         info_report("ps3-ppu: segment %u: 0x%" PRIX64 " + 0x%" PRIX64
                     " -> RAM 0x%" PRIX64 " (filesz 0x%" PRIX64 ")",
                     i, vaddr, memsz, pa, filesz);
+    }
     }
 
     if (!loaded) {
@@ -23640,7 +24936,7 @@ static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp)
                 "0x%" PRIX64 " bytes; PPU started", s->ppu_elf, entry,
                 loaded, bytes);
 
-    if (s->ppu_tick_ns) {
+    if (ps3_ppu_tick_wanted(s)) {
         s->ppu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_ppu_tick, s);
         timer_mod(s->ppu_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ppu_tick_ns);
@@ -24015,7 +25311,7 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         s->ppu_last_pc = code;
         ps3_ppu_reset_register(s);
 
-        if (s->ppu_ticks) {
+        if (ps3_ppu_tick_wanted(s)) {
             s->ppu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ps3_ppu_tick, s);
             timer_mod(s->ppu_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ppu_tick_ns);
@@ -24033,6 +25329,10 @@ static const Property ps3_rom_properties[] = {
                      MemoryRegion *),
     DEFINE_PROP_STRING("ppu-elf", PS3BootROMState, ppu_elf),
     DEFINE_PROP_STRING("ppu-dump", PS3BootROMState, ppu_dump),
+    DEFINE_PROP_UINT32("stop-pc", PS3BootROMState, stop_pc, 0x400),
+    DEFINE_PROP_BOOL("exit-on-stop", PS3BootROMState, exit_on_stop, false),
+    DEFINE_PROP_BOOL("no-chain-fallback", PS3BootROMState, no_chain_fallback,
+                     false),
     DEFINE_PROP_UINT32("ppu-entry", PS3BootROMState, ppu_entry, 0),
     DEFINE_PROP_UINT64("ppu-ticks", PS3BootROMState, ppu_ticks, 0),
     DEFINE_PROP_UINT64("ppu-tick-ns", PS3BootROMState, ppu_tick_ns,
@@ -24063,7 +25363,10 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_UINT64("emmc-size", PS3BootROMState, emmc_size, 12 * GiB),
     DEFINE_PROP_STRING("boot-medium", PS3BootROMState, boot_medium),
     DEFINE_PROP_BOOL("boot-logo", PS3BootROMState, boot_logo, true),
-    DEFINE_PROP_BOOL("own-rom", PS3BootROMState, own_rom, false),
+    /* The built-in opener is the default: no Sony code is needed to open,
+     * decrypt and verify the chain.  own-rom=off is the explicit opt-in to the
+     * mask-ROM replay, and requires -bios. */
+    DEFINE_PROP_BOOL("own-rom", PS3BootROMState, own_rom, true),
     /* Boot with the EEPROM's recover flag set, i.e. into the recovery loop. */
     DEFINE_PROP_BOOL("recover", PS3BootROMState, recover_prop, false),
 
@@ -24085,8 +25388,14 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_BOOL("vsh-run", PS3BootROMState, vsh_run, false),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
+    /* Address a container at an exact flash offset; UINT64_MAX leaves it to
+     * the name lookup and the two fixed slots. */
+    DEFINE_PROP_UINT64("container-offset", PS3BootROMState, container_at,
+                       UINT64_MAX),
     DEFINE_PROP_STRING("readout", PS3BootROMState, readout),
     DEFINE_PROP_STRING("readout-file", PS3BootROMState, readout_file),
+    /* 32 bytes, read order: the channel-66 reads the mask ROM performed. */
+    DEFINE_PROP_STRING("ch66-capture", PS3BootROMState, ch66_capture),
     DEFINE_PROP_STRING("nand-readout", PS3BootROMState, nand_readout),
     DEFINE_PROP_STRING("nand-readout-file", PS3BootROMState,
                        nand_readout_file),
@@ -24095,6 +25404,38 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_BOOL("pad-selftest", PS3BootROMState, pad_selftest, false),
     DEFINE_PROP_BOOL("spu", PS3BootROMState, spu_run, true),
     DEFINE_PROP_BOOL("spu-trace", PS3BootROMState, spu_trace, false),
+    /* Execute the mask ROM over the selected container; its tag check decides. */
+    DEFINE_PROP_BOOL("rom-exec", PS3BootROMState, rom_exec, false),
+    /*
+     * A stage started by the boot ROM has no lv2 to post its mailbox, so a
+     * payload that waits on channel 0x1D polls forever.  This feeds the words
+     * the producer would have written: comma-separated, up to the mailbox's
+     * four slots, e.g. `spu-inbox=0x0,0x0`.
+     */
+    DEFINE_PROP_STRING("spu-inbox", PS3BootROMState, spu_inbox),
+    /*
+     * The same producer, modelled as the peer rather than as an injection: lv2's
+     * end of the mailbox answers each empty ch29 read with `mbox-peer-msg` (a
+     * two-word message by default), so the stage's poll releases on its own and
+     * the words are only handed over when the stage asks for them.
+     */
+    DEFINE_PROP_BOOL("mbox-peer", PS3BootROMState, mbox_peer, true),
+    DEFINE_PROP_STRING("mbox-peer-msg", PS3BootROMState, mbox_peer_msg),
+    /*
+     * The loader's private window.  0x40 is written by the stage (the ROM sends
+     * 1 there at 0x3C4, just before the hand-off), 0x44 is its data out, and
+     * both inbound directions are empty unless a producer is named here: 0x41
+     * takes status words, 0x43 a finite feed.  Comma-separated hex, e.g.
+     * `loader-feed=0x11223344,0x55667788`.
+     */
+    DEFINE_PROP_STRING("loader-status", PS3BootROMState, loader_status),
+    DEFINE_PROP_STRING("loader-feed", PS3BootROMState, loader_feed),
+    /*
+     * Room the host posts on 0x44, the stage's data-out direction.  Default 0:
+     * the channel reports a depth of zero and a write blocks there, just as a
+     * read of 0x41 blocks before status is posted.  `loader-sink=4` opens it.
+     */
+    DEFINE_PROP_UINT32("loader-sink", PS3BootROMState, loader_sink, 0),
     DEFINE_PROP_STRING("ls-dump", PS3BootROMState, ls_dump),
     DEFINE_PROP_STRING("prx-dump", PS3BootROMState, prx_dump),
     DEFINE_PROP_UINT64("flash-base", PS3BootROMState, flash_base, 0x20000000),
