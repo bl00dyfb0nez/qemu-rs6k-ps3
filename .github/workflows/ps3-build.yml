@@ -79,6 +79,7 @@ jobs:
           python3 -m venv .venv-tests
           .venv-tests/bin/pip install --quiet pycryptodome
           .venv-tests/bin/python scripts/ps3_romexec_sweep_test.py
+          .venv-tests/bin/python scripts/ps3_r7_inversion_test.py
 
       - name: Upload the binary
         uses: actions/upload-artifact@v6
@@ -105,6 +106,7 @@ jobs:
               mingw-w64-ucrt-x86_64-glib2
               mingw-w64-ucrt-x86_64-pixman
               mingw-w64-ucrt-x86_64-python
+              mingw-w64-ucrt-x86_64-pip
               mingw-w64-ucrt-x86_64-SDL2
               mingw-w64-ucrt-x86_64-git
           - arch: arm64
@@ -119,6 +121,7 @@ jobs:
               mingw-w64-clang-aarch64-python
               mingw-w64-clang-aarch64-SDL2
               mingw-w64-clang-aarch64-git
+              mingw-w64-clang-aarch64-pip
     steps:
       - uses: actions/checkout@v5
 
@@ -153,6 +156,7 @@ jobs:
         run: |
           python -m pip install --quiet pycryptodome
           python scripts/ps3_romexec_sweep_test.py
+          python scripts/ps3_r7_inversion_test.py
 
       - name: Upload the binary
         uses: actions/upload-artifact@v6
