@@ -270,6 +270,23 @@ def main():
         check("... and refuses a short readout",
               sweep.container_crypt(sealed, body, ro[:16]), False)
 
+        # The two header counts are not compared by the ROM: +0x10 is the block
+        # count, +0x00 the number of trailing encrypted blocks, clamped when
+        # larger.  Both openers in the model accept a header where they differ
+        # (.tmp/probes/counts_vs_rom.py), so the reader must too - and must
+        # still apply the gate when +0x00 is smaller.
+        h_up = bytearray(hdr)
+        h_up[0x00:0x04] = (4).to_bytes(4, "big")
+        sealed_up, body_up = seal_container(kp, bytes(h_up), plain)
+        check("size1 above the count is clamped, not refused",
+              sweep.container_crypt(sealed_up, body_up, ro), True)
+        h_down = bytearray(hdr)
+        h_down[0x00:0x04] = (2).to_bytes(4, "big")
+        sealed_down, body_down = seal_container(kp, bytes(h_down), plain)
+        check("size1 below the count leaves the first block in the clear, so "
+              "an all-encrypted body is refused",
+              sweep.container_crypt(sealed_down, body_down, ro), False)
+
     # The wait must not end on the map line: that is what cut the sample
     # payloads off at the ROM verdict before the fix.
     check("channel map does not end the payload wait",

@@ -9,6 +9,16 @@ the same place or even the same console's sealing:
     lv0ldr.2   the container the ROM opens at the boot slot (0xFC0000 on NOR);
                it carries no name string, so only the fixed slot finds it
 
+A NAND dump is read as its own medium, not as a large NOR: a software dump
+starts 0x40000 below flash, so metldr lands at 0x840 and the flash 0x0 slot
+lv0ldr occupies is not in the dump, leaving one fixed slot instead of two.
+
+A console's twin images are swept together when `--dump` names them:
+
+    py scripts/ps3_romexec_sweep.py --rom-exec --no-samples \
+        --dump CECH3001A.bin --dump CECH4201A.NAND.BIN \
+        --dump CECH4301C-verylate.NOR.BIN
+
 The model can be pointed at either one exactly (`container-offset`).  The
 verdict is the model's built-in opener by default - the same open, decrypt and
 tag-check the mask ROM performs, run as the model's own code with no `-bios`
@@ -89,6 +99,21 @@ FLASH_SIZE = 16 * 1024 * 1024
 
 # The two slots the boot chain fixes before it has parsed anything.
 FIXED_SLOTS = ((0x000840, "metldr.2"), (0xFC0000, "lv0ldr.2"))
+
+#
+# A NAND dump is a different medium, not a bigger NOR.  In flash, metldr sits
+# behind the block header at 0x40840 and lv0ldr at 0x0; a software dump made
+# from GameOS starts 0x40000 below flash, so the first container lands at 0x840
+# and flash 0x0 - lv0ldr's slot - is not in the dump at all.
+#
+NAND_FIXED_SLOTS = ((0x000840, "metldr.2"),)
+
+
+def dump_slots(path):
+    """The fixed slots of a dump's medium: a 16 MiB NOR chip, or NAND."""
+    if os.path.getsize(path) == FLASH_SIZE:
+        return FIXED_SLOTS
+    return NAND_FIXED_SLOTS
 
 #
 # A sample console's containers, with the key each is sealed under.  They are
@@ -232,15 +257,21 @@ def container_crypt_kp(hdr, body, kp):
     """
     if AES is None or len(kp) != 16 or len(hdr) != HEADER:
         return False
-    n = len(body) // 16
-    if not n or len(body) != n * 16:
+    n = struct.unpack(">I", hdr[0x10:0x14])[0] if len(hdr) >= 0x14 else 0
+    if not n or n > MAX_BLOCKS or len(body) < n * 16:
         return False
+    # The Size1 gate: the last `encrypted' blocks carry a keystream, the ones
+    # before it are stored as the plaintext the ROM copies through.
+    encrypted = min(struct.unpack(">I", hdr[0:4])[0], n)
 
     plain = bytearray()
     for i in range(n):
+        ct = body[i * 16:(i + 1) * 16]
+        if i < n - encrypted:
+            plain += ct
+            continue
         ctr = struct.pack(">I", n - i) + hdr[0x04:0x10]
-        plain += xor_bytes(body[i * 16:(i + 1) * 16],
-                           AES.new(kp, AES.MODE_ECB).encrypt(ctr))
+        plain += xor_bytes(ct, AES.new(kp, AES.MODE_ECB).encrypt(ctr))
 
     chain = bytes(16)
     for blk in (hdr[0x00:0x10], hdr[0x10:0x20], hdr[0x20:0x30]):
@@ -334,7 +365,7 @@ def match_matrix():
         if not os.path.exists(path):
             continue
         flash = open(path, "rb").read()
-        for slot, label in FIXED_SLOTS:
+        for slot, label in dump_slots(path):
             ok, blocks, _ = header_ok(flash, slot)
             if not ok:
                 continue
@@ -433,16 +464,27 @@ def qemu_env():
 
 
 def header_ok(flash, off):
-    """The same two fields the model checks, plus the span."""
+    """The ROM's header rule: +0x10 counts, +0x00 is clamped to it.
+
+    `ps3_rom_open()` in rs6000_ps3.c reads the block count from +0x10 and the
+    number of trailing encrypted blocks from +0x00, clamping the latter when it
+    is larger; it does not compare them.  A model run of both openers on a
+    header where they disagree opens the container
+    (`.tmp/probes/counts_vs_rom.py`), so requiring the two to match - which this
+    did - refused something the console accepts.
+
+    Returns (ok, block count, encrypted blocks); the third value is what the
+    header asked for, before the clamp, so a caller can report it.
+    """
     if off + 0x40 > len(flash):
         return False, 0, 0
-    blocks = be32(flash, off)
-    total = be32(flash, off + 0x10)
-    if blocks != total or not blocks or blocks > MAX_BLOCKS:
-        return False, blocks, total
+    encrypted = be32(flash, off)
+    blocks = be32(flash, off + 0x10)
+    if not blocks or blocks > MAX_BLOCKS:
+        return False, 0, encrypted
     if off + HEADER + blocks * 16 > len(flash):
-        return False, blocks, total
-    return True, blocks, total
+        return False, blocks, encrypted
+    return True, blocks, encrypted
 
 
 def asecure_entries(flash):
@@ -460,7 +502,7 @@ def asecure_entries(flash):
     return out
 
 
-def find_containers(flash):
+def find_containers(flash, slots=FIXED_SLOTS):
     """Every validated loader container, with the name it is known by."""
     found = {}
 
@@ -469,7 +511,7 @@ def find_containers(flash):
         if ok:
             found[off] = {"name": name, "source": "asecure_loader table"}
 
-    for slot, label in FIXED_SLOTS:
+    for slot, label in slots:
         ok, blocks, _ = header_ok(flash, slot)
         if ok:
             found.setdefault(slot, {"name": label, "source": "fixed slot"})
@@ -487,8 +529,8 @@ def find_containers(flash):
     out = []
     for off in sorted(found):
         rec = dict(found[off], offset=off)
-        ok, blocks, total = header_ok(flash, off)
-        rec.update(blocks=blocks, total=total, ok=ok,
+        ok, blocks, encrypted = header_ok(flash, off)
+        rec.update(blocks=blocks, encrypted=encrypted, ok=ok,
                    size=HEADER + blocks * 16,
                    tag=flash[off + 0x30:off + 0x40].hex(),
                    kdf=hashlib.sha256(flash[off + 0x20:off + 0x30])
@@ -861,8 +903,8 @@ def main():
     ap.add_argument("--dump", action="append", default=None,
                     help="a NOR dump (default: both 4301C dumps)")
     ap.add_argument("--readout", default=None,
-                    help="a 32-byte channel-66 readout; omit for the "
-                         "zero-key control")
+                    help="a 32-byte channel-66 readout (PCK0); omit for "
+                         "the zero-key control")
     ap.add_argument("--control", action="store_true",
                     help="also point at 0xFC0040, a misaligned address, to "
                          "show that the offset is not cosmetic")
@@ -894,10 +936,10 @@ def main():
     for dump in dumps:
         flash = open(dump, "rb").read()
         name = os.path.basename(dump)
-        if len(flash) != FLASH_SIZE:
-            sys.stderr.write("%s is not a 16 MiB NOR image\n" % name)
+        if len(flash) < 0x900:
+            sys.stderr.write("%s is too small to hold a container\n" % name)
             return 4
-        containers = find_containers(flash)
+        containers = find_containers(flash, dump_slots(dump))
         print("%s: %d container%s" % (name, len(containers),
                                       "" if len(containers) == 1 else "s"))
         for c in containers:

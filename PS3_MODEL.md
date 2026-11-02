@@ -74,19 +74,31 @@ fingerprints).
 ### ch66 is the console's key; PCK1 is carried by metldr.2
 
 The 32 bytes the boot path calls channel 66 are what the SPU's own channel
-returns; the mask ROM reads them at 0x148, expands the key ladder from them and
-opens the medium's first container with it.  They are **per console**, not a
-public key: the same 32 bytes open only the containers sealed for that console.
+returns, and their source is the on-die eFuse bus - not flash.  The Cell's mask
+ROM (the 0x400-byte SPU ROM baked into the die) issues the reads at 0x148,
+expands the key ladder from them and unwraps the medium's first container with
+it; at 0x3C4 it locks the isolated SPU with `wrch $ch64,$1` so the key can
+never be read again, and from 0x3C8 it wipes the local store.  A dump therefore
+holds only the sealed blobs the key opens, never the key.  They are **per
+console**, not a public key: the same 32 bytes open only the containers sealed for that console.
 Measured here, the PC tool's readout opens that console's `lv0ldr` and `metldr`
 (MAC PASS) and both containers of `CECH4301C.NOR.BIN` fail (MAC FAIL), as do
 CECHL's.  What is public is the container format and the published package key,
 not a console's readout.  No NOR/NAND/eMMC dump carries it.
 
+The model reproduces the lock by exhaustion rather than by watching the write:
+it serves the eight reads once per boot, then returns zero and an empty
+`rchcnt` on channel 66 for the rest of the run, which is the lock's
+guest-visible effect.  It does not key that state off `wrch $ch64` itself.
+
 The per-console keys are one and two levels in:
 
-1. **ch66 opens `metldr.2`** - the asecure_loader container the mask ROM is
-   pointed at on both media (on NOR the model also finds `lv0ldr.2` at
-   0xFC0000, which is the bootldr slot).  **metldr carries PCK1**, the 48-byte
+1. **ch66 opens the medium's bootldr** - NOR 0xFC0000, NAND flash 0 - and that
+   carries lv0, which opens `metldr.2` in the asecure_loader region.  Both
+   containers are sealed under the same per-console key, which is why the
+   model's sweep can test one readout against either; the row that says the ROM
+   opens `metldr.2` is a decryption test, not the boot order.  **metldr carries
+   PCK1**, the 48-byte
    per_console_root_key_1 (32 key + 16 RIV): it copies it into local store
    0x00..0x30 and `isoldr` clears it.  PCK1 is what the ATA and flash ladders
    are run on, and what an HDD image's key sector is wrapped under.
@@ -262,6 +274,7 @@ reserved channel is counted as an access the map does not define.
 | --- | --- |
 | `hw/ppc/rs6000_ps3.c` | machine `rs6000-ps3`: `ps3-mic`, `ps3-boot-rom` (mask ROM, container opener, register window), lv2 services, RSX front end, `ps3-vga` scanout |
 | `hw/ppc/ps3_spu.c`, `ps3_spu.h`, `ps3_spu_isa.h` | SPU interpreter, the 128-entry channel map with per-channel accounting, MFC transfers, instruction tables |
+| `hw/ppc/ps3_eep.c`, `ps3_eep.h`, `ps3_eep_image.h` | syscon EEPROM: the documented NVS fields, the console's own 32 KiB readout compiled in, guest writes |
 | `hw/ppc/ps3_self.c`, `ps3_self.h` | SELF opener (ERK/RIV ladder, CTR sections) |
 | `hw/ppc/ps3_aes/` | AES-128/256, the ATA and encdec ladders, XTS over HDD sectors |
 | `hw/ppc/ps3_vga.c`, `ps3_vga.h` | display: boot text, wordmark, HDMI EDID, guest scanout |
@@ -326,6 +339,35 @@ guest's sound (`build-ps3` builds `dsound` too, but a display backend makes it
 the one build that is enough on its own).  The model itself is identical in
 both trees.
 
+A VSH boot in that window:
+
+```sh
+build-ps3-gui/qemu-system-ppc64.exe -M rs6000-ps3 -display sdl     -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on     -global ps3-boot-rom.own-rom=on     -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin     -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img     -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
+```
+
+The window comes up as the console's screen: `PS3 BOOT`, the chain line
+(`vsh: 2 segment(s), 7291232 bytes mapped into RAM, entering`), the container
+verification, the RSX wordmark and `PlayStation 3 Emulator`.  That is the
+model's boot overlay, not a guest frame: the VSH has issued no
+`cellGcmSetDisplayBuffer`/flip yet (the resource-inflate stage in Status is
+where it stops), so the scanout still shows the boot screen.  The window title
+carries the front-panel state (`green on`).  `-display sdl` on a host without
+the SDL2 DLLs stops at start-up instead of falling back to a silent window.
+
+The window's pixels can be captured without a screenshot tool: add
+`-qmp tcp:127.0.0.1:4455,server,nowait`, then send `screendump` over QMP after
+the guest is up -
+
+```json
+{"execute": "qmp_capabilities"}
+{"execute": "screendump", "arguments": {"filename": "C:/.../frame.ppm"}}
+```
+
+which writes the surface the display is presenting.  The coldboot animation
+(`dev_flash/vsh/resource/coldboot.raf`, played by `raf.sprx` through the QGL
+containers) is the VSH's first job once it can draw; it needs the same flip path
+the scanout is waiting for.
+
 ### CI
 
 `.github/workflows/ps3-build.yml` builds the model on Linux, Windows and macOS,
@@ -334,6 +376,136 @@ then smoke-tests the binary: `-M help` must list `rs6000-ps3` and
 `-display help` must list `sdl`.  Runners: Ubuntu 26.04 (x64/arm64), Windows
 Server 2025 (MSYS2 UCRT64), Windows 11 arm64 (MSYS2 CLANGARM64), macOS 13 (x64)
 and macOS 15 (arm64).
+
+### A headless build and the probe (WSL)
+
+A Debian WSL host builds the model with no display backend at all, which is the
+tree the headless probe runs against.  The sources are a copy in the Linux
+filesystem (building over `/mnt/c` is slow) and the build is out-of-tree:
+
+```sh
+rsync -a --exclude 'build*' --exclude .git /mnt/c/Users/Thewoodsman/qemu/ ~/qemu-ps3-src/
+mkdir -p ~/qemu-ps3-build && cd ~/qemu-ps3-build
+~/qemu-ps3-src/configure --target-list=ppc64-softmmu \
+    --disable-gtk --disable-sdl --disable-opengl --disable-vnc \
+    --disable-curses --disable-docs --disable-tools --disable-tests \
+    --disable-werror
+ninja -j16
+```
+
+After editing a source here, copy the changed files into `~/qemu-ps3-src` and
+run `ninja -C ~/qemu-ps3-build`; a changed `meson.build` is picked up there and
+`build.ninja` is regenerated.  The result is
+`~/qemu-ps3-build/qemu-system-ppc64`.
+
+`scripts/ps3_headless_probe.py` runs the three applications the firmware starts
+outside a game and reads a verdict back from each.  It uses the `app=`,
+`app-args=` and `probe=on` properties, so each program gets the arguments its own
+launcher passes, and it stops at the first verdict instead of following the warm
+reset into the recovery program again.  A probe run does not open the boot
+chain: it reports `probe: the boot chain is not checked` rather than a MAC
+failure the run never depended on.  The VSH gets a 4000-tick budget because its
+resource stage begins after the first few hundred ticks; when the main thread
+takes the `0x700` program-interrupt vector the probe ends there with that stop
+named, instead of waiting out the budget on the vector.
+
+```sh
+python3 scripts/ps3_headless_probe.py \
+    --qemu ~/qemu-ps3-build/qemu-system-ppc64 -v
+```
+
+What a headless run on the 4.93 flash and HDD tree shows (one log per
+application, `.tmp/probe_<app>.log`):
+
+| app | SELF | entry | argc | verdict |
+| --- | --- | --- | --- | --- |
+| `vsh` | type 4, 4.93 | 0x6D5AC8 | 1 | `alive at the 4000-tick limit (pc=0xC24E0, 3 fault report(s))` |
+| `emer_init` | type 4, 4.93 | 0xE23F0 | 2 (`-mode=safe`) | `asked the system manager to shut down (action 0x100)` after 0 tick(s): the restart into recovery mode |
+| `hdd_copy` | type 4, 4.93 | 0x91308 | 2 (`-mode=1`) | `asked the system manager to shut down (action 0x8201)` at once: the restart the exchange starts with |
+
+None of the three is the XMB; what they show is that each program is opened,
+given its own arguments, mapped and run on the modelled Cell.  The VSH gets
+through start-up into its module graph: it loads 22 modules from the flash -
+`vshmain_ext`, `vshmain_util`, `paf_ext`, `paf_psjs`, `msmw1`, `msmw2`,
+`vmclib`, `qglbase` (412), `raf` (416), `x3_amgsdk`, `mintx_client`, the
+`mms` family (432-436) and `basic_plugins` (442) last - and the process links
+2005 of 2118 imports over 36 libraries.  By the 4000-tick budget it is still
+running at `0xC24E0` with 1393 of 2786 vblanks delivered.  It has not opened
+a `.rco` or a `.qrc` yet, so the resource stage (RCOXML, `raf.qrc`,
+`lines.qrc`) is still ahead, and it is not flipping a frame.
+
+The null callback the workers used to hit in `mms.sprx` is gone.  It was one
+of the twenty module variables `mms.sprx` imports from `mms_db`, and those are
+reference-style: the entry does not hold the variable, it points at a list of
+`{type, address, addend}` records lv2 patches at load.  `ps3_lv2_link_vars`
+walks those lists, so the descriptor the job reads at `0xE979D08` is filled and
+the worker runs about a thousand ticks further.
+
+Two faults remain, both from a job worker in `vsh.self`, and they are the same
+shape.  `0x4C5704` is the destructor of a 0x38-byte object whose class vtable
+is `0x6CF5D0`: it clears `+0x24` through `0x4C5EF4`, walks the child list at
+`+0x28` (each child's lock is at `+0x10`, its `+0x2C` is cleared, `0x4D6C94`
+tests it), and then counts down an array from its frame and calls slot 1 of
+each element - the deleting slot.  In this run the parent at `0xD6729E0` still
+lists `0xD6706B0`; that address was a real object of the same class - built by
+`0x4C5B64` with that same vtable and argument `0xD6620B0`, its count raised to
+three - but its block had been freed and recycled by the time the parent was
+destroyed, so the first word reads `426C6F63` (`Bloc`, from mms's schema name
+table).  The slot load from that address lands outside RAM and reads back
+zero, so `bctrl` jumps to 0.  The second worker dies the same way: the object
+at `0xD65CF88` has vptr `0xD670730`, inside that same block, and slot `+0x44`
+there names `0x6CF5D0` - a vtable address, not code - with a zero TOC, so the
+callee starts with r2 = 0.  The child was last stored by the get-or-create
+helper at `0x4CE70C`, which does AddRef it, so the next thing to trace is who
+releases the last reference while the parent still lists it - not another
+import.
+
+Earlier in the bring-up the stop was the whole story of a boot:
+`custom_render_plugin` called `qgl_base` (NID `0xF85CB651`, entry `0xE4A47E0`)
+with `r3 = 0x200000`, an
+address in `vsh.self`'s text rather than a descriptor, so the callback word at
+`+0x10` was an instruction and `bctrl` jumped to 0.  The `0x200000` came from
+`[obj+0x2C]`, which `0x43AEDC(this, base, 0x200000, ...)` had filled in from the
+pool allocator `0x357230(2, 3, 0x400, 0x200000)`; that allocator was in fact
+*returning* a pointer, `0x40100400`, into the heap based at `0x40100000`, but
+the store that recorded it never reached the object: the caller's `r30` had a
+dirty upper half (`0xD640010_0D660F10`) at the `stw r3, 0x2C(r30)`, so the
+store went to a 64-bit address nothing mapped while the matching load read a
+zero.  The dirty half was the model's fault, not the VSH's: `0x42C9E0` saves
+`r30` with `std` and a leaf below it, `0x60D078`, keeps `r30` at `-0x10(r1)`
+in the stack's protected zone, which the lv2 trampoline's 32-byte frame
+overwrote with its saved `r12` (`0x0D640010`, the heap object) - see
+**lv2 trampoline frame** below.  With the frame moved below the protected zone
+the restore is clean and the main thread continues.
+
+`emer_init` runs its own start-up (the recover flag it reads goes
+from 0 to 0xFF) and asks the system manager for the restart into recovery mode
+(0x100); `hdd_copy` asks for the restart that starts its copy (0x8201), where
+the probe stops by design.  Exit status: 0 when every selected probe reached a
+verdict, 3 when one did not, 2 when a media image is missing.
+
+### lv2 trampoline frame
+
+The `sc` vector installed at `0xC00` is the only thing the guest's `sc`
+instruction reaches, and it has to save what lv2 preserves (`r0`, `CR`, `r12`)
+before the handler reuses those registers for the call.  It used to do that with
+a 32-byte frame, storing at `S-0x18`, `S-0x14` and `S-0x10`.  Those addresses
+are inside the stack's **protected zone**: the PowerPC ELF ABI lets a leaf
+function use the 288 bytes below `r1` without moving it, and this firmware's
+leaves do exactly that - `0x60D078` in `vsh.self` keeps `r31` at `-8(r1)` and
+`r30` at `-0x10(r1)` across an `sc`.  The trampoline's `stw r12, 16(r1)` then
+landed on the upper half of the saved `r30`, so the leaf restored
+`{0x0D640010, r30.lo}` - the heap object's pointer where a zero belonged - and
+every address derived from it missed its object.  The VSH's allocator recorded
+a freshly allocated 2 MiB block at that mixture and read it back as zero,
+which is how the boot ended up building a heap at address 0.
+
+The trampoline now allocates `PS3_LV2_FRAME` (0x140) bytes and keeps its three
+save slots at `S-0x138..S-0x130`, below the protected zone.  The two places in
+the model that finish a trampoline frame themselves - `ps3_sched_apply` for a
+preemption and `ps3_thread_finish_call` for a parked thread - add the same
+constant when they restore `r1`.  A larger frame costs nothing; writing into
+the caller's protected zone cost the boot.
 
 ## Run
 
@@ -538,6 +710,16 @@ at 0x40000, so the table lands at 0x40200 and the regions on the positions
 eMMC's tree at 0x10000000 carries `dev_flash*`, `dev_hdd0` and the empty
 `dev_hdd1` cache partition.
 
+**Not tested: a Phat console's NAND.**  Everything above about a NAND medium
+was run against the SuperSlim's eMMC image, a chip mapped like NAND.  A "Phat"
+console with a real NAND part - CECHG/H/J/K/L/M/P/Q, the 40, 80 and 160 GB
+models that have no NOR - has not been through the model, so its dump, its
+region table, `ps3_emmc_create.py` on that chip and `boot-medium=emmc` over it
+are all untested.  The layout it should present is the one described here
+(bootldr at flash 0, table at 0x40200, ros at 0xC0000), but that is an
+expectation read off the format, not a result: the NAND path is proven only for
+the eMMC layout.
+
 That container is sealed for the chip's own channel-66 root key, and a flash
 dump does not carry that key: it lives in the console's boot ROM.  Which of the
 two paths runs is therefore explicit.
@@ -580,11 +762,14 @@ give the medium its own key when it differs:
 by both the chain check and the ROM whenever `boot-medium=emmc`; a failure then
 names the container and the address it was found at.
 
-Each medium is asked for the container its own boot ROM opens.  On NOR (and on
-a chain staged on a disk) that is `lv0ldr.2`.  On NAND/eMMC it is `metldr.2` in
-the asecure_loader region - the region the mask ROM is pointed at - and
-`lv0ldr.2` is what metldr opens once it runs, so a NAND flash that carries
-`metldr.2` and no `lv0ldr.2` is the other boot path, not a damaged console:
+Each medium is asked for the container its own boot ROM opens: `lv0ldr.2` at
+NOR 0xFC0000, which is the bootldr slot, or `lv0ldr.2` on a chain staged on a
+disk.  A NAND/eMMC image made from GameOS starts at flash 0x40000, so it does
+not carry the bootldr at flash 0 at all; the first container such an image can
+offer is `metldr.2` in the asecure_loader region (flash 0x40800), and
+`lv0ldr.2` is what metldr opens once it runs.  That is an image-layout fact,
+not a change of what the ROM opens, and a NAND flash that carries `metldr.2`
+and no `lv0ldr.2` is the other boot path, not a damaged console:
 
 ```
 ps3-boot-rom: NAND/eMMC medium: the ROM opens metldr.2 (the asecure_loader);
@@ -692,6 +877,54 @@ audiodev feed `sys_mic`'s rings.
 `-global ps3-vga.dump=FILE` writes the surface the display is presenting, so the
 window's pixels can be inspected without a display.
 
+### The syscon EEPROM (`hw/ppc/ps3_eep.c`)
+
+The console's configuration is in the system controller's EEPROM, a 32 KiB part
+(0x4000 blocks of two bytes).  Nothing on the Cell side sees the chip: lv2
+reaches it through `sys_ss_update_manager()` operations 0x600B/0x600C, which
+take an address and one byte.  The addresses the firmware uses are windows
+rather than part offsets: the address resolver folds 0x48000, 0x48800, 0x48C00
+and 0x48D00 onto NVS 0x7000, 0x7100, 0x7200 and 0x7300, 0x100 bytes each, so
+0x48C07 is NVS byte 0x7207 and 0x48D3E is 0x733E.  A bare address below 0x8000
+is the part's own byte.
+
+The documented bytes, from the console's own SC EEPROM table:
+
+| NVS address | Size | Meaning |
+| --- | --- | --- |
+| 0x48C06 | 1 | FSELF control flag |
+| 0x48C07 | 1 | product mode; 0xFF retail, 0x00/0xFE factory (service) mode |
+| 0x48C0A | 1 | QA flag |
+| 0x48C13 | 1 | device type; 0xFF retail, 0x00 factory/service |
+| 0x48C30 | 1 | usable SPEs, 0x06 stock, 0x07 all eight |
+| 0x48C42 | 1 | HDD copy mode |
+| 0x48C50 | 16 | debug support flags |
+| 0x48C60 | 1 | update status |
+| 0x48C61 | 1 | recover mode flag; selects ros1 over ros0 |
+| 0x48D3E | 0x50 | QA token |
+
+The model always carries a console's own readout: `hw/ppc/ps3_eep_image.h` is a
+CECH-43xx part's dump, 0x5000 of its 0x8000 bytes written and the tail erased,
+compiled into `ps3_eep.c`.  There is no option to load a different dump and no
+sparse synthesised EEPROM any more - a run either has this part or does not
+start.  Regenerate the header from a readout with
+`python3 scripts/ps3_eep_embed.py MyEEPROM.bin`; `--check` compares it with the
+one in the tree.
+
+Two bytes do not come from the readout.  Product mode and the recover flag
+describe how *this* console was started, not what the part stores: a run in
+recovery mode is a console whose service jumper is set, and `emer_init` reads
+product mode through 0x600B to find that out.  Both read 0xFF on a normal boot
+and 0x00 once the machine enters recovery (`recover=on`, or the warm reset an
+emergency program asks for); a guest write of product mode selects factory mode
+the same way.
+
+The rest of those two NVS windows is erased in this readout (its written area
+ends at 0x5000, the windows start at 0x7000), which is what a retail part's
+configuration area looks like: a field nothing has written reads 0xFF.  Guest
+writes are kept in a small overlay for the length of the run, and reads outside
+both the part and the fold read 0xFF.
+
 ## Checks
 
 | Check | Command | Passing looks like |
@@ -701,13 +934,14 @@ window's pixels can be inspected without a display.
 | the ROM's own tag check | `-global ps3-boot-rom.rom-exec=on` | the synthetic image: `the mask ROM opened the container in the SPU interpreter (reached 0x400 after 44453 instructions)` and `container verified, 80 bytes of payload`; the pristine 4301C with a foreign readout: `the mask ROM did not open the container (stop 2 at 0x1E4)` then `stop 2, MAC mismatch (metldr.2 at flash 0x840)` |
 | container opener | `-drive if=pflash,...` with the readout | `container verified, 191152 bytes of payload` |
 | is a container sealed under a published key? | `py .tmp/probes/ps3_public_key_check.py --all-keys` (a probe, kept out of `scripts/`) | `no key tested opens a 4301C container` after the detector fires on all eight sample containers (4 consoles) and the ROM opens the `4th sample` `metldr` with a readout derived from its published key (`reached 0x400 after 3394985 instructions`); 631 candidate keys, 2,500 container/key pairs, 0 matches |
+| can a dump reach PCK1 by itself? | `py scripts/ps3_encdec.py loaders --dump nor.bin --readout ch66.bin` | one line per loader with the ROM's stop code (`metldr @0x000840 opened, blocks 3991, encrypted 3991`, or `MAC mismatch` with no readout), and when metldr opens, `PCK1 metldr carries a copy at +0x..., EID0 ...: accepts it` followed by the four ladder ids and, with `--out`, the 128-byte file.  The opener is the ROM's: hdr[0x10] counts, hdr[0x00] is clamped to it, the blocks before the Size1 gate are copied through.  The 4301C dumps still report `MAC mismatch` for both loaders with no capture, so nothing is invented |
 | every loader container in a dump | `py scripts/ps3_romexec_sweep.py` | one run per container at its own offset, on the built-in opener by default (no `-bios`, `own-rom=on`): both 4301C dumps give `stop 2, MAC mismatch` for `metldr.2` (0x840) and `lv0ldr.2` (0xFC0000) - the header is accepted and the tag is refused - and a deliberately misaligned point (`0xFC0040`) gives `stop 1, invalid payload length` from the span check (the block field there is 2229774634, not a count), so the address is doing the work.  The capture written by each run is the readout itself (with no `--readout`, 32 zero bytes).  The same sweep runs two sample consoles' own containers, with a readout derived from the key each is sealed under, so the acceptance branch is exercised on firmware: the `4th sample` (which ships `Kp` per container) and the `2nd sample` (which ships `rk10`, inverted through the AES schedule to `Kp` first), each giving `container verified, 63712 bytes` and `container verified, 196528 bytes` and then running its own SPU stage (`metldr.2` stops 21 at 0x490 once the mailbox peer answers its channel-0x1D poll; `lv0ldr.2` spends the budget at 0x20058 and never reads 0x1D).  A key match matrix finishes the run: each `Kp` opens only its own container, and the one real channel-66 capture in the tree opens both images of its console - so what matches and what does not is in the report, not implied.  `--rom-exec` replays a supplied mask ROM instead: the verdict is then spelled `stop 2 at 0x1E4` / `reached 0x400`, and a rejected container gets a channel map because the ROM's own code ran.  Each row records the map its image executed (`channels.touched`, `channels.clean`); an access the model does not define is flagged in the JSON and in the report's "Channel map per run" section, and makes the sweep exit 3 |
 | a `.2` loader, whose ERK is wrapped | `-global ps3-boot-rom.lv1ldr=lv1ldr.2.self -global ps3-boot-rom.pck2=<96 hex>` | `the value at 0x... unwraps under eid_root_key into the key this loader was sealed with`, then `NOR lv1ldr: eid_root_key: ladder seed block at 0x...` with `the ladder's ERK is the ERK the loader carries, unwrapped under eid_root_key`.  A wrong eid_root_key finds no window, and a `.2` loader with no eid_root_key given stops and says so |
 | ladder seeds and ERK from the console's own loader | `-global ps3-boot-rom.lv1ldr=lv1ldr.self` - no key on the command line | `NOR lv1ldr: ...: ladder seed block at 0x1BB20, found by the published constants - the ATA and flash ladders run on the console's own seeds; the ladder's ERK is <where it came from>`, and `the NOR and NAND loaders carry the same four seeds` when both are given.  A loader with no block (or a mismatched pair) stops the run with the reason.  `pck1=`/`erk-file=` still override the ERK, and a retail image cannot carry a per-console key, so a given ERK is kept and that is reported |
 | a loader whose seeds are not the published ones | `lv1ldr` plus the `hdd-file`/`emmc-file` those seeds key | `no published seed block; the window at 0x... was the <n>th candidate whose keys open the console's storage`, then `ladder seed block at 0x..., located by structure, by the keys it derives`.  With no storage image to prove a window against, the run stops and says the block cannot be located |
 | a loader stage | `-global ps3-boot-rom.stage-elf=lv2ldr.self` | exit 0, `stop 48 at ...` (the loaders' signal) |
 | the channel map and the loader window's four directions | `py scripts/ps3_loader_channels_test.py` | five stages on the model's own channels: with nothing posted all three depths (0x41, 0x43, 0x44) are 0 and `rdch 0x41` blocks; with `loader-status=0x77`, `loader-feed=0x11,0x22` and `loader-sink=4` the status reads once, the feed drains in order, the depths return to 0, the sink falls 4 then 3, and one command plus one data word go out; with `loader-feed=0x11` the depth is 1 and the next read blocks; with no `loader-sink` the 0x44 depth is 0 and the first write blocks; and on reserved 0x2E `rchcnt` answers 0, `wrch` is dropped, and the run reports `0x2E reserved x3` |
-| the sweep's channel parsing and exit contract | `py scripts/ps3_romexec_sweep_test.py` | 28 QEMU-free checks: both `ps3-spu: channels:` lines (clean, undefined, last-map-wins, zero touched, lowercase/spaces), the flag and per-row note, `exit_status()` = 0 for clean and 3 for a flagged row or failed sample, and the payload-wait regex that must not match a channel line (the bug that cut sample payloads off at the ROM verdict) |
+| the sweep's channel parsing and exit contract | `py scripts/ps3_romexec_sweep_test.py` | 53 QEMU-free checks: both `ps3-spu: channels:` lines (clean, undefined, last-map-wins, zero touched, lowercase/spaces), the flag and per-row note, `exit_status()` = 0 for clean and 3 for a flagged row or failed sample, and the payload-wait regex that must not match a channel line (the bug that cut sample payloads off at the ROM verdict), and the header rule the ROM uses (size1 above the count is clamped and still opens, size1 below it leaves the first block in the clear so an all-encrypted body is refused) |
 | lv0 and above | `-global ps3-boot-rom.ppu-elf=lv0.self` | exit 0 at the next hand-off |
 | vsh.self | `-global ps3-boot-rom.vsh-run=on` | `ps3-vsh: ... entry=0x6D5AC8 ... PPU entering it`, then `sys_prx_load_module` and the module set |
 | the RSX front end | a boot with the RSX display | `ps3-rsx: device window ...`, `gcm context ...`, `ps3-rsx: draw done: ... pixel(s)` then `ps3-vga: guest owns the scanout` |
@@ -806,14 +1040,17 @@ Two more things were settled on that configuration after the module work:
   context in that run (`rsx: 0 vblank(s) ... no driver info`), so the next
   target is what should start the XMB's GCM path, not a lost wake-up.
 
-The `0x700` report below is from the first configuration *without* `-icount`.
-It is not reproducible with `-icount shift=6,sleep=off`, and the return
-address it prints is not backed by any loaded module in that run: the RAM
-dump taken at the stop has zeros at 0xE4A4988 and no module maps that high
-(only 0xDB60000/0xDB70000 are occupied).  The `0xE4A4980` analysis further
-down is sound for the run that *did* have qglbase at 0xE490000, but that run
-is not this one, so treat the address as belonging to the module arena only
-when the module map says so.
+The `0x700` report below **was** reproducible with `-icount shift=6,sleep=off`:
+the vsh probe took the vector after 2373 tick(s) with `lr=0xE4A4988`
+(`.tmp/probe_vsh.log`).  It does not any more - the cause was the lv2
+trampoline writing into the caller's protected zone (see **lv2 trampoline
+frame** in the probe section), not the qgl call itself, and the same build now
+runs past this point.  The analysis is kept because it is how the store that
+lost the address was traced.  `PS3_DUMP_PRX` also leaves each loaded module as
+a `*.ram` image, and qglbase's is `0xE490000 + 0x14988` in it, which is where
+the disassembly below is read from.  The first run without `-icount` printed
+the same lr from a module map that did not list qglbase; trust the dumped
+image, not that map.
 
 The eMMC image does not get that far yet - see the end of this section:
 
@@ -836,11 +1073,12 @@ callee as `this+0x10`:
 0E4A4984 bctrl
 ```
 
-`this+0x10` is a *callback descriptor*, `this+0xC` its argument, and the
-function is exported for exactly one caller: **`raf.sprx`**.  raf's import table
-has `qgl_base` with 145 functions (`0xE871584`), NID `0xF85CB651` sits at index
-140, its slot `0xE88BCC8` holds the OPD `0xE4FDA44`, and the module's only call
-site is `0xE845500`:
+`this+0x10` is a *callback descriptor*, `this+0xC` its argument, and two
+modules import it: **`raf.sprx`** and **`custom_render_plugin.sprx`** (the
+latter's thunk at `0x8AEF0` reads slot `0xF8BC524`, which resolves to the same
+OPD).  raf's import table has `qgl_base` with 145 functions (`0xE871584`), NID
+`0xF85CB651` sits at index 140, its slot `0xE88BCC8` holds the OPD `0xE4FDA44`,
+and raf's call site is `0x845500`:
 
 ```
 0E8454E8 mr   r3, r26          ; this  = a 0x50-byte block, allocated just above
@@ -875,9 +1113,11 @@ is reached from raf's own job worker at `0xE83F41C`, which loads the six
 arguments out of a queued frame, so the OPD arrives from raf's caller and not
 from a registration table inside qglbase.
 
-In a fresh NOR boot with the trace armed at raf's entry, qglbase's initialiser
-and core never execute.  Two `0x700` sites stand between the VSH and qgl work,
-both of them `bctrl` through a pointer whose word is *text* rather than an OPD:
+In a fresh NOR boot the only `qgl_base` call that arrives is custom_render's,
+described below; raf's exported wrapper is never entered, so the provider OPD
+it would pass never reaches the callee.  Runs that stopped earlier parked at
+two `0x700` sites, both `bctrl` through a pointer whose word is *text* rather
+than an OPD:
 `vsh.self` at `0x365214` (`r9 = this+0x40`, and the word there is
 `0x5F666C61` = "_fla", the middle of `dev_flash`) and `mms_db_full.sprx` at
 `lr=0xEA56C54` (`ctr = 0x646576` = "dev").  A field that should hold an
@@ -890,25 +1130,58 @@ build in a 45-second run with `ppu-trace` opened
 stopping, while a 40-second run with the qgl trace armed parked two threads at
 `0x700` and never opened a container.  A reproducible run therefore needs
 `-icount shift=6,sleep=off` and enough guest time to get past the shim's park
-loop.  The old `0x200000` receiver was a separate heap-walk failure (the
-`0x50`-byte block came back inside `vsh.self`'s text); it is not the current
-stop and does not need a registration to explain it.  `PS3_QGL_TRACE=1` logs
-the entry, the descriptor's `+0xC`/`+0x10` (with the OPD's code and TOC) and any
-`0x700` with its `lr`, so the caller of a broken descriptor is named by the
-next run rather than inferred; the fault report now prints `r10` as well,
-because every `bctrl` through an OPD under ELFv1 loads its TOC from `r10`.
+loop.  The `0x200000` receiver is the current stop under `-icount shift=6,sleep=off`,
+and it is not a missing registration.  custom_render's code at `0x11DD4` loads
+`[0x2C]` and calls `qgl_base` only when that word is non-zero; the `lis r9,0`
+there carries no relocation because the module reads an absolute low address,
+which no heap occupies on hardware, so the test is false and the call is
+skipped.  Here `[0x2C]` is a field of a heap header at `0x10`, so the test
+passes with a pointer into code.
+`PS3_QGL_TRACE=1` matches the entries by module offset (their bases move
+between runs), skips the `0x700` loop, and prints the import thunk's saved
+caller, so one run names the caller: custom_render's thunk at `0x8AEF0`,
+return `0xF831E14`, call site `0x11E10`.  `PS3_WATCH_LOW=1` names the writer of
+`0x2C` (`vsh.self` at `0x6027F8`, storing a word of vsh's own data into the
+block based at `0x10`) and walks the frame chain above it.  `PS3_TRACE_PC=0x43aedc`
+reads that heap's constructor arguments: base 0, size `0x200000`, and the base
+is the return of the pool lookup `0x357230(2, 3, 0x400, 0x200000)`.
+`PS3_TRACE_PC` takes a comma-separated list, so one run can follow a call from
+its site through the allocator: `PS3_TRACE_PC=0x357348,0x440b0c,0x440a44,
+0x604a9c,0x6043a0` shows what each layer was handed.  `PS3_STACK_WATCH=base,len`
+puts an IO window over a frame and reports every store into it with the pc, lr,
+sp and the current `r30`; `PS3_STACK_WATCH_VALUE=<word>` keeps only stores that
+write that word, which is how a 32-bit half of a saved register is found among
+a frame's ordinary traffic.  The dirty upper half above was named that way:
+the store never appeared in the frame at all, which is what pointed at the
+trampoline rather than at a guest store.  The pool
+table at `0x736B84` has exactly one entry with that key: the RSX-local heap at
+`0x40100010`, based at `0x40100000` and `0xB80000` long.  `PS3_SNAP_PC=0x43aedc
+PS3_SNAP_ADDR=0x40100000` shows the heap the pool names is initialised (top
+chunk `0xB7FDD0` at `0x401001F8`), so the 2 MiB request does not fail in the
+allocator; the value it returns is lost on the way back (see **lv2 trampoline
+frame** above).  `PS3_FAULT_SNAP=address,length,prefix` reads a range out of
+RAM when the run reports a fault, which a stale pointer needs: every fault in
+the run writes its own `prefix.N`, so the two workers above did not overwrite
+each other's heap.  The virtual-call case also prints the receiver in `r3`,
+its vptr and that table's first words, which is what named `Bloc` without a
+second run.  `PS3_DUMP_RELOC=<offset>[,<span>]` prints every PRX relocation record that
+lands in that window (span defaults to `0x10`), which is how a `lis` left at
+zero is either blamed on a missing record or cleared; `PS3_DUMP_PRX` leaves
+the loaded, relocated module images and the VSH segments as `*.ram`, which is
+what the disassembly above is read from.
 
-Which of the two the main thread is in depends on how far it got, so both are
-read from the same run's scheduler report.  In a 110-second headless NOR run the
-main thread alternates between running at `0xBB9E0` and waiting at the shim's
-halt loop `0xC58` on mutex `0x177`, `blocked=1 parked=1`: the owner is
+Which of the two the VSH gets to depends on how far it got, so both are read
+from the same run's scheduler report.  In a 110-second run without `-icount`
+the main thread alternates between running at `0xBB9E0` and waiting at the
+shim's halt loop `0xC58` on mutex `0x177`, `blocked=1 parked=1`: the owner is
 `ScePafText` (thread `0x179`, created at entry `0x42C864` from lr `0x60CE90`),
 which sits at `0x14E428`.  At the start of that run ScePafText is itself blocked
 and parked (`blocked=1 parked=1 eq=-2 mutex=0x177 cond=0x178`), so the lock it
 holds is one it took for a condition wait on `0x178`, and the dump does not
 show what was meant to signal it: the hand-off only resumes once the model's
-wake reaches that thread.  When the main thread gets the lock instead it goes
-past this hand-off to the `0xE4A4980` call and lands on `0x700`.  Neither path has reached a
+wake reaches that thread.  Under `-icount shift=6` the main thread does get the
+lock and goes past `0xBB9E0`, and the qgl fault then arrives on
+`custom_render_plugin`'s thread.  Neither path has reached a
 `cellGcmSetDisplayBuffer`/flip yet, which is why the run's own frame is still
 an empty buffer.
 
@@ -1090,11 +1363,12 @@ counts the table lists for those builds: `icons` 60 (33 FPO, 3 VPO, 22 MNU,
 1 DDS, 1 BMP), `raf` 23 (1 BIN, 20 FPO, 2 VPO), `rhm` 11 (8 + 3), `canyon` 412,
 `lines` 159, `store` 80, `icontex` 71, `earth` 602.
 
-None of them has been opened by a run yet, and that is the same fault as below:
-the main thread dies at `0xE4A4988` inside `qglbase` before `raf` gets to
-`sys_fs_open("raf.qrc")`.  The probe is therefore compiled in but not exercised
-in a boot; `scripts/ps3_qrc.py verify` is what says the containers themselves
-are sound in the meantime.
+None of them had been opened by a run when this was written; the main thread
+died at `0xE4A4988` inside `qglbase` before `raf` got to
+`sys_fs_open("raf.qrc")`.  With the trampoline frame fixed the VSH loads
+`raf.sprx` and keeps running, so the next run that reaches the resource stage
+should exercise the probe; `scripts/ps3_qrc.py verify` says the containers
+themselves are sound in the meantime.
 
 `sys_config` is a real interface now, not an acknowledgement: `sys_config_open`
 remembers the queue, `sys_config_add_service_listener` announces the two

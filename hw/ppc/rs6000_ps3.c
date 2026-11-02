@@ -123,6 +123,7 @@ typedef struct PS3ReadCall {
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
 #include "hw/ppc/ppc.h"
+#include "hw/ppc/ps3_eep.h"
 #include "hw/ppc/ps3_pc_hook.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -1199,6 +1200,14 @@ struct PS3BootROMState {
     size_t rco_cap;
     unsigned ppu_fault_reports;
     char ppu_why[160];
+    /*
+     * Where the two modules the qgl trace names landed.  A module's base is
+     * assigned per run (the loader places them in load order), so a trace
+     * that compares against fixed addresses stops matching as soon as one
+     * module ahead of it changes size.
+     */
+    uint32_t qgl_base_addr;
+    uint32_t raf_base_addr;
 
     /*
      * The application layer: appldr opens /dev_flash/vsh/module/vsh.self and
@@ -1211,6 +1220,22 @@ struct PS3BootROMState {
      */
     char *audio_dev;             /* the -audiodev id the sound driver uses */
     char *vsh_self;
+    /*
+     * The application a run enters, from `app=': vsh.self, emer_init.self or
+     * hdd_copy.self by short name, or any guest path under a device the
+     * machine maps.  Empty means vsh.self, the boot's own application.
+     */
+    char *app_name;
+    /*
+     * The arguments the launcher would pass.  The console's applications are
+     * told what to do on the command line - emer_init takes `-mode=safe' and
+     * hdd_copy `-mode=1'/`-mode=2' - so a probe that leaves argv empty is
+     * probing a different program from the one the VSH starts.
+     */
+    char *app_args;
+    /* One application, one bounded run, one verdict: what a headless probe
+     * is, as opposed to a boot that may warm-reset into recovery for ever. */
+    bool probe;
     char *vsh_dump;
     char *vsh_erk;
     char *vsh_riv;
@@ -1257,16 +1282,10 @@ struct PS3BootROMState {
     /* Where the next sys_mmapper address is handed out (RSX-backed ranges). */
     uint32_t lv2_mmap_next;
     /*
-     * The system controller's EEPROM, as RPCS3's ps3_syscon keeps it: sparse,
-     * unwritten bytes read 0xFF, and offset 0x48C07 is not a stored byte but
-     * the console's recover mode (0x00 in service mode).
+     * The system controller's EEPROM is ps3_eep.c: the part's own readout is
+     * compiled in there, together with the NVS fields the firmware reads.
+     * The model keeps no copy and takes no dump at run time.
      */
-    struct {
-        uint32_t off;
-        uint8_t val;
-    } syscon_ee[32];
-    int syscon_ee_n;
-    bool syscon_recover;
 
     /*
      * The RSX.  Its local memory is real memory the guest can map with
@@ -1675,7 +1694,7 @@ static uint32_t ps3_be32(const uint8_t *p)
  * The words are this program, already linked, so the runtime needs no
  * assembler:
  *
- *     stwu  r1, -32(r1)
+ *     stwu  r1, -FRAME(r1)
  *     stw   r0, 8(r1)        lv2's `sc` preserves every register but r3
  *     mfcr  r0
  *     stw   r0, 12(r1)
@@ -1695,17 +1714,30 @@ static uint32_t ps3_be32(const uint8_t *p)
  *     lwz   r0, 12(r1)
  *     mtcrf 0xFF, r0
  *     lwz   r0, 8(r1)
- *     addi  r1, r1, 32
+ *     addi  r1, r1, FRAME
  *     rfid
  * halt:
  *     b     halt
+ *
+ * The frame is deliberately much larger than the four words it holds.  The
+ * PowerPC stack ABI reserves a protected zone below the stack pointer - 288
+ * bytes in the 64-bit ELF ABI this firmware is built to - that a leaf function
+ * may use without moving r1.  A trampoline that pushed only 32 bytes would put
+ * its save slots at S-0x18..S-0x10, on top of the leaf's own saves, and the
+ * leaf would read the trampoline's r12 back as half of a restored register.
+ * That is exactly what happened to the VSH's allocator call inside a leaf that
+ * kept r30 at -0x10(r1): the call returned with r30 = {0x0D640010, r30.lo} and
+ * every pointer derived from it missed its object.  Keeping the frame below
+ * the protected zone leaves the leaf's slots alone.
  */
+#define PS3_LV2_FRAME 0x140
+
 static const uint32_t ps3_lv2_shim[] = {
-    0x9421FFE0, 0x90010008, 0x7C000026, 0x9001000C, 0x91810010,
+    0x9421FEC0, 0x90010008, 0x7C000026, 0x9001000C, 0x91810010,
     0x3D800000, 0x618CF104, 0x558C801E, 0x618C0014, 0x916C0000,
     0x3D800000, 0x618C0880, 0x806C0000, 0x800C0004, 0x2C000000,
     0x4082001C, 0x81810010, 0x8001000C, 0x7C0FF120, 0x80010008,
-    0x38210020, 0x4C000024, 0x48000000,
+    0x38210140, 0x4C000024, 0x48000000,
 };
 
 static void ps3_put_be16(uint8_t *p, uint16_t v)
@@ -2882,6 +2914,19 @@ static void ps3_rom_boot(PS3BootROMState *s)
     char why[160];
     uint32_t result;
 
+    /*
+     * A probe names the program it runs; nothing about the container decides
+     * whether that program is in memory.  Opening the chain anyway would put
+     * a MAC failure the run never depended on in front of the verdict, so a
+     * probe reports that the chain is not checked and leaves it alone.
+     */
+    if (s->probe) {
+        info_report("ps3-boot-rom: probe: the boot chain is not checked; "
+                    "app=%s is entered from the flash's ros",
+                    s->app_name ?: "(none)");
+        return;
+    }
+
     memory_region_set_readonly(&s->ls_mr, false);
     memset(memory_region_get_ram_ptr(&s->ls_mr), 0, PS3_LS_SIZE);
 
@@ -3473,6 +3518,7 @@ static void ps3_rom_report_channel_map(PS3SPU *spu);
 static int ps3_ppu_dump(PS3BootROMState *s);
 static bool ps3_ppu_stage(PS3BootROMState *s, Error **errp);
 static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp);
+static bool ps3_app_select(PS3BootROMState *s, Error **errp);
 static void ps3_ppu_reset_entry(void *opaque);
 
 /*
@@ -4943,6 +4989,54 @@ static void ps3_lv2_patch_refs(PS3BootROMState *s, uint8_t *ram,
 }
 
 /*
+ * Variable imports.
+ *
+ * An imported variable has an address the importing module cannot know: it is
+ * defined in the library's own data.  A module that reads one does not go
+ * through a stub - the reference sits in the code as a `lis'/`lwz' pair whose
+ * halves are filled in at load time, which is what the {type, address, addend}
+ * reference lists of an attribute-0x2000 entry are for.  One list per variable
+ * hangs off the vstub array, which holds a pointer to it instead of a value;
+ * an entry without the attribute has no lists and the vstub is the slot the
+ * code loads the variable's address from.
+ */
+static unsigned ps3_lv2_link_vars(PS3BootROMState *s, uint8_t *ram,
+                                  uint64_t ram_size, const PS3PrxEntry *e,
+                                  const char *lib)
+{
+    unsigned linked = 0;
+
+    if (!e->num_var ||
+        !ps3_prx_array(ram_size, e->vnids, e->num_var) ||
+        !ps3_prx_array(ram_size, e->vstubs, e->num_var)) {
+        return 0;
+    }
+
+    for (unsigned i = 0; i < e->num_var; i++) {
+        uint32_t nid = ps3_be32(ram + e->vnids + 4 * i);
+        uint32_t var = ps3_lv2_find_export(s, lib, nid);
+        uint32_t slot = e->vstubs + 4 * i;
+
+        if (!var) {
+            continue;
+        }
+
+        if (e->attributes & 0x2000) {
+            uint32_t refs = ps3_be32(ram + slot);
+
+            if (refs) {
+                ps3_lv2_patch_refs(s, ram, ram_size, refs, var);
+            }
+        } else {
+            ps3_put_be32(ram + slot, var);
+        }
+        linked++;
+    }
+
+    return linked;
+}
+
+/*
  * Resolve a module's import table against what is registered so far.  An
  * import entry is a library name, a NID array and an array of 4-byte slots;
  * lv2 writes the exported OPD's address into each slot, and the module's stub
@@ -5028,9 +5122,19 @@ static unsigned ps3_lv2_link_imports(PS3BootROMState *s, uint8_t *ram,
             linked += missed ? 0 : 1;
         }
 
+        {
+            unsigned vars = ps3_lv2_link_vars(s, ram, ram_size, &e, lib);
+
+            if (vars) {
+                info_report("ps3-ppu: prx: %s: linked %u/%u variable(s) "
+                            "from %s", m->path, vars, e.num_var, lib);
+                got += vars;
+            }
+        }
+
         if (got) {
             info_report("ps3-ppu: prx: %s: linked %u/%u import(s) from %s%s",
-                        m->path, got, e.num_func, lib,
+                        m->path, got, e.num_func + e.num_var, lib,
                         missed ? " (placeholder stubs)" : "");
         }
         if (missed) {
@@ -5204,19 +5308,30 @@ static unsigned ps3_lv2_register_process_exports(PS3BootROMState *s,
             continue;
         }
 
-        for (unsigned i = 0; i < e.num_func; i++) {
-            uint32_t opd = ps3_be32(ram + e.addrs + 4 * i);
+        /*
+         * Variables are exported next to functions, and their entry is the
+         * variable itself rather than an OPD: mms reads `mms_db' variables
+         * (0xFC738C69 is its job interface) through reference lists that
+         * resolve to these addresses, so they have to be registered too.
+         */
+        for (unsigned i = 0; i < e.num_func + e.num_var; i++) {
+            uint32_t addr = ps3_be32(ram + e.addrs + 4 * i);
 
-            if (!ps3_lv2_opd_ok(ram, ram_size, opd, s->vsh_lo, s->vsh_hi)) {
+            if (i < e.num_func) {
+                if (!ps3_lv2_opd_ok(ram, ram_size, addr, s->vsh_lo,
+                                    s->vsh_hi)) {
+                    continue;
+                }
+            } else if (addr < s->vsh_lo || addr >= s->vsh_hi) {
                 continue;
             }
-            ps3_lv2_add_export(s, lib, ps3_be32(ram + e.nids + 4 * i), opd,
+            ps3_lv2_add_export(s, lib, ps3_be32(ram + e.nids + 4 * i), addr,
                                0);
             added++;
         }
 
-        info_report("ps3-ppu: lv2: process exports %s (%u function(s))",
-                    lib, e.num_func);
+        info_report("ps3-ppu: lv2: process exports %s (%u function(s), "
+                    "%u variable(s))", lib, e.num_func, e.num_var);
     }
 
     return added;
@@ -5274,6 +5389,7 @@ static unsigned ps3_lv2_link_process(PS3BootROMState *s, uint8_t *ram,
                 linked++;
             }
         }
+        linked += ps3_lv2_link_vars(s, ram, ram_size, &e, lib);
     }
 
     if (entries) {
@@ -5284,6 +5400,33 @@ static unsigned ps3_lv2_link_process(PS3BootROMState *s, uint8_t *ram,
     }
 
     return linked;
+}
+
+/*
+ * PS3_DUMP_RELOC names one file offset, or "offset,span", and every
+ * relocation that lands there is printed.  A `lis' left at zero means no
+ * record reached its high half, so the question is always which record
+ * should have covered the offset, or whether one exists at all.
+ */
+static bool ps3_prx_reloc_wanted(uint64_t target_off)
+{
+    static bool ready, enabled;
+    static uint64_t base, span;
+
+    if (!ready) {
+        const char *s = g_getenv("PS3_DUMP_RELOC");
+
+        ready = true;
+        if (s && *s) {
+            char *end;
+
+            base = g_ascii_strtoull(s, &end, 0);
+            span = *end == ',' ? g_ascii_strtoull(end + 1, NULL, 0) : 0x10;
+            enabled = span != 0;
+        }
+    }
+
+    return enabled && target_off >= base && target_off - base < span;
 }
 
 /*
@@ -5573,6 +5716,21 @@ static int32_t ps3_lv2_prx_load_path(PS3BootROMState *s, uint8_t *ram,
                                 value);
                 }
             }
+            /*
+             * A `lis' whose immediate stays zero is a high half that no
+             * relocation reached.  Name the record that should have covered
+             * a given offset, or the absence of one, without a table dump.
+             */
+            if (index_addr < loads && ps3_prx_reloc_wanted(target_off)) {
+                info_report("ps3-ppu: prx: %s: reloc at segment %u + "
+                            "0x%" PRIX64 ": type %u, value segment %u, "
+                            "addend 0x%" PRIX64 ", target 0x%" PRIX64
+                            ", value 0x%" PRIX64 ", word %08X",
+                            guest, index_addr, target_off, type,
+                            index_value, ptr, target, value,
+                            (uint64_t)target + 4 <= ram_size ?
+                            ps3_be32(ram + target) : 0);
+            }
             if (!ps3_lv2_reloc_one(ram, ram_size, target, value, type)) {
                 info_report("ps3-ppu: prx: %s: relocation type %u is not "
                             "handled", guest, type);
@@ -5603,6 +5761,12 @@ static int32_t ps3_lv2_prx_load_path(PS3BootROMState *s, uint8_t *ram,
         m->segments = loads;
         m->started = false;
         g_strlcpy(m->path, guest, sizeof(m->path));
+        /* The qgl trace compares against these two modules' offsets. */
+        if (g_str_has_suffix(guest, "/qglbase.sprx")) {
+            s->qgl_base_addr = m->base;
+        } else if (g_str_has_suffix(guest, "/raf.sprx")) {
+            s->raf_base_addr = m->base;
+        }
 
         /*
          * The PRX library header.  A module that has none is still a valid
@@ -5644,6 +5808,23 @@ static int32_t ps3_lv2_prx_load_path(PS3BootROMState *s, uint8_t *ram,
         ps3_lv2_relink_all(s, ram, ram_size);
         ps3_lv2_link_imports(s, ram, ram_size, m, imports_start, imports_end);
         ps3_lv2_link_process(s, ram, ram_size);
+
+        /*
+         * The file's copy of a module is still sealed, so the image that ran
+         * is the only readable one: with PS3_DUMP_PRX set, leave that too,
+         * after the relocations and the import stubs are in place.  A fault
+         * in a module is read off this, not off the .sprx.
+         */
+        if (g_getenv("PS3_DUMP_PRX") &&
+            (uint64_t)m->base + m->size <= ram_size) {
+            g_autofree gchar *base = g_path_get_basename(guest);
+            g_autofree gchar *fname = g_strconcat(base, ".ram", NULL);
+            g_autofree gchar *out = g_build_filename(g_getenv("PS3_DUMP_PRX"),
+                                                     fname, NULL);
+
+            g_file_set_contents(out, (const gchar *)(ram + m->base),
+                                m->size, NULL);
+        }
 
         return (int32_t)m->id;
     }
@@ -7197,7 +7378,7 @@ static void ps3_thread_finish_call(PS3BootROMState *s, PS3Thread *t,
     unsigned i;
 
     t->gpr[3] = ret;
-    if (!t->call_collected && (uint64_t)sp + 0x20 <= ram_size) {
+    if (!t->call_collected && (uint64_t)sp + 0x14 <= ram_size) {
         t->call_collected = true;
         uint32_t cr = ps3_be32(ram + sp + 0x0C);
 
@@ -7206,7 +7387,7 @@ static void ps3_thread_finish_call(PS3BootROMState *s, PS3Thread *t,
             t->crf[i] = (cr >> (28 - 4 * i)) & 0xF;
         }
         t->gpr[0] = ps3_be32(ram + sp + 0x08);
-        t->gpr[1] = sp + 0x20;
+        t->gpr[1] = sp + PS3_LV2_FRAME;
         if (s->ppu_trace) {
             info_report("ps3-ppu: fold: thread 0x%X wake: sp 0x%X -> 0x%X "
                         "nip 0x%" PRIX64 " srr0 0x%X ret 0x%X", t->id, sp,
@@ -8102,7 +8283,7 @@ static void ps3_sched_apply(CPUState *cs, run_on_cpu_data data)
             env->crf[i] = (cr >> (28 - 4 * i)) & 0xF;
         }
         env->gpr[0] = ps3_be32(ram + sp + 0x08);
-        env->gpr[1] = sp + 0x20;
+        env->gpr[1] = sp + PS3_LV2_FRAME;
         /*
          * A return address that is not in the image cannot be executed: the
          * thread would fetch address 0 and die on the 0x700 vector, which says
@@ -8247,8 +8428,14 @@ static void ps3_sched_stall_report(PS3BootROMState *s)
                         " r31 0x%" PRIX64,
                         t->gpr[26], t->gpr[27], t->gpr[28], t->gpr[29],
                         t->gpr[30], t->gpr[31]);
-            /* The word a poll of [rN+off] reads is usually just past a gpr. */
-            if (t->gpr[30] + 0x40 <= ram_size) {
+            /*
+             * The word a poll of [rN+off] reads is usually just past a gpr.
+             * The test is on the 32-bit address the guest would form: a
+             * register holding 0xFFFFFFFFFFFFFFFF wraps a 64-bit `+ 0x40'
+             * to 0x3F, which reads as in range and then walks off the host
+             * buffer below RAM.
+             */
+            if ((uint64_t)(uint32_t)t->gpr[30] + 0x40 <= ram_size) {
                 uint32_t base = (uint32_t)t->gpr[30];
 
                 info_report("ps3-ppu: sched:   [r30] %08X %08X %08X %08X "
@@ -11613,47 +11800,19 @@ static void ps3_rsxaudio_tick(void *opaque)
 }
 
 /*
- * The syscon EEPROM.  RPCS3's ps3_syscon is the reference for the layout: only
- * the recover byte has meaning, everything else reads 0xFF until the guest
- * writes it, and 0x48C07 is the state of the machine rather than a stored byte.
- * emer_init reads it through sys_ss_update_manager(0x600B).
+ * The syscon EEPROM is ps3_eep.c.  emer_init reads its product mode through
+ * sys_ss_update_manager(0x600B) to decide whether this console is in factory
+ * (service) mode, and the answer is the run's own state rather than a stored
+ * byte: a recovery boot is a console whose service jumper is set.
  */
-#define PS3_SYSCON_RECOVER_OFFSET   0x48C07u
-
-static uint8_t ps3_syscon_read(PS3BootROMState *s, uint32_t off)
+static void ps3_syscon_write(uint32_t off, uint8_t val)
 {
-    int i;
-
-    if (off == PS3_SYSCON_RECOVER_OFFSET) {
-        return s->syscon_recover ? 0x00 : 0xFF;
-    }
-    for (i = 0; i < s->syscon_ee_n; i++) {
-        if (s->syscon_ee[i].off == off) {
-            return s->syscon_ee[i].val;
-        }
-    }
-    return 0xFF;
-}
-
-static void ps3_syscon_write(PS3BootROMState *s, uint32_t off, uint8_t val)
-{
-    int i;
-
-    if (off == PS3_SYSCON_RECOVER_OFFSET) {
-        s->syscon_recover = val != 0xFF;
+    /* Writing product mode is how the emergency program selects factory mode. */
+    if (off == PS3_EEP_PRODUCT_MODE) {
+        ps3_eep_set_service_mode(val != 0xFF);
         return;
     }
-    for (i = 0; i < s->syscon_ee_n; i++) {
-        if (s->syscon_ee[i].off == off) {
-            s->syscon_ee[i].val = val;
-            return;
-        }
-    }
-    if (s->syscon_ee_n < ARRAY_SIZE(s->syscon_ee)) {
-        s->syscon_ee[s->syscon_ee_n].off = off;
-        s->syscon_ee[s->syscon_ee_n].val = val;
-        s->syscon_ee_n++;
-    }
+    ps3_eep_write(off, val);
 }
 
 /*
@@ -16670,10 +16829,15 @@ static unsigned ps3_rco_entry_reports;
  * which module reached them (lr), with what, and where a call through the
  * descriptor actually landed - including the 0x700 vector a bctrl through an
  * unfilled descriptor ends on.
+ *
+ * These are offsets inside the modules, not addresses: qglbase and raf land at
+ * a different base from run to run (the loader places modules in load order),
+ * so a fixed absolute address stops matching as soon as one earlier module
+ * changes size.  The bases are recorded when each module is placed.
  */
-#define PS3_QGL_RAF_ENTRY     0xE845428
-#define PS3_QGL_INIT_ENTRY    0xE4A51F4
-#define PS3_QGL_CORE_ENTRY    0xE4A47E0
+#define PS3_QGL_RAF_ENTRY     0x25428u
+#define PS3_QGL_INIT_ENTRY    0x051F4u
+#define PS3_QGL_CORE_ENTRY    0x147E0u
 
 static void ps3_qgl_trace(CPUState *cs, uint64_t pc)
 {
@@ -16684,17 +16848,37 @@ static void ps3_qgl_trace(CPUState *cs, uint64_t pc)
     uint8_t *ram;
     uint64_t ram_size;
     const char *what;
+    bool core = false;
 
-    if (!s || n >= 512) {
+    if (!s || n >= 64) {
+        return;
+    }
+    /*
+     * The 0x700 vector is reported by the fault path and repeats for as long
+     * as the run is stopped there; counting it here would fill the trace
+     * before the first qgl call and hide everything it is for.
+     */
+    if (pc == 0x700) {
         return;
     }
 
-    switch (pc) {
-    case PS3_QGL_RAF_ENTRY:  what = "raf-if";  break;
-    case PS3_QGL_INIT_ENTRY: what = "qgl-init"; break;
-    case PS3_QGL_CORE_ENTRY: what = "qgl-core"; break;
-    case 0x700:              what = "vector";  break;
-    default:                 return;
+    what = NULL;
+    if (s->qgl_base_addr && pc >= s->qgl_base_addr) {
+        uint64_t off = pc - s->qgl_base_addr;
+
+        if (off == PS3_QGL_CORE_ENTRY) {
+            what = "qgl-core";
+            core = true;
+        } else if (off == PS3_QGL_INIT_ENTRY) {
+            what = "qgl-init";
+        }
+    }
+    if (!what && s->raf_base_addr && pc >= s->raf_base_addr &&
+        pc - s->raf_base_addr == PS3_QGL_RAF_ENTRY) {
+        what = "raf-if";
+    }
+    if (!what) {
+        return;
     }
 
     ram = memory_region_get_ram_ptr(s->ram);
@@ -16709,8 +16893,7 @@ static void ps3_qgl_trace(CPUState *cs, uint64_t pc)
                 (uint64_t)env->gpr[7], (uint64_t)env->gpr[8],
                 (uint64_t)env->gpr[9], (uint64_t)env->ctr);
 
-    if ((pc == PS3_QGL_RAF_ENTRY || pc == PS3_QGL_CORE_ENTRY ||
-         pc == PS3_QGL_INIT_ENTRY) && (uint64_t)env->gpr[3] + 0x50 <= ram_size) {
+    if ((uint64_t)env->gpr[3] + 0x50 <= ram_size) {
         uint32_t obj = (uint32_t)env->gpr[3];
         uint32_t cb = ps3_be32(ram + obj + 0x10);
         uint32_t ctx = ps3_be32(ram + obj + 0xC);
@@ -16722,6 +16905,20 @@ static void ps3_qgl_trace(CPUState *cs, uint64_t pc)
         }
         info_report("ps3-qgl:   obj 0x%X: ctx 0x%X cb 0x%X -> code 0x%X "
                     "toc 0x%X", obj, ctx, cb, code, toc);
+    }
+    /*
+     * qgl_base's entry is reached through a module's import thunk, which saves
+     * its own caller's return address at 0x20(r1) without making a frame.  At
+     * the entry that slot is still the thunk's, so it names the function that
+     * asked for this call even when the callee overwrites the caller's LR slot
+     * with its own (which this function does).
+     */
+    if (core && (uint64_t)env->gpr[1] + 0x28 <= ram_size) {
+        uint32_t sp = (uint32_t)env->gpr[1];
+
+        info_report("ps3-qgl:   thunk caller 0x%" PRIX64 " (r2 0x%X)",
+                    ps3_be64(ram + sp + 0x20),
+                    ps3_be32(ram + sp + 0x28));
     }
 }
 
@@ -16878,6 +17075,116 @@ static uint32_t ps3_rco_last_nr = ~0u;
 static uint32_t ps3_rco_last_a0, ps3_rco_last_a1, ps3_rco_last_a2;
 static uint64_t ps3_rco_last_pc;
 
+/*
+ * A register probe: PS3_TRACE_PC names one or more comma-separated guest
+ * pcs whose first hits are reported with their arguments.  Reading a
+ * caller's arguments at its entry, and the result after the call returns,
+ * is how a heap or a factory is checked without guessing at the object it
+ * built afterwards.
+ */
+#define PS3_PC_PROBE_MAX 8
+
+static void ps3_pc_probe(CPUState *cs, uint64_t pc)
+{
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    CPUPPCState *env = &cpu->env;
+    static uint64_t want[PS3_PC_PROBE_MAX];
+    static unsigned want_n;
+    static bool ready;
+    static unsigned hits[PS3_PC_PROBE_MAX];
+
+    if (!ready) {
+        const char *v = g_getenv("PS3_TRACE_PC");
+
+        if (v) {
+            g_auto(GStrv) parts = g_strsplit(v, ",", PS3_PC_PROBE_MAX);
+
+            for (unsigned i = 0; parts[i] && want_n < PS3_PC_PROBE_MAX; i++) {
+                uint64_t a = g_ascii_strtoull(parts[i], NULL, 0);
+
+                if (a) {
+                    want[want_n++] = a;
+                }
+            }
+        }
+        ready = true;
+    }
+    /*
+     * PS3_SNAP_PC marks the moment and PS3_SNAP_ADDR/LEN/FILE say what to
+     * keep: a table built at run time is only readable after the point that
+     * looks it up, and this model has no monitor to ask for a range.
+     */
+    {
+        static bool snap_ready, snap_done;
+        static uint64_t snap_pc, snap_addr, snap_len;
+        static gchar *snap_file;
+
+        if (!snap_ready) {
+            const char *p = g_getenv("PS3_SNAP_PC");
+            const char *a = g_getenv("PS3_SNAP_ADDR");
+            const char *l = g_getenv("PS3_SNAP_LEN");
+
+            snap_pc = p ? g_ascii_strtoull(p, NULL, 0) : 0;
+            snap_addr = a ? g_ascii_strtoull(a, NULL, 0) : 0;
+            snap_len = l ? g_ascii_strtoull(l, NULL, 0) : 0;
+            snap_file = g_strdup(g_getenv("PS3_SNAP_FILE"));
+            snap_ready = true;
+        }
+        if (!snap_done && snap_pc && pc == snap_pc && snap_file &&
+            snap_len && ps3_pc_hook_state) {
+            uint8_t *ram = memory_region_get_ram_ptr(
+                ps3_pc_hook_state->ram);
+            uint64_t ram_size = memory_region_size(ps3_pc_hook_state->ram);
+
+            if (snap_addr + snap_len <= ram_size) {
+                g_file_set_contents(snap_file,
+                                    (const char *)ram + snap_addr,
+                                    snap_len, NULL);
+                info_report("ps3-ppu: pc 0x%" PRIX64 ": 0x%" PRIX64
+                            "..0x%" PRIX64 " written to %s", pc, snap_addr,
+                            snap_addr + snap_len, snap_file);
+            } else if (snap_addr >= PS3_RSX_LOCAL_BASE &&
+                       snap_addr + snap_len <= PS3_RSX_LOCAL_BASE +
+                                              PS3_RSX_LOCAL_SIZE) {
+                /* Local memory is the other RAM the guest addresses. */
+                uint8_t *local = memory_region_get_ram_ptr(
+                    &ps3_pc_hook_state->rsx_local) +
+                    (snap_addr - PS3_RSX_LOCAL_BASE);
+
+                g_file_set_contents(snap_file, (const char *)local,
+                                    snap_len, NULL);
+                info_report("ps3-ppu: pc 0x%" PRIX64 ": local 0x%" PRIX64
+                            "..0x%" PRIX64 " written to %s", pc, snap_addr,
+                            snap_addr + snap_len, snap_file);
+            }
+            snap_done = true;
+        }
+    }
+    {
+        unsigned slot = PS3_PC_PROBE_MAX;
+
+        for (unsigned i = 0; i < want_n; i++) {
+            if (pc == want[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == PS3_PC_PROBE_MAX || hits[slot] >= 32) {
+            return;
+        }
+        hits[slot]++;
+    }
+    info_report("ps3-ppu: pc 0x%" PRIX64 ": r3 0x%" PRIX64 " r4 0x%" PRIX64
+                " r5 0x%" PRIX64 " r6 0x%" PRIX64 " r7 0x%" PRIX64
+                " r8 0x%" PRIX64 " r30 0x%" PRIX64 " r31 0x%" PRIX64
+                " sp 0x%" PRIX64 " lr 0x%" PRIX64,
+                pc, (uint64_t)env->gpr[3], (uint64_t)env->gpr[4],
+                (uint64_t)env->gpr[5], (uint64_t)env->gpr[6],
+                (uint64_t)env->gpr[7], (uint64_t)env->gpr[8],
+                (uint64_t)env->gpr[30], (uint64_t)env->gpr[31],
+                (uint64_t)env->gpr[1], (uint64_t)env->lr);
+}
+
 static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
 {
     PS3BootROMState *s = ps3_pc_hook_state;
@@ -16896,6 +17203,9 @@ static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
 
     if (unlikely(g_getenv("PS3_QGL_TRACE"))) {
         ps3_qgl_trace(cs, pc);
+    }
+    if (unlikely(g_getenv("PS3_TRACE_PC") || g_getenv("PS3_SNAP_PC"))) {
+        ps3_pc_probe(cs, pc);
     }
     if (ps3_rco_watch.on) {
         ram = memory_region_get_ram_ptr(s->ram);
@@ -17373,7 +17683,9 @@ static void ps3_lv2_service(PS3BootROMState *s)
      * itself: its entry is where the ranges it is handed can still be read.
      */
     if (!ps3_pc_hook_state && (s->ppu_trace || g_getenv("PS3_DUMP_RCO") ||
-                               g_getenv("PS3_QGL_TRACE"))) {
+                               g_getenv("PS3_QGL_TRACE") ||
+                               g_getenv("PS3_TRACE_PC") ||
+                               g_getenv("PS3_SNAP_PC"))) {
         ps3_pc_hook_state = s;
         ps3_pc_hook_fn = ps3_rco_inflate_hook;
         info_report("ps3-ppu: rco-inflate: watching the wrapper entry at "
@@ -17588,9 +17900,20 @@ static void ps3_lv2_service(PS3BootROMState *s)
         ps3_uart_flush(s);
         info_report("ps3-ppu: process exited with status %d",
                     s->lv2_exit_status);
+        if (s->probe) {
+            /*
+             * A probe is about one process's own ending: report it and end
+             * the run.  The warm reset that a boot takes would start the
+             * recovery program again and bury the verdict under restarts.
+             */
+            info_report("ps3-probe: verdict %s: exited with status %d after "
+                        "%" PRIu64 " tick(s), %u fault report(s)",
+                        s->app_path ?: "the application", s->lv2_exit_status,
+                        s->ppu_tick_count, s->ppu_fault_reports);
+        }
         ps3_put_be32(ram + PS3_LV2_SCRATCH, 0);
         ps3_put_be32(ram + PS3_LV2_SCRATCH + 4, 1);
-        if (s->warm_reset) {
+        if (s->warm_reset && !s->probe) {
             /*
              * A process that asks for a restart and then exits is the
              * recovery program's normal ending, and on a console the reset
@@ -19140,11 +19463,31 @@ static void ps3_lv2_service(PS3BootROMState *s)
         info_report("ps3-ppu: lv2: sys_sm_shutdown(0x%X) - the recovery "
                     "program asks for a %s", a0,
                     a0 ? "restart in recovery mode" : "power off");
+        if (s->probe) {
+            /*
+             * The console would be off (or on its way through reset) by now,
+             * so the probe ends here: returning to the guest would run code
+             * that only makes sense after the reset it asked for.  hdd_copy's
+             * exchange utility is exactly this shape - it sets the EEPROM
+             * flag and asks for the restart that begins the copy.
+             */
+            info_report("ps3-probe: verdict %s: asked the system manager to "
+                        "shut down (action 0x%X) after %" PRIu64 " tick(s)",
+                        s->app_path ?: "the application", a0,
+                        s->ppu_tick_count);
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+            ret = 0;
+            break;
+        }
+        /*
+         * A probe reports this app's shutdown and ends there: arming the warm
+         * reset would re-enter the recovery program after the verdict.
+         */
         if (a0) {
             s->warm_reset = true;
             /* The byte the program just wrote is what makes the restart come
              * back into recovery. */
-            s->syscon_recover = true;
+            ps3_eep_set_service_mode(true);
         }
         ret = 0;
         break;
@@ -19536,7 +19879,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
                 ret = PS3_LV2_EFAULT;
                 break;
             }
-            ram[ptr] = ps3_syscon_read(s, a1);
+            ram[ptr] = ps3_eep_read(a1);
             if (s->ppu_trace) {
                 info_report("ps3-ppu: syscon: eeprom[0x%X] -> 0x%02X",
                             a1, ram[ptr]);
@@ -19545,7 +19888,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
             break;
         }
         case 0x600C:            /* write eeprom: offset, value */
-            ps3_syscon_write(s, a1, (uint8_t)a2);
+            ps3_syscon_write(a1, (uint8_t)a2);
             ret = 0;
             break;
         case 0x6003:            /* get installed package info */
@@ -23249,6 +23592,16 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
                 "its window title)", s->led_text);
 
     /*
+     * Naming an application makes this an application run, and the device is
+     * set up for one before it is chosen: the low page below is installed for
+     * a vsh-run, and a probe that named its app through `app=' must have it
+     * too, or its first `sc' lands on the lv0 hand-off page.
+     */
+    if (s->app_name) {
+        s->vsh_run = true;
+    }
+
+    /*
      * lv2's low page belongs to the VSH run, not to the boot chain: the
      * 0xC00 vector sits in the page lv0 loads its own trampoline into (lv0's
      * entry is 0xC40, inside it), so installing the shim for an lv0 stage
@@ -23519,6 +23872,34 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     }
 
     /*
+     * A run can name the application it enters, which is what a headless
+     * probe does: vsh.self and hdd_copy.self come from the dev_flash tree,
+     * emer_init.self from a recovery bank when the tree has no copy.  Naming
+     * one skips the chain's own choice below - the caller asked for this app
+     * and the run is about that app, not about which one lv2 would pick.
+     */
+    if (s->app_name && !ps3_app_select(s, errp)) {
+        return;
+    }
+
+    if (s->probe) {
+        if (!s->app_name) {
+            error_setg(errp, "ps3-boot-rom: probe=on needs app= (vsh, "
+                       "emer_init or hdd_copy)");
+            return;
+        }
+        /*
+         * A probe is bounded by construction: with no tick budget it would
+         * be a boot with no verdict.  Threads are watched because the app's
+         * own worker is where a parked wake shows up.
+         */
+        if (!s->ppu_ticks) {
+            s->ppu_ticks = 600;
+        }
+        s->threads_enabled = true;
+    }
+
+    /*
      * The attached storage: dev_usb000 is a host directory, so the VSH and the
      * updater read it through sys_fs.  The update flow looks for an update file
      * under PS3/UPDATE, so say whether the one that will be attached has it.
@@ -23571,7 +23952,7 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
      * vsh.self - lv2 does what the firmware does and creates the vflash recover
      * process (emergency program), which is emer_init.self.
      */
-    if (s->vsh_run) {
+    if (s->vsh_run && !s->app_name) {
         char why[192] = "";
         bool chain_ok = ps3_chain_check(s, why, sizeof(why));
         bool vsh_ok = s->vsh_self &&
@@ -23608,7 +23989,7 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
                             "emer_init.self (%s): the console stays in "
                             "recovery", reason, where);
                 s->recovery = true;
-                s->syscon_recover = true;
+                ps3_eep_set_service_mode(true);
                 ps3_vga_boot_logo("RECOVERY", reason);
                 return;
             }
@@ -23618,7 +23999,7 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
             g_free(s->vsh_self);
             s->vsh_self = NULL;
             s->recovery = true;
-            s->syscon_recover = true;
+            ps3_eep_set_service_mode(true);
 
             info_report("ps3-boot-rom: %s; creating the vflash recover "
                         "process (emergency program): /dev_flash/sys/emerge/"
@@ -24445,6 +24826,93 @@ static void ps3_ppu_tick(void *opaque)
                                             ps3_be32(ram + a + 12));
                             }
                         }
+                        /*
+                         * A virtual call through an empty slot keeps its
+                         * receiver in r3 - the callee's `lwz r2,4(r9)` has
+                         * already replaced the descriptor register - so the
+                         * object is the one word left that names the class
+                         * that shipped the hole.  Its vptr, and the table that
+                         * vptr names, say whether the object was never
+                         * constructed or its slot was left out.
+                         */
+                        {
+                            uint32_t obj = (uint32_t)cpu->env.gpr[3];
+
+                            if (obj && (uint64_t)obj + 0x20 <= ram_size) {
+                                uint32_t vptr = ps3_be32(ram + obj);
+
+                                info_report("ps3-ppu:   object 0x%X:"
+                                            " %08X %08X %08X %08X", obj,
+                                            vptr, ps3_be32(ram + obj + 4),
+                                            ps3_be32(ram + obj + 8),
+                                            ps3_be32(ram + obj + 12));
+                                if (vptr &&
+                                    (uint64_t)vptr + 0x20 <= ram_size) {
+                                    uint32_t opd = ps3_be32(ram + vptr + 4);
+
+                                    info_report("ps3-ppu:   vtable 0x%X:"
+                                                " %08X %08X %08X %08X",
+                                                vptr, ps3_be32(ram + vptr),
+                                                opd,
+                                                ps3_be32(ram + vptr + 8),
+                                                ps3_be32(ram + vptr + 12));
+                                    if (opd &&
+                                        (uint64_t)opd + 8 <= ram_size) {
+                                        info_report("ps3-ppu:   slot 1"
+                                                    " 0x%X holds 0x%X, code"
+                                                    " 0x%X",
+                                                    vptr + 4, opd,
+                                                    ps3_be32(ram + opd));
+                                    }
+                                }
+                            }
+                        }
+                        /*
+                         * A fault leaves the heap in the state that made it,
+                         * and a range read out here answers what a second run
+                         * would have to ask for.  PS3_FAULT_SNAP is
+                         * "address,length,prefix"; every fault in the run
+                         * writes its own file so two workers do not overwrite
+                         * each other's picture.
+                         */
+                        {
+                            static bool snap_ready;
+                            static uint64_t snap_at, snap_len;
+                            static gchar *snap_prefix;
+                            static unsigned snap_n;
+
+                            if (!snap_ready) {
+                                const char *v = g_getenv("PS3_FAULT_SNAP");
+
+                                if (v) {
+                                    g_auto(GStrv) parts =
+                                        g_strsplit(v, ",", 3);
+
+                                    if (parts[0] && parts[1] && parts[2]) {
+                                        snap_at = g_ascii_strtoull(parts[0],
+                                                                   NULL, 0);
+                                        snap_len = g_ascii_strtoull(parts[1],
+                                                                    NULL, 0);
+                                        snap_prefix = g_strdup(parts[2]);
+                                    }
+                                }
+                                snap_ready = true;
+                            }
+                            if (snap_prefix && snap_len &&
+                                snap_at + snap_len <= ram_size) {
+                                g_autofree gchar *fn =
+                                    g_strdup_printf("%s.%u", snap_prefix,
+                                                    snap_n);
+
+                                g_file_set_contents(fn,
+                                                    (const char *)ram +
+                                                    snap_at, snap_len, NULL);
+                                info_report("ps3-ppu:   0x%" PRIX64
+                                            "..0x%" PRIX64 " written to %s",
+                                            snap_at, snap_at + snap_len, fn);
+                                snap_n++;
+                            }
+                        }
                     }
                     if ((uint64_t)sp + 0x40 <= ram_size) {
                         char words[256];
@@ -24466,7 +24934,12 @@ static void ps3_ppu_tick(void *opaque)
                      * module that built it.
                      */
                     if ((uint64_t)sp + 0x100 <= ram_size) {
-                        uint32_t recv = ps3_be32(ram + sp + 0xB0);
+                        /*
+                         * The prologue saves r26 with `std', so the object is
+                         * the low word of the 8-byte slot; reading the high
+                         * word alone reports every object as zero.
+                         */
+                        uint32_t recv = (uint32_t)ps3_be64(ram + sp + 0xB0);
                         unsigned o;
 
                         info_report("ps3-ppu:   receiver r26=0x%X", recv);
@@ -24587,7 +25060,7 @@ static void ps3_ppu_tick(void *opaque)
              * bad slot.  Walk the back chain and print each frame's saved LR,
              * which is what a `blr` out of it would use.
              */
-            if (s->ppu_last_pc == 0x700 && s->ppu_trace) {
+            if (s->ppu_last_pc == 0x700 && (s->ppu_trace || s->probe)) {
                 uint8_t *ram = memory_region_get_ram_ptr(s->ram);
                 uint64_t ram_size = memory_region_size(s->ram);
                 uint32_t sp = (uint32_t)cpu->env.gpr[1];
@@ -24595,14 +25068,20 @@ static void ps3_ppu_tick(void *opaque)
 
                 for (depth = 0; depth < 6 && (uint64_t)sp + 0x20 <= ram_size;
                      depth++) {
+                    /*
+                     * A frame built by `stdu' keeps its back chain in the
+                     * low word of an 8-byte slot; reading the high word gets
+                     * zero and ends the walk at its first step.
+                     */
+                    uint32_t back = (uint32_t)ps3_be64(ram + sp);
+
                     info_report("ps3-ppu:   chain[%u] sp=0x%X lr=0x%" PRIX64
                                 " back=0x%X", depth, sp,
-                                ps3_be64(ram + sp + 0x10),
-                                ps3_be32(ram + sp));
-                    if (!ps3_be32(ram + sp) || ps3_be32(ram + sp) <= sp) {
+                                ps3_be64(ram + sp + 0x10), back);
+                    if (!back || back <= sp) {
                         break;
                     }
-                    sp = ps3_be32(ram + sp);
+                    sp = back;
                 }
             }
 
@@ -24621,6 +25100,29 @@ static void ps3_ppu_tick(void *opaque)
                     }
                 }
             }
+            /*
+             * A probe reports the application's own ending.  When the main
+             * thread takes the program-interrupt vector it has jumped into
+             * code that was never mapped (a descriptor whose code word is
+             * zero, or a provider that was never filled in), and nothing in
+             * the run brings it back: waiting out the tick budget only spins
+             * at 0x700.  End the probe here with the call it died in, so a
+             * run that has already loaded the application's resources says
+             * so instead of timing out on the vector.
+             */
+            if (s->probe && s->ppu_last_pc == 0x700 &&
+                s->thr_cur >= 0 && s->thr_cur < PS3_THREAD_MAX &&
+                s->thr[s->thr_cur].used && s->thr[s->thr_cur].main) {
+                info_report("ps3-probe: verdict %s: took the program "
+                            "interrupt vector 0x700 after %" PRIu64
+                            " tick(s) (lr=0x%" PRIX64 ", %u fault "
+                            "report(s))",
+                            s->app_path ?: "the application",
+                            s->ppu_tick_count,
+                            s->thr[s->thr_cur].lr, s->ppu_fault_reports);
+                qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+                return;
+            }
         }
     }
 
@@ -24637,6 +25139,12 @@ static void ps3_ppu_tick(void *opaque)
                     PRIx64 " (lr=0x%" PRIx64 ")",
                     s->ppu_tick_count, s->ppu_last_pc,
                     (uint64_t)cpu->env.lr);
+        if (s->probe) {
+            info_report("ps3-probe: verdict %s: alive at the %" PRIu64
+                        "-tick limit (pc=0x%" PRIX64 ", %u fault report(s))",
+                        s->app_path ?: "the application", s->ppu_tick_count,
+                        s->ppu_last_pc, s->ppu_fault_reports);
+        }
         /*
          * Where a bounded run stops is often a wait the guest is sitting in,
          * and the call that led there is the useful thing to know: walk the
@@ -25010,6 +25518,134 @@ static const uint8_t *ps3_vsh_open(PS3BootROMState *s, uint8_t *img, size_t len,
 }
 
 /*
+ * Resolve `app=' to the file lv2 would open.  The console's applications are
+ * guest paths on dev_flash, so a probe names them the way the firmware does
+ * and the model looks them up in the tree it mounted; a host path is never
+ * read behind the guest's back.  emer_init is the one exception the console
+ * itself makes: it is a record in a recovery bank, so when the tree has no
+ * copy the record is read and mounted the way the recovery boot does it.
+ */
+static bool ps3_app_select(PS3BootROMState *s, Error **errp)
+{
+    const char *want = s->app_name;
+    g_autofree char *guest = NULL;
+    bool from_ros = false;
+
+    if (!strcmp(want, "vsh") || !strcmp(want, "vsh.self")) {
+        guest = g_strdup("/dev_flash/vsh/module/vsh.self");
+    } else if (!strcmp(want, "emer_init") || !strcmp(want, "emer_init.self")) {
+        guest = g_strdup("/dev_flash/sys/emerge/emer_init.self");
+        from_ros = true;
+    } else if (!strcmp(want, "hdd_copy") || !strcmp(want, "hdd_copy.self")) {
+        guest = g_strdup("/dev_flash/hdd_copy.self");
+    } else if (want[0] == '/') {
+        guest = g_strdup(want);
+        from_ros = !strcmp(want, "/dev_flash/sys/emerge/emer_init.self");
+    } else {
+        error_setg(errp, "ps3-boot-rom: app=%s is neither a short name "
+                   "(vsh, emer_init, hdd_copy) nor a guest path", want);
+        return false;
+    }
+
+    g_free(s->app_path);
+    s->app_path = g_strdup(guest);
+    g_free(s->vsh_self);
+    s->vsh_self = ps3_lv2_host_path(s, guest);
+
+    /* Some dumps keep the application tree on dev_flash3 instead. */
+    if ((!s->vsh_self || !g_file_test(s->vsh_self, G_FILE_TEST_IS_REGULAR)) &&
+        s->dev_flash3 && !strncmp(guest, "/dev_flash/", 11)) {
+        g_autofree char *alt = g_build_filename(s->dev_flash3, guest + 11,
+                                                NULL);
+
+        if (g_file_test(alt, G_FILE_TEST_IS_REGULAR)) {
+            g_free(s->vsh_self);
+            s->vsh_self = g_steal_pointer(&alt);
+            g_free(s->app_path);
+            s->app_path = g_strdup_printf("/dev_flash3/%s", guest + 11);
+        }
+    }
+
+    if (s->vsh_self && g_file_test(s->vsh_self, G_FILE_TEST_IS_REGULAR)) {
+        s->vsh_run = true;
+        info_report("ps3-boot-rom: app=%s: %s (from the dev_flash tree)",
+                    want, s->app_path);
+        return true;
+    }
+
+    /*
+     * The flash's recovery banks carry the application set as well, and a
+     * dump's HDD tree does not always have the same files: hdd_copy.self is
+     * in the ros record of both images this model boots and in neither
+     * extracted tree.  Look in the bank before saying the app is missing.
+     */
+    if ((s->hdd_file || s->emmc_file) && !strncmp(guest, "/dev_flash/", 11)) {
+        gchar *ros = ps3_flash_ros_mount(s, 0, NULL);
+
+        if (ros) {
+            /* The mount returns the dev_flash directory itself. */
+            g_autofree char *alt = g_build_filename(ros, guest + 11, NULL);
+
+            if (g_file_test(alt, G_FILE_TEST_IS_REGULAR)) {
+                g_free(s->vsh_self);
+                s->vsh_self = g_strdup(alt);
+                s->vsh_run = true;
+                info_report("ps3-boot-rom: app=%s: %s (from the flash's "
+                            "recovery bank; the dev_flash tree has no copy)",
+                            want, s->app_path);
+                g_free(ros);
+                return true;
+            }
+            info_report("ps3-boot-rom: app=%s: the dev_flash tree has no "
+                        "copy and the recovery bank has no %s", want, alt);
+            g_free(ros);
+        } else {
+            info_report("ps3-boot-rom: app=%s: the flash's recovery bank "
+                        "could not be read", want);
+        }
+    }
+
+    if (from_ros) {
+        char where[64] = "";
+        int bank = -1;
+
+        if (ps3_flash_ros_read(s, "emer_init.self", &s->app_img,
+                               &s->app_img_len, where, sizeof(where), &bank)) {
+            gchar *ros = ps3_flash_ros_mount(s, bank >= 0 ? (unsigned)bank : 0,
+                                             NULL);
+
+            if (ros) {
+                g_free(s->dev_flash);
+                s->dev_flash = ros;
+            }
+            s->recovery = true;
+            ps3_eep_set_service_mode(true);
+            s->vsh_run = true;
+            info_report("ps3-boot-rom: app=%s: %" PRIu64 " bytes from the "
+                        "flash's %s", want, (uint64_t)s->app_img_len, where);
+            return true;
+        }
+    }
+
+    error_setg(errp, "ps3-boot-rom: app=%s: %s is not on dev_flash", want,
+               guest);
+    return false;
+}
+
+static const char *ps3_self_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case 1: return "lv0";
+    case 2: return "lv1";
+    case 3: return "lv2";
+    case 4: return "application";
+    case 5: return "iso spu";
+    case 6: return "lv0 spu";
+    default: return "unknown";
+    }
+}
+
+/*
  * Map the VSH into RAM the way lv2's ELF loader would: each PT_LOAD lands at
  * its physical address, its metadata section (when the container has one)
  * supplies the stored range, and compression 2 is zlib.  The segment headers
@@ -25052,6 +25688,25 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
     if (!elf) {
         error_setg(errp, "ps3-vsh: %s: %s", name, why);
         return false;
+    }
+
+    if (s->probe && is_self) {
+        uint64_t info = ps3_be64(img + 0x28);
+        uint32_t key_rev = ((unsigned)img[0x08] << 8) | img[0x09];
+        uint32_t key_type = ((unsigned)img[0x0A] << 8) | img[0x0B];
+
+        if (info + 0x18 <= header_len && info + 0x18 <= len) {
+            uint64_t authid = ps3_be64(img + info);
+            uint32_t vendor = ps3_be32(img + info + 0x08);
+            uint32_t kind = ps3_be32(img + info + 0x0C);
+            uint64_t version = ps3_be64(img + info + 0x10);
+
+            info_report("ps3-probe: %s: SELF %s (type %u), authid "
+                        "0x%016" PRIX64 ", vendor 0x%08" PRIX32 ", version "
+                        "0x%016" PRIX64 ", key revision 0x%X type 0x%X",
+                        name, ps3_self_kind_name(kind), kind, authid, vendor,
+                        version, key_rev, key_type);
+        }
     }
 
     phoff = is_self ? ps3_be64(img + 0x38) : ps3_be64(elf + 0x20);
@@ -25158,6 +25813,16 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
             bytes += MIN(src_len, memsz);
         }
 
+        /* The application's own image, for reading a fault back into vsh.self. */
+        if (g_getenv("PS3_DUMP_PRX")) {
+            g_autofree gchar *fn = g_strdup_printf("vsh.seg%u.ram", i);
+            g_autofree gchar *out = g_build_filename(g_getenv("PS3_DUMP_PRX"),
+                                                     fn, NULL);
+
+            g_file_set_contents(out, (const gchar *)(ram + pa),
+                                MIN(memsz, ram_size - pa), NULL);
+        }
+
         if (!s->vsh_lo || pa < s->vsh_lo) {
             s->vsh_lo = pa;
         }
@@ -25197,13 +25862,21 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
             return false;
         }
         info_report("ps3-vsh: decrypted container written to %s", s->vsh_dump);
-    }        info_report("ps3-vsh: %s: entry=0x%" PRIX64 ", %u segment(s), "
-                    "0x%" PRIu64 " bytes mapped into RAM%s", name, entry,
+    }
+
+    info_report("ps3-vsh: %s: entry=0x%" PRIX64 ", %u segment(s), "
+                "0x%" PRIu64 " bytes mapped into RAM%s", name, entry,
                 loaded, bytes,
                 s->vsh_run ? ", PPU entering it" : " (load-only)");
 
     ps3_vga_printf("VSH: %u SEGMENT(S), %" PRIu64 " BYTES MAPPED%s",
                    loaded, bytes, s->vsh_run ? ", ENTERING" : "");
+
+    if (s->probe) {
+        info_report("ps3-probe: %s: entry 0x%" PRIX64 ", %u segment(s), "
+                    "0x%" PRIu64 " byte(s) mapped",
+                    name, entry, loaded, bytes);
+    }
 
     if (s->vsh_run) {
         CPUState *cs = qemu_get_cpu(0);
@@ -25255,27 +25928,57 @@ static bool ps3_vsh_stage(PS3BootROMState *s, Error **errp)
         cpu->env.gpr[1] = ram_size - 0x100;
 
         /*
-         * A process starts with argc/argv, and the recovery program reads
-         * them: emer_init prints its argument vector and exits before drawing
-         * anything when argc is 0.  lv2 builds the block inside the new
-         * process's stack; here it sits just below the initial stack pointer
-         * with the image path as argv[0].
+         * A process starts with argc/argv, and the console's applications read
+         * them: emer_init looks for `-mode=safe' and hdd_copy for `-mode=1'
+         * or `-mode=2', so a run that always hands over argc=1 is not running
+         * the program the launcher would.  lv2 builds the block inside the new
+         * process's stack; here it sits just below the initial stack pointer,
+         * argv[0] first and `app-args' after it.
          */
         {
             uint32_t argv = (uint32_t)ram_size - 0x400;
             uint32_t str = (uint32_t)ram_size - 0x380;
+            uint32_t argv_max = ((uint32_t)ram_size - 0x100 - argv) / 4;
             const char *path = s->app_path ?: s->vsh_self ?: "";
             size_t len = strlen(path);
+            unsigned argc = 0;
 
-            if (len && (uint64_t)str + len + 1 <= ram_size) {
+            if (len && (uint64_t)str + len + 1 <= ram_size - 0x100 &&
+                argv_max >= 2) {
                 memcpy(ram + str, path, len + 1);
                 ps3_put_be32(ram + argv, str);
-                ps3_put_be32(ram + argv + 4, 0);
-                cpu->env.gpr[3] = 1;
+                str += len + 1;
+                argc = 1;
+            }
+
+            if (argc && s->app_args) {
+                g_auto(GStrv) parts = g_strsplit(s->app_args, " ", -1);
+
+                for (unsigned i = 0; parts[i] && argc + 1 < argv_max; i++) {
+                    size_t alen = strlen(parts[i]);
+
+                    if (!alen || (uint64_t)str + alen + 1 > ram_size - 0x100) {
+                        continue;
+                    }
+                    memcpy(ram + str, parts[i], alen + 1);
+                    ps3_put_be32(ram + argv + 4 * argc, str);
+                    str += alen + 1;
+                    argc++;
+                }
+            }
+
+            if (argc) {
+                ps3_put_be32(ram + argv + 4 * argc, 0);
+                cpu->env.gpr[3] = argc;
                 cpu->env.gpr[4] = argv;
             } else {
                 cpu->env.gpr[3] = 0;
                 cpu->env.gpr[4] = 0;
+            }
+
+            if (s->probe) {
+                info_report("ps3-probe: %s: argc=%u, arguments \"%s\"", name,
+                            argc, s->app_args ?: "");
             }
         }
         cpu->env.msr |= (1ULL << MSR_SF) | (1ULL << MSR_ME) |
@@ -25367,7 +26070,7 @@ static const Property ps3_rom_properties[] = {
      * decrypt and verify the chain.  own-rom=off is the explicit opt-in to the
      * mask-ROM replay, and requires -bios. */
     DEFINE_PROP_BOOL("own-rom", PS3BootROMState, own_rom, true),
-    /* Boot with the EEPROM's recover flag set, i.e. into the recovery loop. */
+    /* Boot as a console whose service jumper is set, i.e. into recovery. */
     DEFINE_PROP_BOOL("recover", PS3BootROMState, recover_prop, false),
 
     DEFINE_PROP_UINT64("hdd-size", PS3BootROMState, hdd_size, 20 * GiB),
@@ -25386,6 +26089,10 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_STRING("pck2", PS3BootROMState, pck2_prop),
     DEFINE_PROP_STRING("pck2-file", PS3BootROMState, pck2_file),
     DEFINE_PROP_BOOL("vsh-run", PS3BootROMState, vsh_run, false),
+    /* Which application the run enters, and whether it is a probe. */
+    DEFINE_PROP_STRING("app", PS3BootROMState, app_name),
+    DEFINE_PROP_STRING("app-args", PS3BootROMState, app_args),
+    DEFINE_PROP_BOOL("probe", PS3BootROMState, probe, false),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
     /* Address a container at an exact flash offset; UINT64_MAX leaves it to
@@ -25600,6 +26307,217 @@ static void ps3_lv2_trap_write(void *opaque, hwaddr addr, uint64_t value,
     }
 }
 
+/*
+ * A watch on a fixed low address.  A module can read a pointer from a fixed
+ * slot in the first page (custom_render_plugin reads one from 0x2C), and a
+ * value there that names code instead of an object is only explained by the
+ * store that put it there.  This passes reads and writes through to RAM and
+ * reports the first stores with the pc, lr and argument registers.
+ */
+#define PS3_LOW_WATCH_BASE  0x20
+#define PS3_LOW_WATCH_SIZE  0x20
+#define PS3_LOW_WATCH_SLOT  0xC
+#define PS3_LOW_WATCH_MAX   8
+
+typedef struct PS3LowWatch {
+    MemoryRegion *ram;
+    hwaddr base;
+    hwaddr len;
+    hwaddr slot;
+    unsigned writes;
+} PS3LowWatch;
+
+static uint64_t ps3_low_watch_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PS3LowWatch *w = opaque;
+    const uint8_t *p = memory_region_get_ram_ptr(w->ram) + w->base + addr;
+    uint64_t v = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        v = (v << 8) | p[i];
+    }
+
+    return v;
+}
+
+static void ps3_low_watch_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size)
+{
+    PS3LowWatch *w = opaque;
+    uint8_t *p = memory_region_get_ram_ptr(w->ram) + w->base + addr;
+    CPUState *cs = qemu_get_cpu(0);
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        p[i] = (uint8_t)(value >> (8 * (size - 1 - i)));
+    }
+    /*
+     * The slot a module reads is the one to watch: a store that covers it is
+     * reported even after the fill traffic has used up the general lines.
+     */
+    {
+        bool hit = addr <= w->slot && addr + size > w->slot;
+
+        if (!hit && w->writes >= PS3_LOW_WATCH_MAX) {
+            w->writes++;
+            return;
+        }
+        w->writes++;
+        if (!cs) {
+            return;
+        }
+        {
+            CPUPPCState *env = &POWERPC_CPU(cs)->env;
+
+            info_report("ps3-ppu: low: store of 0x%" PRIX64 " (%u byte(s)) "
+                        "to 0x%X%s (pc=0x%" PRIX64 ", lr=0x%" PRIX64
+                        ", r3=0x%" PRIX64 ", r4=0x%" PRIX64
+                        ", r9=0x%" PRIX64 ")",
+                        value, size, (unsigned)(w->base + addr),
+                        hit ? " [the watched slot]" : "",
+                        (uint64_t)env->nip, (uint64_t)env->lr,
+                        (uint64_t)env->gpr[3], (uint64_t)env->gpr[4],
+                        (uint64_t)env->gpr[9]);
+            /*
+             * The watched slot is written by the allocator, so the store's own
+             * lr points inside it.  The back chain above it names the code
+             * that set up the arena, which is the caller worth having.
+             */
+            if (hit) {
+                uint8_t *ram = memory_region_get_ram_ptr(w->ram);
+                uint64_t ram_size = memory_region_size(w->ram);
+                uint32_t sp = (uint32_t)env->gpr[1];
+                unsigned depth;
+
+                for (depth = 0; depth < 6 &&
+                     (uint64_t)sp + 0x20 <= ram_size; depth++) {
+                    uint32_t back = (uint32_t)ps3_be64(ram + sp);
+
+                    info_report("ps3-ppu: low:   chain[%u] sp=0x%X lr=0x%"
+                                PRIX64 " back=0x%X", depth, sp,
+                                ps3_be64(ram + sp + 0x10), back);
+                    if (!back || back <= sp) {
+                        break;
+                    }
+                    sp = back;
+                }
+            }
+        }
+    }
+}
+
+static const MemoryRegionOps ps3_low_watch_ops = {
+    .read = ps3_low_watch_read,
+    .write = ps3_low_watch_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/*
+ * A watch on a window of one thread's stack.  A callee-saved register that
+ * comes back with a different upper half than it went out with was restored
+ * from a word some other store reached, and the only way to name that store
+ * is to see every one of them.  PS3_STACK_WATCH=base,len installs the
+ * window; every store in it is reported once, with the pc and the frame.
+ */
+#define PS3_STACK_WATCH_MAX 400
+
+typedef struct PS3StackWatch {
+    MemoryRegion *ram;
+    hwaddr base;
+    hwaddr len;
+    unsigned writes;
+} PS3StackWatch;
+
+static uint64_t ps3_stack_watch_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PS3StackWatch *w = opaque;
+    const uint8_t *p = memory_region_get_ram_ptr(w->ram) + w->base + addr;
+    uint64_t v = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        v = (v << 8) | p[i];
+    }
+
+    return v;
+}
+
+static void ps3_stack_watch_write(void *opaque, hwaddr addr, uint64_t value,
+                                  unsigned size)
+{
+    PS3StackWatch *w = opaque;
+    uint8_t *p = memory_region_get_ram_ptr(w->ram) + w->base + addr;
+    CPUState *cs = qemu_get_cpu(0);
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        p[i] = (uint8_t)(value >> (8 * (size - 1 - i)));
+    }
+
+    if (!cs || w->writes >= PS3_STACK_WATCH_MAX) {
+        w->writes++;
+        return;
+    }
+    /*
+     * A window that only wants one value says so: PS3_STACK_WATCH_VALUE
+     * reports a store only when the word it writes is that value, which is
+     * how a single 32-bit half of a saved register is found among a frame's
+     * ordinary traffic.
+     */
+    {
+        static bool filt_ready;
+        static uint32_t filt;
+
+        if (!filt_ready) {
+            const char *v = g_getenv("PS3_STACK_WATCH_VALUE");
+
+            filt = v ? (uint32_t)g_ascii_strtoull(v, NULL, 0) : 0;
+            filt_ready = true;
+        }
+        if (filt) {
+            bool hit = false;
+
+            for (i = 0; i < size; i += 4) {
+                uint32_t word = 0;
+
+                for (unsigned k = 0; k < 4 && i + k < size; k++) {
+                    word = (word << 8) |
+                           (uint8_t)(value >> (8 * (size - 1 - i - k)));
+                }
+                if (word == filt) {
+                    hit = true;
+                }
+            }
+            if (!hit) {
+                w->writes++;
+                return;
+            }
+        }
+    }
+    w->writes++;
+    {
+        CPUPPCState *env = &POWERPC_CPU(cs)->env;
+
+        info_report("ps3-ppu: stack: store 0x%" PRIX64 "/%u to 0x%" PRIX64
+                    " (pc=0x%" PRIX64 ", lr=0x%" PRIX64 ", sp=0x%" PRIX64
+                    ", r30=0x%" PRIX64 ")",
+                    value, size, (uint64_t)(w->base + addr),
+                    (uint64_t)env->nip, (uint64_t)env->lr,
+                    (uint64_t)env->gpr[1], (uint64_t)env->gpr[30]);
+    }
+}
+
+static const MemoryRegionOps ps3_stack_watch_ops = {
+    .read = ps3_stack_watch_read,
+    .write = ps3_stack_watch_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
 static const MemoryRegionOps ps3_lv2_trap_ops = {
     .read = ps3_lv2_trap_read,
     .write = ps3_lv2_trap_write,
@@ -25635,6 +26553,82 @@ static void rs6000_ps3_lv2_page(MemoryRegion *sysmem, MemoryRegion *ram)
         ps3_put_be32(p + i * 4, ps3_lv2_shim[i]);
     }
     memory_region_add_subregion_overlap(sysmem, PS3_LV2_VECTOR, vector, 1);
+
+    {
+        const char *v = g_getenv("PS3_STACK_WATCH");
+
+        if (v) {
+            PS3StackWatch *watch = g_new0(PS3StackWatch, 1);
+            MemoryRegion *watch_mr = g_new0(MemoryRegion, 1);
+            char *end = NULL;
+            uint64_t base = g_ascii_strtoull(v, &end, 0);
+            uint64_t len = (end && *end == ',') ?
+                           g_ascii_strtoull(end + 1, NULL, 0) : 0x300;
+
+            watch->ram = ram;
+            watch->base = base;
+            watch->len = len;
+            memory_region_init_io(watch_mr, NULL, &ps3_stack_watch_ops,
+                                  watch, "ps3.stack-watch", len);
+            memory_region_add_subregion_overlap(sysmem, base, watch_mr, 1);
+            info_report("rs6000-ps3: watching stack stores to 0x%" PRIX64
+                        "..0x%" PRIX64, (uint64_t)base,
+                        (uint64_t)(base + len));
+        }
+    }
+
+    if (g_getenv("PS3_WATCH_LOW")) {
+        PS3LowWatch *watch = g_new0(PS3LowWatch, 1);
+        MemoryRegion *watch_mr = g_new0(MemoryRegion, 1);
+
+        watch->ram = ram;
+        watch->base = PS3_LOW_WATCH_BASE;
+        watch->len = PS3_LOW_WATCH_SIZE;
+        watch->slot = PS3_LOW_WATCH_SLOT;
+        /*
+         * A module can read a pointer from any fixed slot in the first page,
+         * and mms reads a whole block of them (0x1C, 0x2C, 0x4C, ...).  The
+         * window and the slot that is always reported are both selected so a
+         * run can watch the block the caller actually uses.
+         */
+        {
+            const char *v = g_getenv("PS3_WATCH_LOW_RANGE");
+            const char *s = g_getenv("PS3_WATCH_LOW_SLOT");
+            uint64_t slot = watch->base + PS3_LOW_WATCH_SLOT;
+
+            if (v) {
+                char *end = NULL;
+
+                watch->base = g_ascii_strtoull(v, &end, 0);
+                watch->len = end && *end == ',' ?
+                             g_ascii_strtoull(end + 1, NULL, 0) :
+                             PS3_LOW_WATCH_SIZE;
+                slot = watch->base + PS3_LOW_WATCH_SLOT;
+            }
+            if (s) {
+                slot = g_ascii_strtoull(s, NULL, 0);
+            }
+            if (!watch->len) {
+                watch->len = PS3_LOW_WATCH_SIZE;
+            }
+            if (slot >= watch->base && slot < watch->base + watch->len) {
+                watch->slot = slot - watch->base;
+            } else {
+                watch->slot = PS3_LOW_WATCH_SLOT;
+            }
+        }
+        if (!watch->len) {
+            watch->len = PS3_LOW_WATCH_SIZE;
+        }
+        memory_region_init_io(watch_mr, NULL, &ps3_low_watch_ops, watch,
+                              "ps3.low-watch", watch->len);
+        memory_region_add_subregion_overlap(sysmem, watch->base, watch_mr, 1);
+        info_report("rs6000-ps3: watching stores to 0x%" PRIX64
+                    "..0x%" PRIX64 " (slot 0x%" PRIX64 ")",
+                    (uint64_t)watch->base,
+                    (uint64_t)(watch->base + watch->len),
+                    (uint64_t)(watch->base + watch->slot));
+    }
 
     info_report("rs6000-ps3: lv2 low page: %u-word sc vector at 0x%X as ROM, "
                 "scratch 0x%X..0x%X trapped",

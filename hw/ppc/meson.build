@@ -75,6 +75,7 @@ ppc_ss.add(when: 'CONFIG_PREP', if_true: files('prep_systemio.c'))
 ppc_ss.add(when: 'CONFIG_RS6000_MC', if_true: files('rs6000_mc.c'))
 ppc_ss.add(when: 'CONFIG_RS6000_PS3', if_true: files(
   'rs6000_ps3.c',
+  'ps3_eep.c',
   'ps3_spu.c',
   'ps3_self.c',
   'ps3_vga.c',
