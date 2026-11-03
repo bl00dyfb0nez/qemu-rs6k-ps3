@@ -1,11 +1,16 @@
-# Delete old workflow runs so their pages, their logs and the artifacts they
-# carry stop being reachable from the Actions UI.
+# Delete every workflow run that predates the current commit, so the run pages,
+# logs and artifacts from earlier commits stop being reachable from the Actions
+# UI as soon as a new commit lands.
 #
 # A run pins the commit it was started from.  Once that commit has been rewritten
 # out of every branch, the run page is the last in-repository way to open it, and
-# a run is not deleted by a force-push.  Pruning runs on a schedule is the part of
-# that cleanup a workflow can do for itself; objects GitHub keeps internally are
-# still only removable through a support request.
+# a force-push does not delete runs.  Pruning on every push closes that route.
+#
+# retain_days: 0 disables the age filter - the action only applies it when the
+# value is greater than zero - and keep_minimum_runs: 1 then retains only the
+# newest completed run of each workflow.  Runs that are not completed are never
+# deletion candidates, so this job cannot delete itself; a workflow whose current
+# run is still in flight keeps its previous run until the next push removes it.
 #
 # `actions: write` is required to delete runs.  A workflow started by `schedule`
 # gets a read-only token unless the permission is declared here, and a repository
@@ -14,6 +19,8 @@
 name: Delete old workflow runs
 
 on:
+  push:
+    branches: [master]
   schedule:
     # Daily, well away from the build workflow's peak so the two do not contend.
     - cron: '17 3 * * *'
@@ -25,7 +32,7 @@ permissions:
 
 jobs:
   delete-runs:
-    name: Prune runs older than 30 days
+    name: Prune runs from earlier commits
     runs-on: ubuntu-latest
     steps:
       - name: Delete old workflow runs
@@ -33,5 +40,5 @@ jobs:
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          retain_days: 30
-          keep_minimum_runs: 6
+          retain_days: 0
+          keep_minimum_runs: 1
