@@ -86,8 +86,19 @@ QEMU_ROOT = os.path.dirname(HERE)
 HOME = os.path.dirname(QEMU_ROOT)
 TOOLS = os.path.join(HOME, "Documents", "ps3tools-main")
 
-QEMU = os.path.join(QEMU_ROOT, "build-ps3", "qemu-system-ppc64.exe")
-ROM = os.path.join(TOOLS, ".tmp", "rom", "rom.bin")
+
+def first_existing(*paths):
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    return paths[0]
+
+
+QEMU = first_existing(os.path.join(QEMU_ROOT, "build-ps3", "qemu-system-ppc64"),
+                      os.path.join(QEMU_ROOT, "build-ps3",
+                                   "qemu-system-ppc64.exe"))
+ROM = first_existing(os.path.join(TOOLS, ".tmp", "rom", "rom.bin"),
+                     os.path.join(HOME, "Downloads", "rom.bin"))
 WORK = os.path.join(QEMU_ROOT, ".tmp", "romexec_sweep")
 DOWNLOADS = os.path.join(HOME, "Downloads")
 

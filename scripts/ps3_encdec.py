@@ -44,7 +44,7 @@ Usage
   py scripts/ps3_encdec.py open  --pck1 erk48.bin --image drive.img --ata
                                  # a FAT console's disk: --fat instead
 
-The default seal is the eMMC storage area's (the encdec pair, AES-256 XTS).
+The default seal is the eMMC storage area's (the encdec pair, AES-128 XTS).
 A console's *disk* is a different scheme: `--ata` uses the ATA pair with
 AES-128 XTS and the 16-bit sector swap, `--fat` the ATA pair with AES-192 CBC
 and the same swap, exactly as ps3encdec's decrypt_all_sectors() does.
@@ -103,12 +103,13 @@ KAT_CBC_PT = bytes(range(32))
 KAT_CBC_CT = bytes.fromhex(
     "5A6E045708FB7196F02E553D02C3A692C77147EBD5121DE8D0FAE7762423B6BF")
 KAT_XTS_CT = bytes.fromhex(
-    "3A8C89CAB036012A4EE848E9819C281A79BF4DA7D64C9155D0DBBF7A225238AA"
-    "B4A216E205A1D63A075A0130F44F93B4B19BD20B620698719B8F9E4401983BAF")
+    "159EF38C99BA7D3E76EE41F8FDA27379FED88DE9F6CF287A6E71FBFBEAC590A8"
+    "52F392C6C693D70BFAE8E5F8CD6C053B15D35F97E56DC70D3559B8606FA4340F")
 
 
 # --------------------------------------------------------------------------
-# AES-256, CBC (the ladder) and XTS (the sectors).  ECB comes from pycryptodome;
+# AES-256 for the CBC ladder, AES-128 for the XTS sectors.  ECB comes from
+# pycryptodome;
 # the modes are built on it so both match aes.c / ps3_aes.c exactly.
 
 def ecb_encrypt(key, block):
@@ -144,7 +145,7 @@ def cbc_decrypt(key, iv, data):
     return bytes(out)
 
 
-def xts_crypt(data_key, tweak_key, sector, buf, encrypt, keybits=256):
+def xts_crypt(data_key, tweak_key, sector, buf, encrypt, keybits=128):
     """XTS-AES over one 512-byte sector, tweak = sector number (little-endian).
 
     Port of aes_xts_crypt() from naehrwert's ps3encdec: encrypt the tweak with
@@ -152,10 +153,9 @@ def xts_crypt(data_key, tweak_key, sector, buf, encrypt, keybits=256):
     tweak by x in GF(2^128) with the same byte order (bit 7 of byte i is the
     carry out of byte i).
 
-    `keybits` is the AES key size the ENCDEC device is given: the hardware path
-    is 128, so only the first 16 bytes of each 32-byte derived key are used,
-    while the model uses all 32.  The tweak and the GF step are the same either
-    way.
+    `keybits` is the AES key size the ENCDEC device is given: hardware and the
+    model both use 128, so only the first 16 bytes of each 32-byte derived key
+    are used.  The tweak and the GF step are the same either way.
     """
     if not buf or len(buf) % 16:
         return bytes(buf)

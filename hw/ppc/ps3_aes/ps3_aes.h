@@ -99,9 +99,8 @@ void ps3_encdec_keys(const uint8_t erk[48], uint8_t data_key[32],
                      uint8_t tweak_key[32]);
 
 /*
- * XTS-AES over one sector with the ATA keys: 256-bit data and tweak keys,
- * the sizes naehrwert's ps3_decrypt_tools derive and the order the consoles'
- * ATA controllers use.  `sector` is the sector number; `len` must be a
+ * XTS-AES over one sector with the ATA keys: XTS-AES-128, the first 16 bytes
+ * of each derived 32-byte key, which is what the console's ENCDEC device uses.  `sector` is the sector number; `len` must be a
  * multiple of 16 and no larger than a sector (512 bytes).  The eMMC's storage
  * area goes through this same function, with the encdec pair above instead:
  * one cipher, two ladders, exactly as the console's own encdec block does it.
@@ -111,7 +110,7 @@ void ps3_xts_crypt_sector(const uint8_t data_key[32],
                           uint8_t *buf, size_t len, bool encrypt);
 
 /*
- * Known-answer check over the AES-256 CBC and XTS paths: the AES-256-CBC
+ * Known-answer check over the AES-256-CBC and XTS-AES-128 paths: the CBC
  * vector is FIPS-197's key schedule over a fixed block, and the XTS one is
  * the ATA derivation of a test ERK followed by a sector encryption, both
  * cross-checked against an independent implementation.  Returns false and

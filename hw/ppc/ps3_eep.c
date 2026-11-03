@@ -36,12 +36,20 @@
  * always has a console's EEPROM and no run-time dump is accepted - so the
  * image below is the only source of EEPROM bytes.
  *
- * Two bytes cannot come from it.  Product mode and the recover flag describe
- * how *this* console was started, not what the part stores: a run in recovery
- * mode is a console whose service jumper was set, and lv2 asks those two
- * bytes to find that out.  They are therefore kept as state here, retail
- * (0xFF) until the machine enters service/recovery mode, and the readout's
- * own bytes at those offsets are left alone.
+ * Two bytes cannot come from it.
+ *
+ * The recover flag describes how *this* console was started: clear on a
+ * console whose service jumper was set, which is what a recovery run is.  It
+ * is state here, retail (0xFF) until the machine enters recovery.
+ *
+ * Product mode is not the machine's: it is what a program writes to select
+ * factory (service) mode, 0x00/0xFE, and a program's write is the state a
+ * later read and the next boot see.  A console in recovery is still a retail
+ * console, so product mode reads 0xFF there; tying the two together made
+ * emer_init read product mode 0x00 in recovery and take its factory branch,
+ * writing the recover flag and restarting instead of drawing the menu.
+ *
+ * The readout's own bytes at those offsets are left alone.
  */
 #include "qemu/osdep.h"
 #include "hw/ppc/ps3_eep.h"
@@ -93,16 +101,26 @@ uint8_t ps3_eep_read(uint32_t nvs_off)
     uint32_t nvs_byte;
     int i;
 
-    if (nvs_off == PS3_EEP_PRODUCT_MODE) {
-        return ps3_eep_service ? 0x00 : 0xFF;
-    }
-    if (nvs_off == PS3_EEP_RECOVER) {
-        return ps3_eep_service ? 0x00 : 0xFF;
-    }
+    /*
+     * A program's own writes come first: they are how a factory-mode program
+     * selects product mode, and how one clears the recover flag before asking
+     * for the restart that leaves recovery.
+     */
     for (i = 0; i < ps3_eep_nwrites; i++) {
         if (ps3_eep_writes[i].off == nvs_off) {
             return ps3_eep_writes[i].val;
         }
+    }
+    /*
+     * Retail until a program says otherwise: recovery is a retail console
+     * whose recover flag is clear, not a factory one, and the emergency
+     * program takes the factory branch when product mode reads 0x00.
+     */
+    if (nvs_off == PS3_EEP_PRODUCT_MODE) {
+        return 0xFF;
+    }
+    if (nvs_off == PS3_EEP_RECOVER) {
+        return ps3_eep_service ? 0x00 : 0xFF;
     }
     if (ps3_eep_nvs_byte(nvs_off, &nvs_byte) &&
         nvs_byte < PS3_EEP_IMAGE_USED) {
@@ -115,10 +133,6 @@ void ps3_eep_write(uint32_t nvs_off, uint8_t val)
 {
     int i;
 
-    if (nvs_off == PS3_EEP_PRODUCT_MODE) {
-        /* Only service mode writes this byte, and only the model does. */
-        return;
-    }
     for (i = 0; i < ps3_eep_nwrites; i++) {
         if (ps3_eep_writes[i].off == nvs_off) {
             ps3_eep_writes[i].val = val;

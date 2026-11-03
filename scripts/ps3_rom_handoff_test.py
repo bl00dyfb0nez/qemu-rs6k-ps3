@@ -49,7 +49,7 @@ Each run passes `exit-on-stop=on`, so the model ends the run itself the moment
 the snapshot is written; a run that has to be killed is reported as a failure.
 
 Prerequisites: the Cell SDK ROM (`Downloads/rom.bin`), a built
-`build-ps3/qemu-system-ppc64.exe`, and pycryptodome.  Missing any of them is a
+`build-ps3/qemu-system-ppc64`, and pycryptodome.  Missing any of them is a
 skip, not a pass.
 
     py scripts/ps3_rom_handoff_test.py [--rom ...] [--qemu ...] [--keep]
@@ -89,9 +89,9 @@ ROM_CANDIDATES = [
     os.path.join(QEMU_ROOT, ".tmp", "rom", "rom.bin"),
 ]
 QEMU_CANDIDATES = [
-    os.path.join(QEMU_ROOT, "build-ps3", "qemu-system-ppc64.exe"),
     os.path.join(QEMU_ROOT, "build-ps3", "qemu-system-ppc64"),
-    os.path.join(QEMU_ROOT, "build-ps3-gui", "qemu-system-ppc64.exe"),
+    os.path.join(QEMU_ROOT, "build-ps3", "qemu-system-ppc64.exe"),
+    os.path.join(QEMU_ROOT, "build-ps3-gui", "qemu-system-ppc64"),
 ]
 
 SBOX = bytes.fromhex(

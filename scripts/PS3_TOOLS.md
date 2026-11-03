@@ -18,7 +18,7 @@ derived from one.
 | `ps3_hdd_create.py` | writes a model-specific raw HDD image. Sector 0 contains the model's `PS3ATA01` key block wrapped with AES-256-CBC; the remaining area is initially zero-filled. This format is not verified as a retail console disk. |
 | `ps3_hdd_tree.py` | puts the console's own file tree (`dev_flash`, `dev_flash2`, `dev_flash3`, `dev_hdd0`) inside such an image, and lists what is in one. |
 | `ps3_emmc_create.py` | builds the 12 GB eMMC image of a 40xxA from a NAND dump: the dump at its NAND position 0x40000, the erased tail of the NAND-mapped area written out as 0xFF up to 0x10000000, the `dev_flash*`/`dev_hdd0`/`dev_hdd1` tree there, and - given the console's ERK - that storage area sealed with the model's own XTS layer.  `--verify` reads a finished image back and checks it against the dump. |
-| `ps3_disk_verify.py` | reads samples from an image or `\\.\PhysicalDriveN`, tries ATA keys derived from a candidate, and reports structural heuristics and the model key-block check. Read-only; a heuristic result is not proof of console ownership. |
+| `ps3_disk_verify.py` | reads samples from an image or a raw device, tries ATA keys derived from a candidate, and reports structural heuristics and the model key-block check. Read-only; a heuristic result is not proof of console ownership. |
 | `ps3_encdec.py` | derives the console's ENCDEC ladder from PCK1 - the encdec and ATA data/tweak keys, each AES-256-CBC over the published seed block - and seals or opens an image's 512-byte sectors with the encdec pair (XTS-AES, the sector number as the tweak).  A console's *disk* is a different scheme and `--ata` uses it: the ATA pair, AES-128 XTS and the 16-bit sector swap, byte-identical to `ps3encdec`'s ATA branch both ways; `--fat` is the FAT console's AES-192 CBC variant.  Writes the same bytes as the C seal tool `ps3_emmc_create.py` builds, with no compiler.  `loaders` also opens metldr/lv0ldr from a dump with a channel-66 readout, using the ROM's own rules (below), and scans the metldr plaintext for the 48-byte PCK1 that the EID0 CMAC accepts - so the ladder starts from a key the console itself carries.  `chain` walks the whole thing in one pass (`--readout` from PCK0, or `--pck1` from the ERK) and stops at the first missing input, naming it. |
 | `ps3_capture_verify.py` | checks a 16/32/48-byte capture against a NOR or NAND dump's loader containers and EID0 CMAC, in memory, and prints only PASS/FAIL.  It is the gate `ps3_ram_dump.py --launch` uses and never prints or writes key material. |
 | `ps3_ch66_triage.py` | one command for one question: does a 32-byte channel-66 readout belong to this dump?  It reports whether the readout opens `metldr.2` or `lv0ldr.2` at their real offsets, using the container's own tag, and searches past the two half orders into all 1,152 four-word compositions of each half (the ROM assembles the readout from eight 32-bit reads, so another tool's dump can hold the same words in a different order).  The word pass runs on the cheaper container and its hit composition is then tried once against the other, because a capture's layout is one fact; `--quick` stops at the half orders and says the `no` is narrower.  A hit names the composition, and a reversed capture says so before it is fed to the model.  Prints file name, length, offsets, block counts and PASS/no - never the readout - and `--selftest` proves both answers with no dump, no ROM and no console.  `--rom-exec` puts the mask ROM's own answer beside the Python one: the readout goes to the model, the published ROM is replayed over the same dump through `ps3_romexec_sweep.boot()` (one argv and verdict parser, not two), and its stop code is printed under each container.  Exit 0 opens a container, 3 opens neither, 2 usage or unreadable material, 5 the dump has no container at those offsets, 7 the ROM and the model disagree. |
@@ -62,7 +62,7 @@ py scripts/ps3_hdd_tree.py -o hdd.raw --size 20G --root /path/to/rs3
 py scripts/ps3_hdd_tree.py hdd.raw --list
 
 # boot the console from nothing but that disk
-build-ps3-gui/qemu-system-ppc64.exe -M rs6000-ps3 -display sdl \
+build-ps3-gui/qemu-system-ppc64 -M rs6000-ps3 -display sdl \
     -global ps3-boot-rom.hdd-file=hdd.raw \
     -global ps3-boot-rom.boot-medium=hdd \
     -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
@@ -151,7 +151,7 @@ The three images in `Downloads` are not three versions of one console:
 
 | image | firmware | console |
 | --- | --- | --- |
-| `CECH4301C.NOR.BIN` | 4.57 | the 4301C whose 1 TB drive is `\\.\PhysicalDrive1` |
+| `CECH4301C.NOR.BIN` | 4.57 | the 4301C, whose 1 TB drive was read on the bench |
 | `CECH4301C-verylate.NOR.BIN` | 4.60 | a second 4301C - a later firmware *and* a different console |
 | `CECH4201A.NAND.BIN` | NAND 4201A | a third console, different model |
 
@@ -195,6 +195,15 @@ It scans the decrypted `metldr` first, then `lv0ldr.2`, and accepts a 48-byte
 window only when it authenticates EID0.  A loader with no raw copy is reported
 as such; that scan is a model convenience, not the hardware derivation.
 
+The scan now checks metldr's own hand-off slot before any window search: the
+real metldr plaintext carries PCK1 at `0xD2D0` (32-byte key + 16-byte IV) and
+the loader build tag at `0xD300`, and lv0pen's rebuilt `metldr2` hands those
+32/16/8 pieces to local store `0x00/0x20/0x30` - the shape the 3.6.5 sample
+exposes.  `--scan-lv0` reports that slot when it authenticates EID0, says when
+the slot is present but belongs to another console, and saves the 48 bytes with
+`--save-pck1`.  The 4.57 dump's own container still cannot be opened without
+PCK0, so it remains a refusal rather than a guess.
+
 A 48-byte capture that passes here is the same PCK1 `ps3_encdec.py` checks.
 Re-run its EID0 check and derive the ENCDEC ladder before sealing a disk:
 
@@ -224,7 +233,7 @@ path, where the 0x400-byte ROM is executed by the SPU interpreter and the device
 writes what it read:
 
 ```sh
-./build-ps3/qemu-system-ppc64.exe -M rs6000-ps3 -bios .tmp/rom/rom.bin \
+./build-ps3/qemu-system-ppc64 -M rs6000-ps3 -bios .tmp/rom/rom.bin \
     -global ps3-boot-rom.own-rom=off \
     -global ps3-boot-rom.ch66-capture=.tmp/ch66.bin -nographic
 # channel-66 capture: 8 read(s), 32 bytes in read order -> .tmp/ch66.bin
@@ -290,10 +299,8 @@ opens `metldr.2` (tag `073b64ccaaa20d038c23db0ca1a2c72d`, 3991 blocks) or
 `lv0ldr.2` (tag `0831e7d76ca9a516ded96891d7aa2d12`, 12,315 blocks).  In
 particular `ch66_chain/4301c_romexec_cap.bin` is the ROM's own read on a
 **synthetic** console (`chain.json` records `"mode": "synthetic"`), so the
-`4301c` in its name is the model it ran on, not hardware material; and
-`.tmp/keys/ch66_private.bin` opens neither this dump nor the `sample2`
-containers, so it is a candidate, not a capture.  A readout taken off the
-console is the only thing that changes this result.
+`4301c` in its name is the model it ran on, not hardware material.  A readout
+taken off the console is the only thing that changes this result.
 
 That sweep is a tool now, so the next capture is one command rather than a
 one-off script.  It searches the two half orders and, when they fail, the
@@ -416,8 +423,8 @@ right length, but it is not one - 0.4% zero bytes against the samples' 10.8%,
 and it is neither the zero-readout nor the zero-key decryption of the
 container, so it is a wrong-key artefact and nothing should be read from it.  The arithmetic
 underneath is pinned separately, without QEMU or sample files, by
-`ps3_r7_inversion_test.py` (21 checks, the FIPS-197 vector among them).  Only fingerprints
-are printed (`Kp` d4c5fe3992ab6a70 and 44b3a37ece799721).  It does not change
+`ps3_r7_inversion_test.py` (21 checks, the FIPS-197 vector among them).  Only
+fingerprints are printed, never key bytes.  It does not change
 the 4301C's position - the samples are other consoles' containers, and their
 keys say nothing about this dump's.
 
@@ -550,7 +557,7 @@ before `wrch $ch64,$1`, so they touch 13 channels and an opened container adds
 0x40.
 
 The container code is cross-checked against an independent C implementation
-(`Downloads/spu_iso_tool-master`): on canonical containers the two agree byte
+(the published `spu_iso_tool`): on canonical containers the two agree byte
 for byte in both directions (our seal == its `enc` output, each opens the
 other's), and `.tmp/probes/spu_iso_diff.py` re-runs that with the working key
 *derived* from a private readout file.  It is not an oracle for the Size1 gate:
@@ -878,17 +885,17 @@ The pair was previously compared with the reference binary on synthetic
 fixtures: the ATA derivation and both the slim XTS and `-p` FAT CBC decryption
 paths agreed on those fixtures. Re-checked after the device work: 8 sectors
 from one random 48-byte ERK, sealed by Python and opened by
-`bin/Release/ps3encdec.exe`, give back the exact plaintext; `-e` gives back the
+`bin/Release/ps3encdec`, give back the exact plaintext; `-e` gives back the
 exact ciphertext; Python opens the reference's sectors; and `-p` agrees the
 same way. So the ATA AES is not the open question on a real disk.
 
-A device path needs two things an image does not: `\\.\PhysicalDriveN` cannot
+A device path needs two things an image does not: a raw device node cannot
 be stat-ed, so the path check accepts the device namespace instead of asking
 `os.path.exists` (the check previously wanted four leading backslashes and
 rejected every device as missing), and the read goes through `os.open` with
 `O_RDONLY` rather than a buffered `open()`. Raw access needs an elevated
 process; without it the tool says permission denied instead of "does not
-exist". A 1 TB USB disk on this machine (`\\.\PhysicalDrive1`, RAW) reads as
+exist". A 1 TB USB disk attached to this machine reads as
 sealed data - sector 0 is high entropy with no `PS3ATA01` block, and there is
 no `PS3HDFS1` tree at 32 MiB or 256 MiB - which is what a console-formatted
 drive looks like before its PCK1 is applied. Listing its folders needs that
@@ -901,16 +908,15 @@ as a round key at all eleven schedule indices - and scanning every aligned
 authenticates the console's EID0, so PCK1 is not stored in the clear either.
 The QEMU path is closed on this disk too: the model puts
 `PS3ATA01 | data key | tweak key` in sector 0 under a 48-byte ERK, and none of
-the eight held 48-byte keys (including `Downloads/eid_root_key.bin`, the
-private PCK1 in `.tmp/keys`, the zeros and the synthetic chain key) unwraps it.
+the eight held 48-byte keys (the zeros and the synthetic chain key among them)
+unwraps it.
 The EID0 record is extracted to `.tmp/eid0_4301c.bin` (2144 bytes from
 0x2F070), so a PCK1 that does appear can be confirmed immediately with
 `ps3_capture_verify.py --kind erk`. A negative sampled-sector heuristic still
 cannot prove that a candidate is wrong: offsets, sector contents, byte order,
 format and untested variants can all affect the result. The reference builds with
-`gcc -O2 -o .tmp/ps3encdec.exe src/{aes,aes_xts,getopt,kgen,main,util}.c`
-from `Downloads/ps3encdec-master`, with `/c/msys64/usr/bin` on `PATH` so its
-`cc1` can load (without that the compiler exits 1 and says nothing).
+`gcc -O2 -o .tmp/ps3encdec src/{aes,aes_xts,getopt,kgen,main,util}.c` from the
+`ps3encdec` sources.
 
 Sectors are sampled at LBA 1, 2, 3, 4, 8, 100, 1000, 10000, 100000 and 200000.
 The tool skips all-zero raw sectors and scores the others by zeros and printable
@@ -924,8 +930,8 @@ py scripts/ps3_disk_verify.py --device disk.img --inspect
 
 # Candidate-key heuristics do not authenticate a retail disk.
 py scripts/ps3_disk_verify.py --device disk.img --pck1 erk48.bin
-py scripts/ps3_disk_verify.py --device \\.\PhysicalDrive1 \
-    --pck1 eid_root_key.bin --report .tmp/disk1.txt
+py scripts/ps3_disk_verify.py --device /dev/sdX \
+    --pck1 erk48.bin --report .tmp/disk1.txt
 ```
 
 `--inspect` reports raw sample statistics and returns 4 if any sample could not
@@ -940,7 +946,7 @@ block check or plaintext heuristic matched; 3 means no candidate matched that
 heuristic; and 4 means no nonzero sample was found. These are not definitive
 retail-drive authentication results.
 
-A previous read-only probe of the 1 TB `\\.\PhysicalDrive1` reported 0 of 7
+A previous read-only probe of the 1 TB drive reported 0 of 7
 sampled nonzero sectors looking structured for either of two candidate keys,
 under the modes it tried. That is a heuristic result, not proof that the drive
 belongs to a different console. Those candidates have not been established as

@@ -36,10 +36,19 @@ import subprocess
 import sys
 import time
 
-EXE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                   "build-ps3", "qemu-system-ppc64.exe")
-VERIFY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      "ps3_capture_verify.py")
+def _qemu_binary():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("qemu-system-ppc64", "qemu-system-ppc64.exe"):
+        path = os.path.join(root, "build-ps3", name)
+        if os.path.exists(path):
+            return path
+    return os.path.join(root, "build-ps3", "qemu-system-ppc64")
+
+
+EXE = _qemu_binary()
+_HERE = os.path.dirname(os.path.abspath(__file__))
+VERIFY = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "Documents",
+                      "ps3tools-main", "ps3_capture_verify.py")
 RAM_SIZE = 0x10000000            # 256 MiB of XDR
 
 

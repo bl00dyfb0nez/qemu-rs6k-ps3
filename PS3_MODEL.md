@@ -301,7 +301,7 @@ ninja
 
 `configure` creates a Python venv under `build-ps3/pyvenv` and installs meson
 into it, so the first run needs network access.  The result is
-`build-ps3/qemu-system-ppc64.exe`.  Incremental rebuild after editing sources:
+`build-ps3/qemu-system-ppc64`.  Incremental rebuild after editing sources:
 
 ```sh
 ninja -C build-ps3
@@ -321,17 +321,13 @@ Same steps with the distribution's packages (`gcc`, `ninja-build`,
 
 `build-ps3` has no display backend (`-display help` lists only `none`), which
 is what the headless checks want.  For the guest window, configure a second
-tree with SDL.  Run the configure from a **UCRT64 login shell**: in a plain
-MSYS shell the compiler check picks a `cc` it cannot run and configure stops
-early with `ERROR: Unknown target name '0'` instead of a compiler error.
+tree with SDL:
 
 ```sh
-pacman -S --needed mingw-w64-ucrt-x86_64-SDL2
-MSYSTEM=UCRT64 /c/msys64/usr/bin/bash -lc '
-  cd /c/Users/Thewoodsman/qemu && mkdir -p build-ps3-gui &&
-  cd build-ps3-gui &&
-  ../configure --target-list=ppc64-softmmu --enable-sdl --disable-werror &&
-  ninja'
+cd ~/qemu
+mkdir -p build-ps3-gui && cd build-ps3-gui
+../configure --target-list=ppc64-softmmu --enable-sdl --disable-werror
+ninja
 ```
 
 The SDL build also carries QEMU's audio backends, so the same binary plays the
@@ -342,7 +338,7 @@ both trees.
 A VSH boot in that window:
 
 ```sh
-build-ps3-gui/qemu-system-ppc64.exe -M rs6000-ps3 -display sdl     -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on     -global ps3-boot-rom.own-rom=on     -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin     -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img     -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
+build-ps3-gui/qemu-system-ppc64 -M rs6000-ps3 -display sdl     -drive if=pflash,format=raw,file=.tmp/bootchain_flash.bin,readonly=on     -global ps3-boot-rom.own-rom=on     -global ps3-boot-rom.readout-file=.tmp/dlt/readout.bin     -global ps3-boot-rom.hdd-file=.tmp/hdd_fs.img     -global ps3-boot-rom.vsh-run=on -global ps3-boot-rom.threads=on
 ```
 
 The window comes up as the console's screen: `PS3 BOOT`, the chain line
@@ -360,7 +356,7 @@ the guest is up -
 
 ```json
 {"execute": "qmp_capabilities"}
-{"execute": "screendump", "arguments": {"filename": "C:/.../frame.ppm"}}
+{"execute": "screendump", "arguments": {"filename": ".tmp/frame.ppm"}}
 ```
 
 which writes the surface the display is presenting.  The coldboot animation
@@ -377,14 +373,13 @@ then smoke-tests the binary: `-M help` must list `rs6000-ps3` and
 Server 2025 (MSYS2 UCRT64), Windows 11 arm64 (MSYS2 CLANGARM64), macOS 13 (x64)
 and macOS 15 (arm64).
 
-### A headless build and the probe (WSL)
+### A headless build and the probe
 
-A Debian WSL host builds the model with no display backend at all, which is the
-tree the headless probe runs against.  The sources are a copy in the Linux
-filesystem (building over `/mnt/c` is slow) and the build is out-of-tree:
+A Debian host builds the model with no display backend at all, which is the
+tree the headless probe runs against.  The build is out-of-tree:
 
 ```sh
-rsync -a --exclude 'build*' --exclude .git /mnt/c/Users/Thewoodsman/qemu/ ~/qemu-ps3-src/
+rsync -a --exclude 'build*' --exclude .git ~/qemu/ ~/qemu-ps3-src/
 mkdir -p ~/qemu-ps3-build && cd ~/qemu-ps3-build
 ~/qemu-ps3-src/configure --target-list=ppc64-softmmu \
     --disable-gtk --disable-sdl --disable-opengl --disable-vnc \
@@ -460,6 +455,31 @@ helper at `0x4CE70C`, which does AddRef it, so the next thing to trace is who
 releases the last reference while the parent still lists it - not another
 import.
 
+That trace now names the free, and it is not a reference count.  `0xD6706B0`
+is released by the small buffer destructor at `0x4CA198`, which calls the raw
+allocator free `0x4B8B4C` on the pointer held at `[this]` (return address
+`0x4CA1B8`, holder frame `0xD670540`); the child's own deleting destructor
+never runs for that address.  The block is then recycled as mms's string
+scratch: a store watch shows `/dev_hdd...` and `BlockedPlayer:...` written over
+it by threads 33 and 34, and the same address is freed again through the same
+`0x4CA1B8` return while it is still in that rotation.  By the time the parent's
+destructor walks `+0x28`, the first word is `BlockedP`, the slot load lands on
+garbage, and `bctrl` goes nowhere.
+
+Two facts narrow the remaining gap.  The parent at `0xD6729E0` is never written
+inside the watch window, and neither is the child before the string traffic, so
+both object images predate the instrumented range.  And the watch shows threads
+33 and 34 writing the same block between each other, one store at a time: the
+free and the string writes overlap rather than following one another, so the
+block is in use by both workers at once.  The gate in the release helper is the
+child's `+0x30` byte: `0x4CD768` tests it before deciding whether to notify the
+owner, then deletes the child unconditionally.  A child that is not marked
+there is deleted while the parent still lists it, which is the state the two
+faults come from.  The store-watch run reproduced the same program interrupt
+(`r3 = 0xD6706B0`, `lr = 0x4C57F0`) but then outran the probe's 420-second
+budget, so that run has no tick-limit verdict; the fault text above is from it,
+the verdict table is from the run before.
+
 Earlier in the bring-up the stop was the whole story of a boot:
 `custom_render_plugin` called `qgl_base` (NID `0xF85CB651`, entry `0xE4A47E0`)
 with `r3 = 0x200000`, an
@@ -478,11 +498,13 @@ overwrote with its saved `r12` (`0x0D640010`, the heap object) - see
 **lv2 trampoline frame** below.  With the frame moved below the protected zone
 the restore is clean and the main thread continues.
 
-`emer_init` runs its own start-up (the recover flag it reads goes
-from 0 to 0xFF) and asks the system manager for the restart into recovery mode
-(0x100); `hdd_copy` asks for the restart that starts its copy (0x8201), where
-the probe stops by design.  Exit status: 0 when every selected probe reached a
-verdict, 3 when one did not, 2 when a media image is missing.
+`emer_init` now starts up past the EEPROM check - product mode reads 0xFF and
+the recover flag 0x00 in recovery - and reaches its GCM initialisation, where
+it prints `Gcm Init Memory Shortage.` and jumps to `pc=0x700` (`lr=0x1622c`)
+before it opens the disc.  `hdd_copy` still asks for the restart that starts
+its copy (0x8201), where the probe stops by design.  Exit status: 0 when every
+selected probe reached a verdict, 3 when one did not, 2 when a media image is
+missing.
 
 ### lv2 trampoline frame
 
@@ -509,12 +531,8 @@ the caller's protected zone cost the boot.
 
 ## Run
 
-The Windows binary links the MSYS2 DLLs, so from outside an MSYS2 shell put
-`ucrt64\bin` on `PATH` first:
-
 ```sh
-export PATH="/c/msys64/ucrt64/bin:$PATH"
-Q=build-ps3-gui/qemu-system-ppc64.exe          # the SDL build
+Q=build-ps3-gui/qemu-system-ppc64               # the SDL build
 ```
 
 ### Boot the chain, then vsh.self, in the window
@@ -911,13 +929,20 @@ start.  Regenerate the header from a readout with
 `python3 scripts/ps3_eep_embed.py MyEEPROM.bin`; `--check` compares it with the
 one in the tree.
 
-Two bytes do not come from the readout.  Product mode and the recover flag
-describe how *this* console was started, not what the part stores: a run in
-recovery mode is a console whose service jumper is set, and `emer_init` reads
-product mode through 0x600B to find that out.  Both read 0xFF on a normal boot
-and 0x00 once the machine enters recovery (`recover=on`, or the warm reset an
-emergency program asks for); a guest write of product mode selects factory mode
-the same way.
+Two bytes do not come from the readout.  The recover flag describes how *this*
+console was started: it reads 0xFF on a normal boot and 0x00 once the machine
+enters recovery (`recover=on`, or the warm reset an emergency program asks
+for).  Product mode is not the machine's - it is what a program writes to
+select factory (service) mode, and a program's own byte is what a later read,
+and the next boot, see.
+
+A console in recovery is still a retail console, so product mode reads 0xFF
+there.  Tying the two bytes together made `emer_init` read product mode 0x00
+through 0x600B in recovery, take its factory branch and print `factory mode ON
+recover flag[0] --> [ff]`, clear the recover flag and ask for the restart at
+tick 0 - the recovery menu, and with it the disc update, was never reached.
+With the two separate, `emer_init` starts up and reaches its GCM
+initialisation instead (see the recovery section below).
 
 The rest of those two NVS windows is erased in this readout (its written area
 ends at 0x5000, the windows start at 0x7000), which is what a retail part's
@@ -951,8 +976,8 @@ both the part and the fold read 0xFF.
 The two guest programs are built with the PS3 PPU toolchain in this tree:
 
 ```sh
-AS=/c/msys64/usr/local/ps3dev/ppu/bin/powerpc64-ps3-elf-as.exe
-LD=/c/msys64/usr/local/ps3dev/ppu/bin/powerpc64-ps3-elf-ld.exe
+AS=~/Downloads/ps3gcc411/ppu/bin/ppu-lv2-as
+LD=~/Downloads/ps3gcc411/ppu/bin/ppu-lv2-ld
 $AS -mcell -o .tmp/sys_audio_test.o .tmp/sys_audio_test.S
 $LD -Ttext=0x02000000 -e _start -o .tmp/sys_audio_test.elf .tmp/sys_audio_test.o
 ```
@@ -1147,7 +1172,14 @@ reads that heap's constructor arguments: base 0, size `0x200000`, and the base
 is the return of the pool lookup `0x357230(2, 3, 0x400, 0x200000)`.
 `PS3_TRACE_PC` takes a comma-separated list, so one run can follow a call from
 its site through the allocator: `PS3_TRACE_PC=0x357348,0x440b0c,0x440a44,
-0x604a9c,0x6043a0` shows what each layer was handed.  `PS3_STACK_WATCH=base,len`
+0x604a9c,0x6043a0` shows what each layer was handed.  `PS3_TRACE_PC_ADDR=lo,hi`
+keeps only the hits whose `r3` falls in that range, and `PS3_TRACE_PC_HITS=n`
+raises the 32-hit cap, so one heap block can be followed through a destructor
+or a free instead of the report filling with its first callers.
+`PS3_WATCH_STORE` takes up to four `address,length` pairs and reports every
+change to them after the instruction that made it, with the `pc`, `lr` and
+thread; that is what showed the string writes landing on the freed child.
+`PS3_STACK_WATCH=base,len`
 puts an IO window over a frame and reports every store into it with the pc, lr,
 sp and the current `r30`; `PS3_STACK_WATCH_VALUE=<word>` keeps only stores that
 write that word, which is how a 32-bit half of a saved register is found among
@@ -1267,6 +1299,25 @@ itself is still not reached; what the run shows is that the process, its flash
 bank, its recover flag and its restart are the console's, and that the model no
 longer reports a chain failure underneath it.
 
+### The HFW disc and the update search
+
+A disc carrying the real HFW 4.93.1 package is mounted and named correctly.
+`.tmp/pup_hfw.iso` is built by `.tmp/mkiso.py` around
+`HFW_4.93.1_PS3UPDAT.PUP` (205,929,009 bytes; ISO 9660, one directory, one
+file, 196 MiB) and the model reports
+
+```
+ps3-bdvd: .tmp/pup_hfw.iso: ISO 9660, 1 directory and 1 file(s), 196 MiB; mounted as dev_bdvd
+ps3-bdvd: /PS3_UPDATE/PS3UPDAT.PUP is on the disc, 205929009 bytes; the guest reads it as dev_bdvd/PS3_UPDATE/PS3UPDAT.PUP
+```
+
+No run reaches it yet.  With the EEPROM split fixed, `emer_init` no longer
+restarts at tick 0, but it reports `Gcm Init Memory Shortage.` through
+`sys_tty_write` and jumps to `pc=0x700` (`lr=0x1622c`) before any `dev_bdvd`
+lookup: the staging tree beside the image (`.tmp/pup_hfw.iso.bdvd`) is never
+created, so the file is never extracted.  The update search stops in the
+recovery program's graphics initialisation, not in the disc path or the EEPROM.
+
 ## Stock 4.93 on both models
 
 The two consoles' images are now built from the official `PS3UPDAT` 4.93, not
@@ -1294,7 +1345,10 @@ same place: 214 modules published from the HDD tree / the eMMC's dev_flash,
 then `stopping after 1500 ticks at pc=0x9e538 (lr=0xbc068)` - the resource
 inflate / `cellFsTruncate2` stage the Status section lists as open.  Both
 recovery runs start `emer_init.self` from the flash's ros and loop on
-`ErrorPage[6] Code[-2147290383]` (`0x8002F2F1`, the update search).
+`ErrorPage[6] Code[-2147290383]` (`0x8002F2F1`, the update search).  Those runs
+predate the EEPROM split: product mode now reads 0xFF in recovery, so
+`emer_init` starts up normally instead of taking the factory branch that
+printed this code.
 
 The XMB's resource file can be had back out of a run: with `PS3_DUMP_RCO=<dir>`
 in the environment, the model assembles every `.rco` the loader reads from the

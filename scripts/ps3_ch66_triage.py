@@ -54,6 +54,10 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+QEMU_ROOT = os.path.dirname(HERE)
+HOME = os.path.dirname(QEMU_ROOT)
+TOOLS = os.path.join(HOME, "Documents", "ps3tools-main")
+sys.path.insert(0, TOOLS)
 sys.path.insert(0, HERE)
 import ps3_capture_verify as cap  # noqa: E402  (container crypto, dump reads)
 

@@ -11807,11 +11807,12 @@ static void ps3_rsxaudio_tick(void *opaque)
  */
 static void ps3_syscon_write(uint32_t off, uint8_t val)
 {
-    /* Writing product mode is how the emergency program selects factory mode. */
-    if (off == PS3_EEP_PRODUCT_MODE) {
-        ps3_eep_set_service_mode(val != 0xFF);
-        return;
-    }
+    /*
+     * A program writes product mode to select factory (service) mode, and the
+     * byte is the state: the next read, and the next boot, see what it wrote.
+     * The recover flag is separate - it says how this console was started, not
+     * what a program asked for - so writing one does not move the other.
+     */
     ps3_eep_write(off, val);
 }
 
@@ -17069,6 +17070,24 @@ static struct {
     unsigned reports;
 } ps3_rco_watch;
 
+/*
+ * PS3_WATCH_STORE names up to four "address,length" ranges whose contents
+ * are compared after every instruction.  A field written once and read much
+ * later by a destructor - a child link, a vtable - is identified by the pc
+ * of the store that wrote it, which a reading of the class cannot supply.
+ */
+#define PS3_STORE_WATCH_MAX 4
+
+static struct {
+    uint64_t addr;
+    unsigned len;
+    uint8_t first[16];
+} ps3_store_watch[PS3_STORE_WATCH_MAX];
+static unsigned ps3_store_watch_n;
+static unsigned ps3_store_watch_reports;
+static unsigned ps3_store_watch_max = 64;
+static bool ps3_store_watch_ready;
+
 /* The lv2 call the guest last made: a clobber traced to the 0xC00 trampoline
  * is a host-side store inside that call, so the number names the handler. */
 static uint32_t ps3_rco_last_nr = ~0u;
@@ -17092,6 +17111,8 @@ static void ps3_pc_probe(CPUState *cs, uint64_t pc)
     static unsigned want_n;
     static bool ready;
     static unsigned hits[PS3_PC_PROBE_MAX];
+    static uint64_t r3_lo, r3_hi;
+    static unsigned max_hits = 32;
 
     if (!ready) {
         const char *v = g_getenv("PS3_TRACE_PC");
@@ -17104,6 +17125,34 @@ static void ps3_pc_probe(CPUState *cs, uint64_t pc)
 
                 if (a) {
                     want[want_n++] = a;
+                }
+            }
+        }
+        /*
+         * PS3_TRACE_PC_ADDR narrows a probe to the object it is about:
+         * "lo,hi" keeps only the hits whose r3 lies in that range, so a
+         * destructor or a free named once can be followed for one heap
+         * block without the first thirty-two calls filling the report.
+         * PS3_TRACE_PC_HITS raises that cap when the first call is not
+         * the one that matters.
+         */
+        {
+            const char *r = g_getenv("PS3_TRACE_PC_ADDR");
+            const char *h = g_getenv("PS3_TRACE_PC_HITS");
+
+            if (r) {
+                g_auto(GStrv) parts = g_strsplit(r, ",", 2);
+
+                if (parts[0] && parts[1]) {
+                    r3_lo = g_ascii_strtoull(parts[0], NULL, 0);
+                    r3_hi = g_ascii_strtoull(parts[1], NULL, 0);
+                }
+            }
+            if (h) {
+                unsigned n = g_ascii_strtoull(h, NULL, 0);
+
+                if (n) {
+                    max_hits = n;
                 }
             }
         }
@@ -17169,10 +17218,42 @@ static void ps3_pc_probe(CPUState *cs, uint64_t pc)
                 break;
             }
         }
-        if (slot == PS3_PC_PROBE_MAX || hits[slot] >= 32) {
+        if (slot == PS3_PC_PROBE_MAX) {
+            return;
+        }
+        if (r3_lo || r3_hi) {
+            uint64_t r3 = (uint64_t)env->gpr[3];
+
+            if (r3 < r3_lo || r3 > r3_hi) {
+                return;
+            }
+        }
+        if (hits[slot] >= max_hits) {
             return;
         }
         hits[slot]++;
+    }
+    /*
+     * A free names only the allocator; which release it was is the frame
+     * above.  PS3_TRACE_BT walks the ABI backchain at a probed pc so the
+     * caller of free() is on the report, not just the return into it.
+     */
+    if (pc == 0x4B8B4C && g_getenv("PS3_TRACE_BT") && ps3_pc_hook_state) {
+        uint64_t bt_sp = (uint64_t)env->gpr[1];
+        uint8_t *bt_ram = memory_region_get_ram_ptr(ps3_pc_hook_state->ram);
+        uint64_t bt_size = memory_region_size(ps3_pc_hook_state->ram);
+
+        for (int k = 0; k < 10 && bt_sp && bt_sp + 0x18 <= bt_size; k++) {
+            uint64_t bt_next = ps3_be64(bt_ram + bt_sp);
+            uint64_t bt_ret = ps3_be64(bt_ram + bt_sp + 0x10);
+
+            info_report("ps3-ppu: bt %d: sp 0x%" PRIX64 " return 0x%" PRIX64,
+                        k, bt_sp, bt_ret);
+            if (bt_next <= bt_sp) {
+                break;
+            }
+            bt_sp = bt_next;
+        }
     }
     info_report("ps3-ppu: pc 0x%" PRIX64 ": r3 0x%" PRIX64 " r4 0x%" PRIX64
                 " r5 0x%" PRIX64 " r6 0x%" PRIX64 " r7 0x%" PRIX64
@@ -17183,6 +17264,79 @@ static void ps3_pc_probe(CPUState *cs, uint64_t pc)
                 (uint64_t)env->gpr[7], (uint64_t)env->gpr[8],
                 (uint64_t)env->gpr[30], (uint64_t)env->gpr[31],
                 (uint64_t)env->gpr[1], (uint64_t)env->lr);
+}
+
+static void ps3_store_watch_check(CPUState *cs, uint64_t pc)
+{
+    PS3BootROMState *s = ps3_pc_hook_state;
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    uint8_t *ram;
+    uint64_t ram_size;
+
+    if (!ps3_store_watch_ready) {
+        const char *v = g_getenv("PS3_WATCH_STORE");
+
+        /*
+         * A range that is ordinary scratch traffic fills the default report
+         * budget before the one write that matters; PS3_WATCH_STORE_REPORTS
+         * raises it.
+         */
+        if (v) {
+            const char *m = g_getenv("PS3_WATCH_STORE_REPORTS");
+            g_auto(GStrv) parts = g_strsplit(v, ",", PS3_STORE_WATCH_MAX * 2);
+
+            for (unsigned i = 0;
+                 parts[i] && parts[i + 1] && ps3_store_watch_n < PS3_STORE_WATCH_MAX;
+                 i += 2) {
+                uint64_t a = g_ascii_strtoull(parts[i], NULL, 0);
+                unsigned n = g_ascii_strtoull(parts[i + 1], NULL, 0);
+
+                if (a && n && n <= sizeof(ps3_store_watch[0].first)) {
+                    ps3_store_watch[ps3_store_watch_n].addr = a;
+                    ps3_store_watch[ps3_store_watch_n].len = n;
+                    ps3_store_watch_n++;
+                }
+            }
+            if (m) {
+                unsigned r = g_ascii_strtoull(m, NULL, 0);
+
+                if (r) {
+                    ps3_store_watch_max = r;
+                }
+            }
+        }
+        ps3_store_watch_ready = true;
+    }
+    if (!s || !ps3_store_watch_n ||
+        ps3_store_watch_reports >= ps3_store_watch_max) {
+        return;
+    }
+    ram = memory_region_get_ram_ptr(s->ram);
+    ram_size = memory_region_size(s->ram);
+    for (unsigned i = 0; i < ps3_store_watch_n; i++) {
+        uint64_t a = ps3_store_watch[i].addr;
+        unsigned n = ps3_store_watch[i].len;
+
+        if (a + n > ram_size) {
+            continue;
+        }
+        if (!memcmp(ram + a, ps3_store_watch[i].first, n)) {
+            continue;
+        }
+        info_report("ps3-ppu: store watch: 0x%" PRIX64 "..0x%" PRIX64
+                    " now %02X %02X %02X %02X %02X %02X %02X %02X,"
+                    " written by pc 0x%" PRIX64 " (thread %d, lr 0x%" PRIX64
+                    ")", a, a + n, ram[a], a + 1 < ram_size ? ram[a + 1] : 0,
+                    a + 2 < ram_size ? ram[a + 2] : 0,
+                    a + 3 < ram_size ? ram[a + 3] : 0,
+                    a + 4 < ram_size ? ram[a + 4] : 0,
+                    a + 5 < ram_size ? ram[a + 5] : 0,
+                    a + 6 < ram_size ? ram[a + 6] : 0,
+                    a + 7 < ram_size ? ram[a + 7] : 0,
+                    pc, s->thr_cur, cpu->env.lr);
+        memcpy(ps3_store_watch[i].first, ram + a, n);
+        ps3_store_watch_reports++;
+    }
 }
 
 static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
@@ -17206,6 +17360,9 @@ static void ps3_rco_inflate_hook(CPUState *cs, uint64_t pc)
     }
     if (unlikely(g_getenv("PS3_TRACE_PC") || g_getenv("PS3_SNAP_PC"))) {
         ps3_pc_probe(cs, pc);
+    }
+    if (unlikely(g_getenv("PS3_WATCH_STORE"))) {
+        ps3_store_watch_check(cs, pc);
     }
     if (ps3_rco_watch.on) {
         ram = memory_region_get_ram_ptr(s->ram);
@@ -17685,6 +17842,7 @@ static void ps3_lv2_service(PS3BootROMState *s)
     if (!ps3_pc_hook_state && (s->ppu_trace || g_getenv("PS3_DUMP_RCO") ||
                                g_getenv("PS3_QGL_TRACE") ||
                                g_getenv("PS3_TRACE_PC") ||
+                               g_getenv("PS3_WATCH_STORE") ||
                                g_getenv("PS3_SNAP_PC"))) {
         ps3_pc_hook_state = s;
         ps3_pc_hook_fn = ps3_rco_inflate_hook;
@@ -24573,6 +24731,20 @@ static void ps3_ppu_reset_entry(void *opaque)
 
     if (!cs || !s->ppu_entry) {
         return;
+    }
+
+    /*
+     * Arm the pc and store hooks at reset when either is named.  The
+     * inflate path installs the same hook when a resource is loaded, which
+     * is too late to see how an object that is already in the heap was
+     * built: a watch armed there starts after its constructor and after the
+     * first free it took part in.
+     */
+    if (!ps3_pc_hook_state &&
+        (g_getenv("PS3_WATCH_STORE") || g_getenv("PS3_TRACE_PC"))) {
+        ps3_pc_hook_state = s;
+        ps3_pc_hook_fn = ps3_rco_inflate_hook;
+        info_report("ps3-ppu: pc/store hooks armed at reset");
     }
 
     if (s->warm_reset) {
