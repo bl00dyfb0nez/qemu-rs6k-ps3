@@ -1,0 +1,216 @@
+# Build the rs6000-ps3 machine on every host the model targets.
+#
+# One job per host, two architectures each.  Every job configures the same
+# minimal tree the model is developed against - only ppc64-softmmu, TCG, SDL for
+# the guest window - builds it with ninja, and then proves the binary it produced
+# actually carries the machine and the display backend: `-M help` must list
+# rs6000-ps3 and `-display help` must list sdl.  A build that links but registers
+# nothing would pass a bare compile, so the smoke test runs before the binary is
+# uploaded, and the artifact is the same file that passed it.  The sweep test is
+# the one PS3 script test that runs without a model binary, a dump or the
+# external SPU assembler, so it is the one wired in here; the loader-channel
+# test needs both the built binary and spuasm from the ps3tools tree.
+#
+# The action versions are the Node 24 runtime releases: GitHub removed the
+# Node 20 action runtime on 23 September 2026, so checkout is v5 (the first
+# Node 24 release) and upload-artifact is v6 (the first whose default runtime is
+# Node 24).  setup-msys2's v2 line moved to Node 24 in 2.31.0, which is what the
+# `v2` tag resolves to.
+#
+# Artifacts cannot be kept forever - GitHub expires them, and deleting a run
+# deletes its artifacts.  `retention-days: 400` asks for the longest retention a
+# repository can have; a public repository's cap is 90 days, and the uploader
+# clamps the request to the cap with a warning rather than failing.
+
+name: PS3 model build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-26.04
+          - arch: arm64
+            runs-on: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config python3 python3-venv \
+            libglib2.0-dev libpixman-1-dev libsdl2-dev
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          ../configure --target-list=ppc64-softmmu \
+            --enable-tcg --enable-sdl --disable-werror --disable-docs \
+            --disable-guest-agent --disable-tools --disable-tests
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Smoke test the machine and the display backend
+        run: |
+          test -x build/qemu-system-ppc64
+          ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
+          ./build/qemu-system-ppc64 -display help | grep -qw sdl
+          ./build/qemu-system-ppc64 --version
+
+      - name: Run the QEMU-free PS3 script tests
+        run: |
+          # pycryptodome is only for the sweep's key-match matrix, which
+          # checks a readout against a container's tag in the test.
+          python3 -m venv .venv-tests
+          .venv-tests/bin/pip install --quiet pycryptodome
+          .venv-tests/bin/python scripts/ps3_romexec_sweep_test.py
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: qemu-system-ppc64-linux-${{ matrix.arch }}
+          path: build/qemu-system-ppc64
+          if-no-files-found: error
+          retention-days: 90
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: windows-2025
+            msystem: UCRT64
+            packages: >-
+              mingw-w64-ucrt-x86_64-gcc
+              mingw-w64-ucrt-x86_64-ninja
+              mingw-w64-ucrt-x86_64-pkgconf
+              mingw-w64-ucrt-x86_64-glib2
+              mingw-w64-ucrt-x86_64-pixman
+              mingw-w64-ucrt-x86_64-python
+              mingw-w64-ucrt-x86_64-python-pip
+              mingw-w64-ucrt-x86_64-SDL2
+              mingw-w64-ucrt-x86_64-git
+          - arch: arm64
+            runs-on: windows-11-arm
+            msystem: CLANGARM64
+            packages: >-
+              mingw-w64-clang-aarch64-clang
+              mingw-w64-clang-aarch64-ninja
+              mingw-w64-clang-aarch64-pkgconf
+              mingw-w64-clang-aarch64-glib2
+              mingw-w64-clang-aarch64-pixman
+              mingw-w64-clang-aarch64-python
+              mingw-w64-clang-aarch64-SDL2
+              mingw-w64-clang-aarch64-git
+              mingw-w64-clang-aarch64-python-pip
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          install: ${{ matrix.packages }}
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          mkdir -p build
+          cd build
+          ../configure --target-list=ppc64-softmmu \
+            --enable-tcg --enable-sdl --disable-werror --disable-docs \
+            --disable-guest-agent --disable-tools --disable-tests
+
+      - name: Build
+        shell: msys2 {0}
+        run: ninja -C build
+
+      - name: Smoke test the machine and the display backend
+        shell: msys2 {0}
+        run: |
+          test -x build/qemu-system-ppc64.exe
+          ./build/qemu-system-ppc64.exe -M help | grep -qw rs6000-ps3
+          ./build/qemu-system-ppc64.exe -display help | grep -qw sdl
+
+      - name: Run the QEMU-free PS3 script tests
+        shell: msys2 {0}
+        run: |
+          python -m pip install --quiet pycryptodome
+          python scripts/ps3_romexec_sweep_test.py
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: qemu-system-ppc64-windows-${{ matrix.arch }}
+          path: build/qemu-system-ppc64.exe
+          if-no-files-found: error
+          retention-days: 90
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: macos-15-intel
+          - arch: arm64
+            runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the build dependencies
+        run: |
+          brew install ninja pkg-config glib pixman sdl2
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip meson pycryptodome
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          PATH="$PWD/../.venv/bin:$PATH" ../configure \
+            --target-list=ppc64-softmmu \
+            --enable-tcg --enable-sdl --disable-werror --disable-docs \
+            --disable-guest-agent --disable-tools --disable-tests \
+            --disable-hvf
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Smoke test the machine and the display backend
+        run: |
+          test -x build/qemu-system-ppc64
+          ./build/qemu-system-ppc64 -M help | grep -qw rs6000-ps3
+          ./build/qemu-system-ppc64 -display help | grep -qw sdl
+
+      - name: Run the QEMU-free PS3 script tests
+        run: |
+          .venv/bin/python scripts/ps3_romexec_sweep_test.py
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: qemu-system-ppc64-macos-${{ matrix.arch }}
+          path: build/qemu-system-ppc64
+          if-no-files-found: error
+          retention-days: 90
