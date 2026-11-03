@@ -61,6 +61,12 @@ ARGC_RE = re.compile(r"argc=(?P<argc>\d+), arguments \"(?P<args>[^\"]*)\"")
 VERDICT_RE = re.compile(r"verdict (?P<path>[^:]+): (?P<what>.+)$")
 
 
+def default_flash() -> str:
+    """The console's own dump when it is there, the fixture otherwise."""
+    real = os.path.expanduser("~/Downloads/CECHL.hex")
+    return real if os.path.isfile(real) else ".tmp/bootchain_flash.bin"
+
+
 def find_qemu(explicit: str | None) -> str | None:
     """The model binary: the caller's, the environment's, a build tree, PATH."""
     candidates = []
@@ -192,9 +198,10 @@ def main() -> int:
                     help="probe only this application (repeatable)")
     ap.add_argument("--qemu", help="the model binary (default: a build tree, "
                                    "then PATH)")
-    ap.add_argument("--flash", default=".tmp/bootchain_flash.bin",
+    ap.add_argument("--flash", default=default_flash(),
                     help="NOR image the chain and the recovery banks come "
-                         "from")
+                         "from (default: ~/Downloads/CECHL.hex when present, "
+                         "else .tmp/bootchain_flash.bin)")
     ap.add_argument("--hdd", default=".tmp/hdd_fs.img",
                     help="HDD image carrying dev_flash")
     ap.add_argument("--timeout", type=int, default=420,

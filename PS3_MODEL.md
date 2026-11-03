@@ -866,6 +866,7 @@ audiodev feed `sys_mic`'s rings.
 | Property | Default | Meaning |
 | --- | --- | --- |
 | `rom-file` / `drive` | - | set by `-bios` and `-drive if=pflash,...` |
+| `eeid-file`, `cisd-file` | - | replace the NOR eEID (64 KiB at 0x2F000) and cISD (2 KiB at 0x3F000) in the model's in-memory flash copy from files; the pflash backend is not modified, and both require `boot-medium=flash` |
 | `erk-file`, `pck1-file`, `readout-file` | - | the console's 48-byte ERK + RIV (the name `pck1` gives the same value), or the mask boot ROM's channel-66 key, 32 raw bytes, K_lo then K_hi.  Optional: without it the ERK is the one the loader in `lv1ldr`/`nand-loader` carries |
 | `ch66-capture` | - | writes the eight `rdch $35,$ch66` words the ROM performed, 32 bytes in read order.  Fed from the SPU channel, never copied from `readout`; with `selftest=on` it is the mask ROM's own run.  The file is the same layout `readout-file` takes |
 | `pck1`, `erk` | - | the same 48 bytes as hex (96 digits); `pck1` is the console's name for it |

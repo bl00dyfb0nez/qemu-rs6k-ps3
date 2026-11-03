@@ -170,6 +170,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(PS3BootROMState, PS3_BOOT_ROM)
 
 #define TYPE_RS6000_PS3_MACHINE MACHINE_TYPE_NAME("rs6000-ps3")
 
+/* The two identity regions in a 16 MiB NOR image. */
+#define PS3_NOR_EEID_OFF   0x0002F000
+#define PS3_NOR_EEID_SIZE  0x00010000
+#define PS3_NOR_CISD_OFF   0x0003F000
+#define PS3_NOR_CISD_SIZE  0x00000800
+
 /* ---------------------------------------------------------------------- */
 /* The Cell memory interface controller.                                   */
 
@@ -1074,6 +1080,8 @@ struct PS3BootROMState {
 
     BlockBackend *blk;
     char *rom_file;
+    char *eeid_file;                /* NOR eEID override, 64 KiB at 0x2F000 */
+    char *cisd_file;                /* NOR cISD override, 2 KiB at 0x3F000 */
     char *container;
     char *readout;
     char *readout_file;
@@ -23539,6 +23547,74 @@ static void ps3_isa_noop(void *opaque, int line, int level)
 {
 }
 
+/*
+ * A NOR image carries the console's eEID at 0x2F000 and cISD at 0x3F000.
+ * These two properties replace those regions in the model's in-memory copy,
+ * which lets a synthetic fixture be paired with a dump without writing either
+ * file.  The pflash backend is never modified.
+ */
+static bool ps3_nor_region_override(PS3BootROMState *s, const char *path,
+                                    uint32_t offset, size_t size,
+                                    const char *name, Error **errp)
+{
+    g_autofree gchar *data = NULL;
+    GError *err = NULL;
+    gsize len = 0;
+
+    if (offset > s->flash_len || size > s->flash_len - offset) {
+        error_setg(errp, "ps3-boot-rom: %s needs a NOR image of at least "
+                   "0x%X bytes", name, offset + (uint32_t)size);
+        return false;
+    }
+
+    if (!g_file_get_contents(path, &data, &len, &err)) {
+        error_setg(errp, "ps3-boot-rom: cannot read %s: %s", path,
+                   err->message);
+        g_error_free(err);
+        return false;
+    }
+    if (len != size) {
+        error_setg(errp, "ps3-boot-rom: %s is %u byte(s), the NOR %s region "
+                   "is %u", path, (unsigned)len, name, (unsigned)size);
+        return false;
+    }
+
+    memcpy(s->flash + offset, data, size);
+    info_report("ps3-boot-rom: NOR %s overridden from %s (%u byte(s) at "
+                "0x%X)", name, path, (unsigned)size, offset);
+    return true;
+}
+
+static bool ps3_nor_fixtures_setup(PS3BootROMState *s, Error **errp)
+{
+    const char *medium = s->boot_medium ?: "flash";
+
+    if (!s->eeid_file && !s->cisd_file) {
+        return true;
+    }
+    if (strcmp(medium, "flash")) {
+        error_setg(errp, "ps3-boot-rom: eeid-file/cisd-file replace NOR "
+                   "regions; set boot-medium=flash");
+        return false;
+    }
+    if (!s->flash) {
+        error_setg(errp, "ps3-boot-rom: eeid-file/cisd-file need a NOR "
+                   "image (-drive if=pflash,format=raw,file=...)");
+        return false;
+    }
+    if (s->eeid_file &&
+        !ps3_nor_region_override(s, s->eeid_file, PS3_NOR_EEID_OFF,
+                                 PS3_NOR_EEID_SIZE, "eEID", errp)) {
+        return false;
+    }
+    if (s->cisd_file &&
+        !ps3_nor_region_override(s, s->cisd_file, PS3_NOR_CISD_OFF,
+                                 PS3_NOR_CISD_SIZE, "cISD", errp)) {
+        return false;
+    }
+    return true;
+}
+
 static void ps3_rom_realize(DeviceState *dev, Error **errp)
 {
     PS3BootROMState *kbd_s = PS3_BOOT_ROM(dev);
@@ -23943,7 +24019,13 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
             error_setg(errp, "ps3-boot-rom: cannot read the flash drive");
             return;
         }
+    }
 
+    if (!ps3_nor_fixtures_setup(s, errp)) {
+        return;
+    }
+
+    if (s->blk) {
         memory_region_init_ram(&s->flash_mr, OBJECT(s), "ps3.flash",
                                ROUND_UP(s->flash_len, 4 * KiB), &error_fatal);
         memcpy(memory_region_get_ram_ptr(&s->flash_mr), s->flash, s->flash_len);
@@ -26266,6 +26348,9 @@ static const Property ps3_rom_properties[] = {
     DEFINE_PROP_STRING("app-args", PS3BootROMState, app_args),
     DEFINE_PROP_BOOL("probe", PS3BootROMState, probe, false),
     DEFINE_PROP_STRING("rom-file", PS3BootROMState, rom_file),
+    /* Replace the NOR identity regions in memory; the drive stays untouched. */
+    DEFINE_PROP_STRING("eeid-file", PS3BootROMState, eeid_file),
+    DEFINE_PROP_STRING("cisd-file", PS3BootROMState, cisd_file),
     DEFINE_PROP_STRING("container", PS3BootROMState, container),
     /* Address a container at an exact flash offset; UINT64_MAX leaves it to
      * the name lookup and the two fixed slots. */

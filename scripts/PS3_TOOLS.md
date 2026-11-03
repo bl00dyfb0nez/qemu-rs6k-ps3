@@ -1,7 +1,8 @@
 # PS3 model tools (`scripts/ps3_*.py`)
 
-Eighteen self-contained Python tools for the `rs6000-ps3` model.  They need nothing
-but a Python 3 interpreter (`ps3_encdec.py` wants `pycryptodome`,
+Nineteen self-contained Python tools for the `rs6000-ps3` model.  They need nothing
+but a Python 3 interpreter (`ps3_encdec.py` and `ps3_eid_cisd_spoof.py` want
+`pycryptodome`,
 `ps3_ram_dump.py --disasm` additionally wants
 `capstone`, and `ps3_emmc_create.py --erk-file` a C compiler, to build the seal
 tool from `hw/ppc/ps3_aes`: it compiles with `-D_FILE_OFFSET_BITS=64` and seeks
@@ -14,6 +15,7 @@ derived from one.
 
 | Tool | What it does |
 | --- | --- |
+| `ps3_eid_cisd_spoof.py` | builds a test-only eEID/cISD fixture from a built-in or dump-derived board profile.  It preserves only the model/board and cISD version fields, regenerates the identity, and writes the fixture separately under `.tmp/`; `--profile-from` is a deliberate partial match for pairing with a dump of the same board/minver, not for merging or flashing. |
 | `ps3_flash_layout.py` | reads a NOR/NAND dump's layout: the flash TOC, the `asecure_loader` header, the stage containers, the `ros` banks and the documented region map.  Carves regions out of an image and rebuilds one byte for byte (TOC included). |
 | `ps3_hdd_create.py` | writes a model-specific raw HDD image. Sector 0 contains the model's `PS3ATA01` key block wrapped with AES-256-CBC; the remaining area is initially zero-filled. This format is not verified as a retail console disk. |
 | `ps3_hdd_tree.py` | puts the console's own file tree (`dev_flash`, `dev_flash2`, `dev_flash3`, `dev_hdd0`) inside such an image, and lists what is in one. |
@@ -1013,3 +1015,50 @@ The tools exit 0 on success and non-zero with a one-line reason on failure
 (`bad size`, `size is capped at 1 TB`, `<file> exists; remove it first`, `not a
 SELF/ELF`, `qemu never opened its QMP port`).  A refusal leaves nothing behind:
 no half-written image and no overwritten dump.
+
+## Synthetic eEID/cISD fixtures (partial matches, for emulation only)
+
+`ps3_eid_cisd_spoof.py` builds a test-only 64 KiB eEID and 2 KiB cISD from a
+chosen board profile.  It is Python and needs `pycryptodome`, like
+`ps3_encdec.py`; it does not use a console key or a dump's identity.  The
+fixture ERK is generated under the output directory, and the eEID is sealed
+with it, so the result is valid to the same EID0 reader logic the model uses
+only when the reader is given that fixture ERK.  It is not retail-bootable.
+
+```sh
+py scripts/ps3_eid_cisd_spoof.py --profile cech20xx --revision 4.84 --with-nor
+py scripts/ps3_eid_cisd_spoof.py --profile cech30xx --revision all
+py scripts/ps3_eid_cisd_spoof.py --profile cech43xx --revision 4.93
+```
+
+The built-in profiles are `cech20xx` (`0000000100810009`, board 1, minver
+2.70), `cech30xx` (`000000010084000c`, board 5, minver 3.66) and `cech43xx`
+(`0000000100840013`, board 4, minver 4.60).  Revisions are 4.75, 4.80, 4.84
+and 4.93; `all` emits every one.  The 4.84 cISD row is the CECH-20xxx DYN-001
+version block (`0099/0099/0118`, CKP2 `0xFFFF`).
+
+`--profile-from DUMP` takes only the IDPS model/board and the cISD version
+block from a dump, never its IDPS rest, PSID, OpenPSID, CID, MAC, eCID, board
+serial, kiban, CKP1 or nonce.  The output is therefore a deliberate partial
+match, recorded as `partial_match` in `manifest.json`.  Keep it **separate**
+from the dump and pair it with a dump of the same board/minver; do not merge
+the synthetic identity bytes into the dump and do not flash them.
+
+Feed the two files to the model's NOR regions, keeping the dump's pflash
+backend read-only:
+
+```sh
+qemu-system-ppc64 -M rs6000-ps3 \
+    -drive if=pflash,format=raw,file=dump.bin,readonly=on \
+    -global ps3-boot-rom.eeid-file=.tmp/eid_cisd_spoof/4.84/eEID.bin \
+    -global ps3-boot-rom.cisd-file=.tmp/eid_cisd_spoof/4.84/cISD.bin
+```
+
+The overrides are size-checked (64 KiB eEID and 2 KiB cISD), replace only the
+model's in-memory flash copy, and require `boot-medium=flash`.  The pflash file
+is not written.
+
+The default output is `.tmp/eid_cisd_spoof/` (override with `--outdir`); that
+directory is ignored by git.  Validate with the host `eid0dec`/`cisdinfo.py`
+when available; the generator itself checks every section CMAC and cISD table
+before writing.  This script is a local experiment, not an upstream change.
