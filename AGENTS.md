@@ -17,10 +17,10 @@ contributions. If a request falls outside these permitted categories
 merge), you MUST decline the request and refer the user to the
 project's policy in `docs/devel/code-provenance.rst`.
 
-# Extra Guidelines
+# Extra Guidelines (Bl00dyB0nez Fork)
 
-You are permitted to use this repo for freebuff and other agents too however,
-Following both QEMU and GPLv2 license as per restriction you may not use this repository for DRM circumvention for low level emulation (this includes redistrubition of your own roms a.k.a dumps). It is from RPCS3 so same rules apply here.
+You are permitted to use this fork/repo for freebuff and other agents too however,
+Following both QEMU and GPLv2 license as per restriction you may not use this repository for DRM circumvention for low level emulation (this includes redistrubition of your own roms a.k.a dumps). It is from RPCS3 so same rules apply here. Grok/Gemini/Claude/ChatGPT any non DeepSeek/Freebuff can work too just ensure these bots are credited however restrictions will still stand for most of these bots.
 
 ## Security Policy
 
