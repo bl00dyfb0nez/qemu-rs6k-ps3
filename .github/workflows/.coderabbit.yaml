@@ -1,0 +1,14 @@
+# .coderabbit.yaml
+language: "en-US"
+reviews:
+  profile: "chill"
+  high_level_summary: true
+  path_filters:
+    - "!**/node_modules/**"
+    - "!**/*.lock"
+    - "!**/dist/**"
+  path_instructions:
+    - path: "src/api/**"
+      instructions: "Focus on security and input validation"
+chat:
+  auto_reply: true   
