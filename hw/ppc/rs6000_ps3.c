@@ -1105,6 +1105,16 @@ struct PS3BootROMState {
     uint8_t nand_readout_bytes[32];
     bool has_nand_readout;
     bool has_readout;
+    /*
+     * K_payload for the first-stage container, when it is known without the
+     * channel-66 readout.  A rev-1 console's bootldr and metldr are sealed for
+     * its own readout, which lives in the SPU ROM and is absent from every
+     * flash dump; a carrier that already holds the key can hand it in here and
+     * the container still has to pass its tag check.
+     */
+    char *container_key;
+    uint8_t container_key_bytes[16];
+    bool has_container_key;
     bool selftest;
     bool mic_selftest;              /* drive the cellMic path once at start */
     bool pad_selftest;              /* one controller state through the pad */
@@ -1969,6 +1979,7 @@ static bool ps3_container_find(const uint8_t *flash, size_t flash_len,
  */
 static uint32_t ps3_rom_open(const uint8_t *hdr, const uint8_t *body,
                              size_t body_len, const uint8_t ch66[32],
+                             const uint8_t *direct_key,
                              uint8_t *plain, uint8_t key_out[16])
 {
     uint32_t encrypted = ps3_be32(hdr);
@@ -1988,13 +1999,23 @@ static uint32_t ps3_rom_open(const uint8_t *hdr, const uint8_t *body,
         encrypted = total;
     }
 
-    /* K_payload = E(K_hi, hdr[0x20..0x2F] ^ K_lo). */
-    for (j = 0; j < 16; j++) {
-        block[j] = hdr[0x20 + j] ^ ch66[j];
-    }
+    /*
+     * K_payload = E(K_hi, hdr[0x20..0x2F] ^ K_lo), derived from the ROM's
+     * channel-66 readout.  `direct_key' is the same K_payload already in hand,
+     * which is how a rev-1 console's own container can be checked without the
+     * readout a flash dump does not carry; the tag still has to pass, so this
+     * is a shortcut to the key, not past the check.
+     */
+    if (direct_key) {
+        memcpy(key_out, direct_key, 16);
+    } else {
+        for (j = 0; j < 16; j++) {
+            block[j] = hdr[0x20 + j] ^ ch66[j];
+        }
 
-    ps3_aes_expand_key(ch66 + 16, rk);
-    ps3_aes_encrypt(rk, block, key_out);
+        ps3_aes_expand_key(ch66 + 16, rk);
+        ps3_aes_encrypt(rk, block, key_out);
+    }
 
     ps3_aes_expand_key(key_out, rk);
 
@@ -2547,20 +2568,63 @@ static gchar *ps3_flash_ros_mount(PS3BootROMState *s, unsigned bank,
 }
 
 /*
+ * The loader family a flash carries, read from the medium rather than assumed.
+ *
+ * The asecure_loader region's entry table names the loader stored in it, and
+ * that name is the generation: the pre-3.60 set calls it `metldr`, the 3.60 and
+ * later set `metldr.2`.  The region header (type 1, one entry) sits at 0x800 on
+ * a NOR image and 0x40800 on a NAND/eMMC image, with the entry's name at +0x20
+ * within the header.  A carved chain that does not carry the region returns 0
+ * and keeps the .2 default.
+ */
+static unsigned ps3_flash_ldr_gen(const uint8_t *flash, size_t flash_len)
+{
+    static const size_t hdr_at[] = { 0x800, 0x40800 };
+
+    if (!flash) {
+        return 0;
+    }
+
+    for (unsigned i = 0; i < ARRAY_SIZE(hdr_at); i++) {
+        size_t at = hdr_at[i];
+        const uint8_t *name;
+
+        if (at + 0x40 > flash_len || ps3_be32(flash + at) != 1 ||
+            !ps3_be32(flash + at + 4)) {
+            continue;
+        }
+
+        name = flash + at + 0x20;
+        if (!memcmp(name, "metldr.2", 8)) {
+            return 2;
+        }
+        if (!memcmp(name, "metldr", 6) && name[6] == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
  * Which container the medium's own boot ROM opens.
  *
- * A NOR console (and a chain staged on a disk) keeps lv0ldr.2 in its flash and
- * that is what the ROM finds.  A NAND console's first container is metldr.2 in
- * the asecure_loader region - the region the mask ROM is pointed at - and
- * lv0ldr.2 is what metldr opens once it runs, so a NAND/eMMC flash that carries
- * metldr.2 but no lv0ldr.2 is a healthy console, not a broken one.  The search
- * tries the configured name first and then, for such a medium, metldr.2.
+ * A rev-2 NOR console (and a chain staged on a disk) keeps lv0ldr.2 in its
+ * flash and that is what the ROM finds; the rev-1 set keeps `bootldr` in the
+ * same slot.  A NAND console's first container is metldr.2 (rev 2) or metldr
+ * (rev 1) in the asecure_loader region - the region the mask ROM is pointed at
+ * - and the NOR loader is what metldr opens once it runs, so a NAND/eMMC flash
+ * that carries metldr but no bootldr/lv0ldr is a healthy console, not a broken
+ * one.  The search tries the configured name first and then, for such a
+ * medium, the generation's own first container.
  */
 static bool ps3_chain_container(PS3BootROMState *s, const char **name_out,
                                 uint64_t *offset, char *why, size_t why_len)
 {
-    static const char nand_first[] = "metldr.2";
-    const char *name = s->container ?: "lv0ldr.2";
+    const unsigned gen = ps3_flash_ldr_gen(s->flash, s->flash_len);
+    const char *nand_first = gen == 1 ? "metldr" : "metldr.2";
+    const char *nor_first = gen == 1 ? "bootldr" : "lv0ldr.2";
+    const char *name = s->container ?: nor_first;
     bool nand_medium = s->boot_medium && !strcmp(s->boot_medium, "emmc");
 
     /*
@@ -2685,11 +2749,19 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
      * A NAND/eMMC medium may be sealed for its own channel-66 key, so that is
      * the one its first container is checked with when the caller gave both.
      */
-    if (!s->has_readout && !(nand_medium && s->has_nand_readout)) {
+    if (!s->has_readout && !(nand_medium && s->has_nand_readout) &&
+        !s->has_container_key) {
         if (ps3_chain_loader_path(s, name, offset, why, why_len)) {
             return true;
         }
-        snprintf(why, why_len, "no channel-66 readout");
+        if (!strcmp(name, "bootldr") || !strcmp(name, "metldr")) {
+            snprintf(why, why_len,
+                     "the %s container at flash 0x%" PRIX64 " is sealed for "
+                     "this console's channel-66 key; a dump does not carry it "
+                     "(pass readout-file or container-key)", name, offset);
+        } else {
+            snprintf(why, why_len, "no channel-66 readout");
+        }
         return false;
     }
 
@@ -2699,6 +2771,7 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
                           (size_t)blocks * 16,
                           (nand_medium && s->has_nand_readout) ?
                           s->nand_readout_bytes : s->readout_bytes,
+                          s->has_container_key ? s->container_key_bytes : NULL,
                           plain, key);
     g_free(plain);
 
@@ -2914,7 +2987,7 @@ static void ps3_rom_report_channel_map(PS3SPU *spu)
 
 static void ps3_rom_boot(PS3BootROMState *s)
 {
-    const char *name = s->container ?: "lv0ldr.2";
+    const char *name = s->container ?: "first-stage container";
     const bool nand_medium = s->boot_medium &&
                              !strcmp(s->boot_medium, "emmc");
     uint8_t ch66[32];
@@ -2963,6 +3036,25 @@ static void ps3_rom_boot(PS3BootROMState *s)
     }
 
     /*
+     * A rev-1 NOR's first container is sealed for the console's own
+     * channel-66 key, which is in the SPU ROM rather than the flash.  Opening
+     * it with the zeros a dump leaves behind would report a MAC mismatch as if
+     * the image were wrong; say what is actually missing instead.  A NAND/eMMC
+     * medium is left to ps3_chain_loader_path below, which boots its own
+     * loader when the container's key is not available.
+     */
+    if (!nand_medium && !s->has_readout && !s->has_container_key &&
+        !strcmp(name, "bootldr")) {
+        snprintf(why, sizeof(why),
+                 "the bootldr container at flash 0x%" PRIX64 " is sealed for "
+                 "this console's channel-66 key; a dump does not carry it "
+                 "(pass readout-file or container-key)", s->container_offset);
+        s->status = PS3_BOOT_BAD_MAC;
+        info_report("ps3-boot-rom: stop 2, %s", why);
+        return;
+    }
+
+    /*
      * The ROM's only source of the per-console key is channel 66.  When the
      * caller has a readout it is used as the ROM read it - first 16 bytes in
      * K_lo, second 16 in K_hi.  With no readout the channel returns zeros,
@@ -2977,7 +3069,14 @@ static void ps3_rom_boot(PS3BootROMState *s)
         memcpy(ch66, s->readout_bytes, sizeof(ch66));
     } else {
         memset(ch66, 0, sizeof(ch66));
-        info_report("ps3-boot-rom: no channel-66 readout supplied; using zeros");
+        if (s->has_container_key) {
+            info_report("ps3-boot-rom: no channel-66 readout supplied; the "
+                        "first-stage container is opened with the supplied "
+                        "container key");
+        } else {
+            info_report("ps3-boot-rom: no channel-66 readout supplied; using "
+                        "zeros");
+        }
     }
 
     s->blocks = ps3_be32(s->flash + s->container_offset + 0x10);
@@ -3003,7 +3102,9 @@ static void ps3_rom_boot(PS3BootROMState *s)
 
     result = ps3_rom_open(s->flash + s->container_offset,
                           s->flash + s->container_offset + PS3_CONTAINER_HDR,
-                          s->bytes, ch66, plain, s->key);
+                          s->bytes, ch66,
+                          s->has_container_key ? s->container_key_bytes : NULL,
+                          plain, s->key);
 
     /*
      * A container that does not open on a NAND/eMMC medium may not be the
@@ -3156,6 +3257,23 @@ static void ps3_rom_boot(PS3BootROMState *s)
                         ps3_spu_mbox_peer_posts(s->spu)
                         ? ", mailbox peer answered" : "");
 
+            /*
+             * A stage that does not stop is at a frontier, and the registers
+             * there name the call it is in: $0 is the return address of the
+             * current function and $3..$6 are its first four arguments.  One
+             * line saves tracing the instructions that got there.
+             */
+            if (s->spu_status != PS3_SPU_STOPPED) {
+                info_report("ps3-spu: state at 0x%X: $0/lr 0x%08X, "
+                            "$3 0x%08X, $4 0x%08X, $5 0x%08X, $6 0x%08X",
+                            ps3_spu_pc(s->spu),
+                            ps3_spu_gpr_word(s->spu, 0, 3),
+                            ps3_spu_gpr_word(s->spu, 3, 3),
+                            ps3_spu_gpr_word(s->spu, 4, 3),
+                            ps3_spu_gpr_word(s->spu, 5, 3),
+                            ps3_spu_gpr_word(s->spu, 6, 3));
+            }
+
             ps3_rom_report_loader_channels(s->spu);
             ps3_rom_report_channel_map(s->spu);
 
@@ -3303,7 +3421,7 @@ static void ps3_rom_selftest(PS3BootROMState *s)
         }
     }
 
-    result = ps3_rom_open(hdr, body, sizeof(body), ch66, plain, key);
+    result = ps3_rom_open(hdr, body, sizeof(body), ch66, NULL, plain, key);
 
     if (result != PS3_BOOT_OK) {
         s->selftest_result = 2;
@@ -23925,6 +24043,24 @@ static void ps3_rom_realize(DeviceState *dev, Error **errp)
     }
 
     /*
+     * The first-stage container's K_payload, for a rev-1 medium whose own
+     * channel-66 readout is not available.  Only the 16-byte AES key is taken;
+     * the tag check still decides whether it is the right one.
+     */
+    if (s->container_key) {
+        size_t key_len = 0;
+
+        if (!ps3_stage_parse_hex(s->container_key, s->container_key_bytes,
+                                 sizeof(s->container_key_bytes), &key_len) ||
+            key_len != sizeof(s->container_key_bytes)) {
+            error_setg(errp, "ps3-boot-rom: container-key must be 32 hex "
+                       "digits");
+            return;
+        }
+        s->has_container_key = true;
+    }
+
+    /*
      * A second channel-66 key for a NAND/eMMC medium.  The readout belongs to
      * the mask ROM, so one key normally opens every console's first container;
      * when a chip dump is sealed for a different one - a NAND console's metldr
@@ -26358,6 +26494,7 @@ static const Property ps3_rom_properties[] = {
                        UINT64_MAX),
     DEFINE_PROP_STRING("readout", PS3BootROMState, readout),
     DEFINE_PROP_STRING("readout-file", PS3BootROMState, readout_file),
+    DEFINE_PROP_STRING("container-key", PS3BootROMState, container_key),
     /* 32 bytes, read order: the channel-66 reads the mask ROM performed. */
     DEFINE_PROP_STRING("ch66-capture", PS3BootROMState, ch66_capture),
     DEFINE_PROP_STRING("nand-readout", PS3BootROMState, nand_readout),
