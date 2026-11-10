@@ -75,8 +75,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(PS3VGAState, PS3_VGA)
 #define PS3_VGA_REFRESH_NS  (1000000000ULL / 60)
 
 /* The boot screen: 1024x768, 8x16 glyphs, so 128 columns by 48 rows. */
-#define PS3_VGA_BOOT_W      1024
-#define PS3_VGA_BOOT_H      768
+#define PS3_VGA_BOOT_W      720
+#define PS3_VGA_BOOT_H      480
 #define PS3_VGA_TEXT_COLS   (PS3_VGA_BOOT_W / 8)
 #define PS3_VGA_TEXT_ROWS   (PS3_VGA_BOOT_H / 16)
 #define PS3_VGA_FG          0x00E6E6E6
