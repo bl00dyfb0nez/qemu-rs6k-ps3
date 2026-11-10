@@ -47,8 +47,8 @@
  * device feeds the ROM 32 zero bytes, which is what the ROM's own channel
  * reads once the key ladder has been used and the ROM has wiped itself, and
  * the tag check then fails exactly as the ROM's "stop 2" path does.  The
- * container name defaults to lv0ldr.2 and falls back to the NOR slots at
- * 0xFC0000 and 0x840 when a dump carries no name.
+ * container name defaults to lv0ldr.2 (lv0ldr on rev 1) and falls back to the
+ * NOR slots at 0xFC0000 and 0x840 when a dump carries no name.
  *
  * Once the container opens, its plaintext is placed at LS 0x400 - where the
  * mask ROM falls through to it - and executed by the SPU interpreter
@@ -2610,8 +2610,9 @@ static unsigned ps3_flash_ldr_gen(const uint8_t *flash, size_t flash_len)
  * Which container the medium's own boot ROM opens.
  *
  * A rev-2 NOR console (and a chain staged on a disk) keeps lv0ldr.2 in its
- * flash and that is what the ROM finds; the rev-1 set keeps `bootldr` in the
- * same slot.  A NAND console's first container is metldr.2 (rev 2) or metldr
+ * flash and that is what the ROM finds; the rev-1 set keeps `lv0ldr` in the
+ * same slot (the flash layout calls that region `bootldr`).  A NAND console's
+ * first container is metldr.2 (rev 2) or metldr
  * (rev 1) in the asecure_loader region - the region the mask ROM is pointed at
  * - and the NOR loader is what metldr opens once it runs, so a NAND/eMMC flash
  * that carries metldr but no bootldr/lv0ldr is a healthy console, not a broken
@@ -2623,7 +2624,7 @@ static bool ps3_chain_container(PS3BootROMState *s, const char **name_out,
 {
     const unsigned gen = ps3_flash_ldr_gen(s->flash, s->flash_len);
     const char *nand_first = gen == 1 ? "metldr" : "metldr.2";
-    const char *nor_first = gen == 1 ? "bootldr" : "lv0ldr.2";
+    const char *nor_first = gen == 1 ? "lv0ldr" : "lv0ldr.2";
     const char *name = s->container ?: nor_first;
     bool nand_medium = s->boot_medium && !strcmp(s->boot_medium, "emmc");
 
@@ -2754,7 +2755,8 @@ static bool ps3_chain_check(PS3BootROMState *s, char *why, size_t why_len)
         if (ps3_chain_loader_path(s, name, offset, why, why_len)) {
             return true;
         }
-        if (!strcmp(name, "bootldr") || !strcmp(name, "metldr")) {
+        if (!strcmp(name, "lv0ldr") || !strcmp(name, "bootldr") ||
+            !strcmp(name, "metldr")) {
             snprintf(why, why_len,
                      "the %s container at flash 0x%" PRIX64 " is sealed for "
                      "this console's channel-66 key; a dump does not carry it "
@@ -3044,11 +3046,12 @@ static void ps3_rom_boot(PS3BootROMState *s)
      * loader when the container's key is not available.
      */
     if (!nand_medium && !s->has_readout && !s->has_container_key &&
-        !strcmp(name, "bootldr")) {
+        (!strcmp(name, "lv0ldr") || !strcmp(name, "bootldr"))) {
         snprintf(why, sizeof(why),
-                 "the bootldr container at flash 0x%" PRIX64 " is sealed for "
+                 "the %s container at flash 0x%" PRIX64 " is sealed for "
                  "this console's channel-66 key; a dump does not carry it "
-                 "(pass readout-file or container-key)", s->container_offset);
+                 "(pass readout-file or container-key)", name,
+                 s->container_offset);
         s->status = PS3_BOOT_BAD_MAC;
         info_report("ps3-boot-rom: stop 2, %s", why);
         return;

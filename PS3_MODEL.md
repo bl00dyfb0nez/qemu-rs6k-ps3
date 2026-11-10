@@ -273,24 +273,27 @@ reserved channel is counted as an access the map does not define.
 The generation is read from the medium, not chosen by a flag.  The
 `asecure_loader` region's entry table names the loader it holds: `metldr` is the
 pre-3.60 (rev 1) set and `metldr.2` the 3.60+ (rev 2) one.  `ps3_flash_ldr_gen()`
-reads that name at NOR 0x800 / NAND 0x40800, so a rev-1 NOR opens `bootldr` at
+reads that name at NOR 0x800 / NAND 0x40800, so a rev-1 NOR opens `lv0ldr` at
 0xFC0000 where a rev-2 one opens `lv0ldr.2`, and a rev-1 NAND/eMMC opens
 `metldr` in the asecure_loader region where a rev-2 one opens `metldr.2`.
-`container=` still overrides the choice.
+`bootldr` is the flash layout's name for that same 0xFC0000 region and is
+accepted as an alias, but the chain-stage label is `lv0ldr`.  `container=`
+still overrides the choice.
 
 The rev-1 first stage is sealed for the console's own channel-66 key, which is
 in the SPU mask ROM rather than in the flash.  A dump therefore reaches exactly
 this point and no further:
 
 ```
-ps3-boot-rom: stop 2, the bootldr container at flash 0xFC0000 is sealed for
+ps3-boot-rom: stop 2, the lv0ldr container at flash 0xFC0000 is sealed for
 this console's channel-66 key; a dump does not carry it (pass readout-file or
 container-key)
 ```
 
 The CECHL dump in `~/Downloads/CECHL.hex` is that case, and its headers agree
 with the rev-1 table in the ps3tools tree: `metldr` at 0x840 has 0x0E85 blocks
-and counter `BC78B8F02879A81184A0DA74`, `bootldr` at 0xFC0000 has 0x2F13 and
+and counter `BC78B8F02879A81184A0DA74`, `lv0ldr` (the `bootldr` region) at
+0xFC0000 has 0x2F13 and
 `F5A221B5C05F214201979DAA`, and the asecure_loader entry names `metldr`.  Its
 nonce `16C353DD1539B06159025077` is the console's own; the published package
 `Kp` (`8E661E78...`) opens the 2.45 *package* container (`CECHL_bootldr.bin`,
@@ -946,7 +949,7 @@ audiodev feed `sys_mic`'s rings.
 | `pck1`, `erk` | - | the same 48 bytes as hex (96 digits); `pck1` is the console's name for it |
 | `lv1ldr`, `nand-loader` | - | the console's loader image the ERK and the ladder seeds are read from: a NOR `lv1ldr.self`, and/or a NAND/eMMC loader, bank carve or dump.  The key that opens it *is* the ladder's ERK, so a loader alone keys the storage ladder; the published loader keyset is accepted for a retail image and says so, and both images are read and must agree.  The seed block is the published one when the image carries it, and otherwise located by structure and proved against the `hdd-file`/`emmc-file` it keys |
 | `pck2`, `pck2-file` | - | the console's eid_root_key (the ERK+RIV, 48 bytes; the property names are the old ones and are kept for scripts).  Only a `.2` loader needs it: that image carries its ERK wrapped, and eid_root_key is what unwraps it - the ERK the unwrap yields is then the ladder's key |
-| `container` | generation's first stage | container to look for in the flash image, and the label its messages use: `bootldr` on a rev-1 NOR and `lv0ldr.2` on rev 2, or `metldr`/`metldr.2` first on a NAND/eMMC medium.  A dump that does not carry the name falls back to the slot that name belongs to (`lv0ldr`/`bootldr` -> 0xFC0000, `metldr` -> 0x840) and only to that one: a name with no slot, e.g. `lv1ldr.2`, stops with `no container called lv1ldr.2`, rather than answering for the boot slot |
+| `container` | generation's first stage | container to look for in the flash image, and the label its messages use: `lv0ldr` on a rev-1 NOR (`bootldr` is the flash-layout name for the same slot and is accepted too) and `lv0ldr.2` on rev 2, or `metldr`/`metldr.2` first on a NAND/eMMC medium.  A dump that does not carry the name falls back to the slot that name belongs to (`lv0ldr`/`bootldr` -> 0xFC0000, `metldr` -> 0x840) and only to that one: a name with no slot, e.g. `lv1ldr.2`, stops with `no container called lv1ldr.2`, rather than answering for the boot slot |
 | `container-offset` | - | address a container at an exact flash offset, for a dump that holds more than one (`metldr.2` at 0x840, `lv0ldr.2` at 0xFC0000).  Unset means the name lookup, then the two fixed slots; set, the header at that offset is used and its span is bounds-checked before anything is allocated |
 | `hdd-file`, `emmc-file` | - | the drive, or the eMMC, the firmware trees and the application are mounted from |
 | `hdd-file`, `hdd-size` | - / 20G | raw disk image, and the size the model gives a fresh one (1 TB max) |
