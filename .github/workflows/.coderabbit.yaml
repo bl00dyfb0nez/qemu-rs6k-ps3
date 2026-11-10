@@ -20,4 +20,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Optional: Required for advanced features
-          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}   
+          OPENAI_API_KEY: ${{ secrets.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 }}   
