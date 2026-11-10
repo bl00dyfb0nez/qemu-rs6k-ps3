@@ -1,14 +1,23 @@
-# .coderabbit.yaml
-language: "en-US"
-reviews:
-  profile: "chill"
-  high_level_summary: true
-  path_filters:
-    - "!**/node_modules/**"
-    - "!**/*.lock"
-    - "!**/dist/**"
-  path_instructions:
-    - path: "src/api/**"
-      instructions: "Focus on security and input validation"
-chat:
-  auto_reply: true   
+# .github/workflows/coderabbit.yml
+name: AI Code Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run CodeRabbit Review
+        uses: coderabbitai/ai-pr-reviewer@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: Required for advanced features
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}   
